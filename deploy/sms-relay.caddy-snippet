@@ -1,0 +1,23 @@
+# Caddy snippet for the SMS relay.
+#
+# This is NOT a standalone Caddyfile. It is the block that must be added
+# INSIDE the existing site block for the relay hostname, e.g.
+#
+#   ai-barrow.ir {
+#       reverse_proxy localhost:3000
+#
+#       handle /relay/* {
+#           uri strip_prefix /relay
+#           reverse_proxy 127.0.0.1:8090
+#       }
+#   }
+#
+# `handle` blocks are mutually exclusive and are matched before the
+# site-level reverse_proxy, so existing routes keep working untouched.
+# The backend is bound to 127.0.0.1 only -- it must never be exposed
+# directly to the internet.
+
+	handle /relay/* {
+		uri strip_prefix /relay
+		reverse_proxy 127.0.0.1:8090
+	}

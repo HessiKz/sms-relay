@@ -1,0 +1,527 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The content is wrapped in a ScrollView: on a small screen the buttons
+     used to fall off the bottom of the window.
+
+     The screen is written for the person, not for the technician: the
+     things that matter are at the top, the technical settings live in
+     the last section. -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="16dp">
+
+        <!-- ============ Status ============ -->
+        <LinearLayout
+            android:id="@+id/cardStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_status_card"
+            android:orientation="vertical"
+            android:padding="12dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent">
+
+            <TextView
+                android:id="@+id/textStatusHeadline"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/status_working"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/textStatusSummary"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="4dp" />
+
+            <TextView
+                android:id="@+id/textPermissions"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="8dp" />
+
+            <TextView
+                android:id="@+id/textCapturePath"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingTop="8dp" />
+        </LinearLayout>
+
+        <!-- ============ 1. Forward to Telegram ============ -->
+        <TextView
+            android:id="@+id/textSectionForward"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_forward_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/cardStatus" />
+
+        <TextView
+            android:id="@+id/textSectionForwardHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_forward_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionForward" />
+
+        <CheckBox
+            android:id="@+id/checkForwardEnabled"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="@string/label_forward_enabled"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionForwardHelp" />
+
+        <!-- ============ 2. Reply from Telegram ============ -->
+        <TextView
+            android:id="@+id/textSectionReply"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_reply_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/checkForwardEnabled" />
+
+        <TextView
+            android:id="@+id/textSectionReplyHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_reply_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionReply" />
+
+        <CheckBox
+            android:id="@+id/checkSendingEnabled"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="@string/label_sending_enabled"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionReplyHelp" />
+
+        <!-- ============ 3. Backup number ============ -->
+        <TextView
+            android:id="@+id/textSectionBackup"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_backup_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/checkSendingEnabled" />
+
+        <TextView
+            android:id="@+id/textSectionBackupHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_backup_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionBackup" />
+
+        <EditText
+            android:id="@+id/inputPhoneB"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="@string/label_phone_b"
+            android:importantForAutofill="no"
+            android:inputType="phone"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionBackupHelp" />
+
+        <CheckBox
+            android:id="@+id/checkFallbackEnabled"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="@string/label_fallback_enabled"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputPhoneB" />
+
+        <!-- ============ 4. Send an SMS ============ -->
+        <TextView
+            android:id="@+id/textComposeTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_send_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/checkFallbackEnabled" />
+
+        <!-- The card every message of this phone goes out with. The
+             choice is the one and only source for the composer, the
+             commands from Telegram and the backup number. -->
+        <TextView
+            android:id="@+id/textSendUsing"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text="@string/label_send_using"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textComposeTitle" />
+
+        <Spinner
+            android:id="@+id/spinnerSim"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:prompt="@string/label_send_using"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSendUsing" />
+
+        <TextView
+            android:id="@+id/textSendUsingHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/label_send_using_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/spinnerSim" />
+
+        <EditText
+            android:id="@+id/inputComposeNumber"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="@string/hint_compose_number"
+            android:importantForAutofill="no"
+            android:inputType="phone"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSendUsingHelp" />
+
+        <EditText
+            android:id="@+id/inputComposeBody"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:gravity="top|start"
+            android:hint="@string/hint_compose_body"
+            android:importantForAutofill="no"
+            android:inputType="textMultiLine|textCapSentences"
+            android:minLines="2"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputComposeNumber" />
+
+        <Button
+            android:id="@+id/buttonSendSms"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_send_sms"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputComposeBody" />
+
+        <TextView
+            android:id="@+id/textComposeStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonSendSms" />
+
+        <!-- ============ 5. Contacts ============ -->
+        <TextView
+            android:id="@+id/textSectionContacts"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_contacts_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textComposeStatus" />
+
+        <TextView
+            android:id="@+id/textSectionContactsHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_contacts_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionContacts" />
+
+        <Button
+            android:id="@+id/buttonSyncContacts"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_sync_contacts"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionContactsHelp" />
+
+        <TextView
+            android:id="@+id/textContactsState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonSyncContacts" />
+
+        <!-- ============ 6. History ============ -->
+        <TextView
+            android:id="@+id/textSectionHistory"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_history_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textContactsState" />
+
+        <TextView
+            android:id="@+id/textSectionHistoryHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_history_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionHistory" />
+
+        <Button
+            android:id="@+id/buttonHistory"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_history"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionHistoryHelp" />
+
+        <!-- ============ 7. Old messages ============ -->
+        <TextView
+            android:id="@+id/textSectionImport"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_import_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonHistory" />
+
+        <TextView
+            android:id="@+id/textSectionImportHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_import_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionImport" />
+
+        <Button
+            android:id="@+id/buttonImportSms"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_import_sms"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionImportHelp" />
+
+        <TextView
+            android:id="@+id/textImportState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonImportSms" />
+
+        <!-- ============ Advanced ============ -->
+        <View
+            android:id="@+id/dividerAdvanced"
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_marginTop="24dp"
+            android:background="#33888888"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textImportState" />
+
+        <TextView
+            android:id="@+id/textSectionAdvanced"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="12dp"
+            android:text="@string/section_advanced_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/dividerAdvanced" />
+
+        <EditText
+            android:id="@+id/inputBaseUri"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="@string/label_base_uri"
+            android:importantForAutofill="no"
+            android:inputType="textUri"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionAdvanced" />
+
+        <EditText
+            android:id="@+id/inputToken"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="@string/label_token"
+            android:importantForAutofill="no"
+            android:inputType="textPassword"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputBaseUri" />
+
+        <Button
+            android:id="@+id/buttonTestConnection"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/action_test_connection"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputToken" />
+
+        <TextView
+            android:id="@+id/textConnectionState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingStart="12dp"
+            android:paddingEnd="0dp"
+            android:text="@string/label_connection"
+            app:layout_constraintBottom_toBottomOf="@id/buttonTestConnection"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toEndOf="@id/buttonTestConnection"
+            app:layout_constraintTop_toTopOf="@id/buttonTestConnection" />
+
+        <TextView
+            android:id="@+id/textQueueState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text="@string/label_queue"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonTestConnection" />
+
+        <TextView
+            android:id="@+id/textCapturePathTechnical"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text="@string/capture_path"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textQueueState" />
+
+        <TextView
+            android:id="@+id/textHint"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text="@string/hint_permissions"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textCapturePathTechnical" />
+
+        <Button
+            android:id="@+id/buttonBatterySettings"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="@string/action_battery_settings"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintHorizontal_weight="1"
+            app:layout_constraintStart_toEndOf="@id/buttonAppSettings"
+            app:layout_constraintTop_toBottomOf="@id/textHint" />
+
+        <Button
+            android:id="@+id/buttonAppSettings"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:text="@string/action_open_settings"
+            app:layout_constraintEnd_toStartOf="@id/buttonBatterySettings"
+            app:layout_constraintHorizontal_chainStyle="spread"
+            app:layout_constraintHorizontal_weight="1"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="@id/buttonBatterySettings" />
+
+        <Button
+            android:id="@+id/buttonDefaultSmsApp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:text="@string/action_default_sms_app"
+            app:layout_constraintEnd_toStartOf="@id/buttonAutostart"
+            app:layout_constraintHorizontal_chainStyle="spread"
+            app:layout_constraintHorizontal_weight="1"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="@id/buttonAutostart" />
+
+        <Button
+            android:id="@+id/buttonAutostart"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="@string/action_autostart"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintHorizontal_weight="1"
+            app:layout_constraintStart_toEndOf="@id/buttonDefaultSmsApp"
+            app:layout_constraintTop_toBottomOf="@id/buttonAppSettings" />
+
+        <Button
+            android:id="@+id/buttonNotificationAccess"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_notification_access"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonAutostart" />
+
+        <TextView
+            android:id="@+id/textCommandStatus"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="12dp"
+            android:text="@string/label_last_command"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonNotificationAccess" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+</ScrollView>

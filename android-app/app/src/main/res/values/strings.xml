@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SMS Relay</string>
+    <string name="title_history">Delivery history</string>
+
+    <!-- Status at the top of the screen -->
+    <string name="status_working">Working ✓</string>
+    <string name="status_not_connected">Not connected ✗</string>
+    <string name="status_last_sms">Last SMS: %1$s</string>
+    <string name="status_no_sms_yet">Last SMS: none yet</string>
+    <string name="status_waiting_to_send">Waiting to send: %1$d</string>
+    <string name="status_never">never</string>
+    <string name="status_failed">failed</string>
+
+    <string name="time_just_now">just now</string>
+    <string name="time_minutes">%1$d minutes ago</string>
+    <string name="time_hours">%1$d h ago</string>
+    <string name="time_days">%1$d days ago</string>
+
+    <!-- What the app is allowed to do, in plain words -->
+    <string name="perm_plain_receive_yes">Can read messages: yes</string>
+    <string name="perm_plain_receive_no">Can read messages: no</string>
+    <string name="perm_plain_receive_hint">Android only allows this when SMS Relay is your default SMS app, or when you let it read your notifications.</string>
+    <string name="perm_plain_send_yes">Can send messages: yes</string>
+    <string name="perm_plain_send_no">Can send messages: no</string>
+    <string name="perm_plain_battery_ok">Android will not pause this app in the background.</string>
+    <string name="perm_plain_battery_blocked">Android may pause this app in the background.</string>
+
+    <string name="capture_default_app">SMS Relay is your default SMS app, so it sees every message.</string>
+    <string name="capture_notifications">SMS Relay reads your messages from the notifications of your messaging app.</string>
+    <string name="capture_none">SMS Relay cannot see your messages yet. Make it your default SMS app, or let it read your notifications.</string>
+    <string name="capture_path">How SMS Relay sees your messages: %1$s</string>
+    <string name="capture_state_default_app">default SMS app</string>
+    <string name="capture_state_notifications">notification access only</string>
+    <string name="capture_state_none">no way to see messages yet</string>
+
+    <!-- The sections of the screen -->
+    <string name="section_forward_title">Forward messages to Telegram</string>
+    <string name="section_forward_help">Every SMS your phone receives is sent to your Telegram chat.</string>
+    <string name="section_reply_title">Reply from Telegram</string>
+    <string name="section_reply_help">When on, you can send SMS from the Telegram chat and the app can text your contacts.</string>
+    <string name="section_backup_title">Backup number</string>
+    <string name="section_backup_help">If Telegram delivery fails, the app texts this number instead.</string>
+    <string name="section_send_title">Send an SMS</string>
+    <string name="section_contacts_title">Contacts</string>
+    <string name="section_contacts_help">Let the bot show contact names when you ask it to text someone.</string>
+    <string name="section_history_title">History</string>
+    <string name="section_history_help">See the messages this phone received.</string>
+    <string name="section_import_title">Old messages</string>
+    <string name="section_import_help">Copy the SMS that are already in this phone\'s inbox into the web inbox. They are not sent to Telegram.</string>
+    <string name="section_advanced_title">Advanced settings (you can ignore these)</string>
+
+    <string name="label_forward_enabled">Send every new message to Telegram</string>
+    <string name="label_sending_enabled">Turn on replies from Telegram</string>
+    <string name="label_fallback_enabled">Use the backup number when Telegram delivery fails</string>
+    <string name="label_phone_b">Number to text when Telegram delivery fails</string>
+
+    <!-- Writing a message -->
+    <string name="hint_compose_number">Number or contact name</string>
+    <string name="hint_compose_body">Message</string>
+    <string name="action_send_sms">Send</string>
+    <string name="label_send_using">Send using</string>
+    <string name="label_send_using_help">Every message this phone sends goes out with this card.</string>
+    <string name="sim_label">SIM %1$d</string>
+    <string name="hint_sending_disabled">Turn on Reply from Telegram above to send messages with this phone.</string>
+    <string name="status_sending_ready">Ready to send.</string>
+    <string name="status_sms_sent">The message was sent.</string>
+    <string name="status_sms_failed">The message was not sent: %1$s</string>
+    <string name="status_invalid_number">That is not a phone number.</string>
+    <string name="status_unknown_contact">I do not know that contact.</string>
+    <string name="status_empty_body">The message is empty.</string>
+    <string name="reason_no_sms_service">the phone has no SMS service</string>
+    <string name="reason_permission">the app is not allowed to send SMS</string>
+    <string name="reason_invalid_target">the number is not valid</string>
+    <string name="reason_empty_body">the message is empty</string>
+    <string name="reason_send_error">the phone refused to send</string>
+    <string name="reason_sim_unavailable">the chosen SIM card cannot be used</string>
+
+    <!-- Contacts -->
+    <string name="action_sync_contacts">Sync contacts</string>
+    <string name="status_contacts_synced">%1$d contacts synced · last sync %2$s</string>
+    <string name="status_contacts_none">No contacts synced yet.</string>
+    <string name="status_contacts_no_permission">SMS Relay cannot read your contacts yet. Press Sync contacts to allow it.</string>
+    <string name="status_contacts_uploading">Sending your contacts to the server…</string>
+    <string name="status_contacts_uploaded">Contacts sent to the server.</string>
+    <string name="status_contacts_failed">The contacts could not be sent. Try again later.</string>
+
+    <!-- History -->
+    <string name="action_history">Open history</string>
+    <string name="history_via_sim">via %1$s</string>
+
+    <!-- Importing the phone's old messages -->
+    <string name="action_import_sms">Import old messages</string>
+    <string name="import_confirm_title">Import old messages?</string>
+    <string name="import_confirm_message">Every SMS in this phone\'s inbox will be readable in the web inbox. They are not forwarded to Telegram, and messages that are already there are skipped. This can take a few minutes. Continue?</string>
+    <string name="import_confirm_positive">Import</string>
+    <string name="import_confirm_negative">Cancel</string>
+    <string name="status_import_none">Old messages have not been imported yet.</string>
+    <string name="status_import_needs_default_app">Make SMS Relay your default SMS app before importing.</string>
+    <string name="status_import_needs_permission">Allow SMS Relay to read messages before importing.</string>
+    <string name="status_import_waiting">Waiting to start the import…</string>
+    <string name="status_import_running">Importing… %1$d messages so far (%2$d already present).</string>
+    <string name="status_import_done">Imported %1$d messages. %2$d were already present; %3$d could not be used.</string>
+    <string name="status_import_failed">The import stopped: %1$s</string>
+    <string name="import_error_no_role">make SMS Relay your default SMS app first</string>
+    <string name="import_error_no_permission">the app cannot read the SMS inbox</string>
+    <string name="import_error_auth">the server rejected the device token</string>
+    <string name="import_error_rejected">the server refused a message</string>
+    <string name="import_error_server">the server URL is empty</string>
+    <string name="import_error_read">the SMS inbox could not be read</string>
+    <string name="import_error_unknown">unknown error</string>
+
+    <!-- Advanced settings -->
+    <string name="label_base_uri">Server URL</string>
+    <string name="label_token">Device token</string>
+    <string name="label_connection">Connection</string>
+    <string name="label_queue">Queued messages</string>
+    <string name="label_last_upload">Last upload</string>
+    <string name="action_test_connection">Test connection</string>
+    <string name="action_open_settings">App settings</string>
+    <string name="action_battery_settings">Battery</string>
+    <string name="action_autostart">Autostart</string>
+    <string name="action_default_sms_app">Default SMS app</string>
+    <string name="action_notification_access">Notifications</string>
+    <string name="hint_permissions">Android can pause this app in the background. The buttons below open the settings that keep it running.</string>
+
+    <!-- Commands from Telegram -->
+    <string name="label_last_command">Last Telegram command</string>
+    <string name="status_command_none">none yet</string>
+
+    <!-- Short messages -->
+    <string name="toast_probe_ok">Server reachable (%1$d ms)</string>
+    <string name="toast_probe_failed">Server unreachable: %1$s</string>
+    <string name="toast_saved">Saved</string>
+
+    <string name="history_empty">No messages yet</string>
+    <string name="compose_sms_info">SMS Relay passes your messages on to Telegram. To write a new message, use your usual messaging app.</string>
+</resources>

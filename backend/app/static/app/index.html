@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <base href="/relay/app/">
+  <title>SMS Relay</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  <link rel="stylesheet" href="assets/app.css">
+  <link rel="modulepreload" href="assets/js/app.js">
+  <script type="module" src="assets/app.js"></script>
+</head>
+<body>
+  <div id="app" class="app">
+    <div id="splash" class="splash" role="status" aria-live="polite">
+      <div class="splash-card">
+        <p id="splash-title" class="splash-title">Loading SMS Relay…</p>
+        <p id="splash-detail" class="splash-detail muted"></p>
+      </div>
+    </div>
+
+    <section id="list-pane" class="pane list-pane" aria-label="Conversations">
+      <header class="pane-header">
+        <div class="list-heading">
+          <h1 class="title">Inbox</h1>
+          <button id="new-chat-button" class="new-chat-button" type="button">
+            New conversation
+          </button>
+        </div>
+        <p id="me-line" class="muted"></p>
+        <form id="search-form" class="search-form" role="search">
+          <label class="visually-hidden" for="search">Search conversations</label>
+          <input id="search" class="search-input" type="search" inputmode="search"
+                 autocomplete="off" spellcheck="false" maxlength="100"
+                 placeholder="Search name, number or text">
+        </form>
+      </header>
+      <p id="paused-indicator" class="paused-indicator" role="status" hidden>
+        Relay is paused. New messages will queue on the phone.
+      </p>
+      <p id="list-status" class="status-line" role="status" aria-live="polite"></p>
+      <ul id="chat-list" class="chat-list" aria-label="Conversation list"></ul>
+    </section>
+
+    <section id="thread-pane" class="pane thread-pane" aria-label="Conversation" hidden>
+      <header class="thread-header">
+        <button id="back-button" class="back-button" type="button"
+                aria-label="Back to conversations">Back</button>
+        <div class="thread-heading">
+          <h2 id="thread-name" class="thread-name"></h2>
+          <p id="thread-number" class="muted"></p>
+        </div>
+      </header>
+      <div id="timeline-status" class="status-line" role="status" aria-live="polite"></div>
+      <ol id="timeline" class="timeline" aria-label="Messages"></ol>
+      <form id="composer" class="composer" aria-label="Send a message">
+        <div id="composer-sim-row" class="composer-sim" hidden>
+          <label class="field-label" for="composer-sim">SIM card</label>
+          <select id="composer-sim" class="sim-select"></select>
+        </div>
+        <div class="composer-row">
+          <label class="visually-hidden" for="composer-body">Message</label>
+          <textarea id="composer-body" class="composer-input" rows="1"
+                    maxlength="1600" placeholder="Message"></textarea>
+          <button id="composer-send" class="send-button" type="submit">Send</button>
+        </div>
+        <p id="composer-meta" class="composer-meta">0 chars</p>
+        <p id="composer-paused" class="composer-hint" hidden>
+          Relay is paused. The message will still be queued.
+        </p>
+        <p id="composer-error" class="composer-error" role="alert" hidden></p>
+        <button id="composer-retry" class="retry-button" type="button" hidden>
+          Retry
+        </button>
+      </form>
+    </section>
+
+    <div id="new-chat-dialog" class="dialog-backdrop" hidden>
+      <div class="dialog-card" role="dialog" aria-modal="true"
+           aria-labelledby="new-chat-title">
+        <h2 id="new-chat-title" class="dialog-title">New conversation</h2>
+        <form id="new-chat-form" class="dialog-form">
+          <label class="field-label" for="new-chat-number">Phone number</label>
+          <input id="new-chat-number" class="field-input" type="tel"
+                 inputmode="tel" autocomplete="off" maxlength="32"
+                 placeholder="+98 912 123 4567">
+          <label class="field-label" for="new-chat-body">Message</label>
+          <textarea id="new-chat-body" class="field-input" rows="3"
+                    maxlength="1600" placeholder="Message"></textarea>
+          <div id="new-chat-sim-row" class="field-row" hidden>
+            <label class="field-label" for="new-chat-sim">SIM card</label>
+            <select id="new-chat-sim" class="sim-select"></select>
+          </div>
+          <p id="new-chat-error" class="dialog-error" role="alert" hidden></p>
+          <div class="dialog-actions">
+            <button id="new-chat-cancel" class="secondary-button" type="button">
+              Cancel
+            </button>
+            <button id="new-chat-send" class="send-button" type="submit">Send</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

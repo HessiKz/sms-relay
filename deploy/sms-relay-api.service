@@ -1,0 +1,55 @@
+[Unit]
+Description=SMS Relay API (FastAPI, single worker)
+Documentation=file:/root/sms-relay/docs/vps-setup.md
+After=network-online.target
+Wants=network-online.target
+# If the environment file is incomplete the service must fail fast and
+# stay down instead of restart-looping forever.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+User=smsrelay
+Group=smsrelay
+WorkingDirectory=/opt/sms-relay/app
+EnvironmentFile=/etc/sms-relay/env
+ExecStart=/opt/sms-relay/venv/bin/python -m app.main --env-file /etc/sms-relay/env --host 127.0.0.1 --port 8090
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillSignal=SIGINT
+
+# Soft/hard memory guardrails. These are deliberately generous for a
+# 1-2 GB box: the whole FastAPI process should sit far below 200 MB RSS.
+# Raise them if measurement shows legitimate usage above these numbers --
+# a service that OOM-kills itself is not "reliable". Check with:
+#   systemctl show sms-relay-api -p MemoryCurrent
+#   ps -o rss= -p $(systemctl show -p MainPID --value sms-relay-api)
+MemoryHigh=200M
+MemoryMax=320M
+MemorySwapMax=256M
+
+# Hardening (mirrors the pattern used by the other services on this host).
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Only this directory is writable for the service account.
+ReadWritePaths=/var/lib/sms-relay
+
+[Install]
+WantedBy=multi-user.target
