@@ -346,6 +346,8 @@ class MainActivity : AppCompatActivity() {
         ) {
             saveSimSelection()
         }
+
+        override fun onNothingSelected(parent: AdapterView<*>) = Unit
     }
 
     private val simIds = mutableListOf<Int>()
