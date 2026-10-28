@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'android-app/**'
+      - '.github/workflows/android-build.yml'
 
 permissions:
   contents: read
@@ -32,6 +33,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action defaults to "tools platform-tools", but the legacy
+          # "tools" package was removed from the SDK repository and makes
+          # sdkmanager exit 1.
+          packages: platform-tools
 
       - name: Accept SDK licenses
         run: |
