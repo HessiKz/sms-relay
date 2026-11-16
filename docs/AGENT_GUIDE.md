@@ -88,7 +88,7 @@ own bearer token.
 | `backend/app/db.py` | schema, migrations, transactions, every SQL query, queue helpers | data model, states, queue semantics, new queries |
 | `backend/app/phones.py` | sender/thread-key normalization | number formats, shortcode rules, thread identity |
 | `backend/app/ingest.py` | `POST /sms` live ingest, filters, dedupe, pause | live-ingest behavior |
-| `backend/app/importer.py` | `POST /import` historical inbox | import format, limits, import dedupe |
+| `backend/app/importer.py` | `POST /import` historical inbox and sent folder | import format, direction, limits, import dedupe |
 | `backend/app/api.py` | device/admin REST API, status, settings, filters | REST contracts or admin controls |
 | `backend/app/pairing.py` | public pairing endpoints (`/pair/start`, `/pair/claim`) and the Mini App pairing/device endpoints | pairing flow, device lifecycle, device list |
 | `backend/app/delivery.py` | delivery worker, chunking, retry policy, Telegram buttons, device label | forwarding behavior |
@@ -130,7 +130,8 @@ first 11 characters are kept in `devices.token_prefix` for the UI).
   `(device_id, thread_key)`.
 - `messages`: one row per inbound SMS, including imported history.
   - `id` primary key; live ids come from Android (UUID); import ids are
-    deterministic `imp-<hash>`.
+    deterministic `imp-<hash>` (the SHA-256 of device, direction and the
+    provider row id, or of sender/timestamp/text when there is no id).
   - `device_id` is the device that captured the message.
   - `thread_key` is the canonical conversation key (`989...`, `short:110`,
     `raw:bank`).
@@ -142,10 +143,12 @@ first 11 characters are kept in `devices.token_prefix` for the UI).
 - `jobs`: one row per message that still needs forwarding. It has its own
   `attempts`, `next_attempt_at`, and `locked_at`. A job lock older than 300 s
   is stale and can be reclaimed after a crash.
-- `sms_commands`: outbound requests. `device_id` is mandatory: it names the
-  phone that has to run the command. Status is `pending`, `sent`,
-  `delivered`, `failed`, or `rejected`. `client_ref` is a partial unique
-  index used for Mini App idempotency.
+- `sms_commands`: outbound requests and outbound history. `device_id` is
+  mandatory: it names the phone that has to run the command. Status is
+  `pending`, `sent`, `delivered`, `failed`, or `rejected`. `client_ref` is a
+  partial unique index used for Mini App idempotency. Imported sent messages
+  also live here, with `source='import'` and terminal `status='sent'`: see
+  "Historical import" below.
 - `contacts`, `filters`, `settings`, `thread_reads`, `device_status` are
   supporting tables. `contacts`, `thread_reads` and `device_status` are the
   pre-split tables: they are kept for a rollback, but the new readers never
@@ -174,6 +177,7 @@ new live SMS, not paused ──► pending ──► delivered
         │
 new live SMS, paused ──► received ──(resume)──► pending
 imported history ──────► received  (no job, not forwarded)
+imported sent history ─► sms_commands, status='sent'  (terminal, no job)
 ```
 
 - `failed` deletes the job and is terminal.
@@ -201,6 +205,44 @@ first and later `delivered`.
 command up and compares its `device_id` with the authenticated device. A
 mismatch is a 404, never a silent accept. Revoking a device fails its pending
 commands (`db.fail_device_commands`).
+
+### Historical import (`POST /import`)
+
+`importer.ImportItem` accepts `id`/`provider_id`, `sender`, `body`,
+`received_at` (epoch seconds), `sub_id`, and `direction` (`"in"` or
+`"out"`, default `"in"` so an older APK keeps working). Between 1 and 200
+items per request; the phone sends 100. The device always comes from the
+bearer token, never from the body.
+
+- `direction='in'`: `db.find_import_duplicate()` then `db.record_message()`
+  with `source='import'`, `state='received'`. No job, never forwarded,
+  never resumed.
+- `direction='out'`: `db.find_import_command_duplicate()` then
+  `db.record_imported_command()`, which writes `sms_commands` with
+  `source='import'`, `status='sent'`, `result`/`reply_to_telegram_id` NULL,
+  and `device_id` from the token. `pending_commands()` only reads
+  `status='pending'`, so the row can never reach a phone, and no Telegram
+  delivery path reads `sms_commands`. For a sent row `sender` is the
+  recipient, which is still the thread key.
+
+Dedupe is server-side, per device and per direction:
+
+- inbound: same `thread_key`, same body, within ±60 s;
+- outbound: same `thread_key`, same body, within ±60 s, matched against
+  **any** `sms_commands` row of that device. That covers a message the relay
+  itself queued and the phone later re-imported from its Sent folder.
+
+The id is deterministic (`imp-<32 hex>`): `sha256(device_id, direction,
+"pid:"+provider_id)`, or `sender\0received_at\0body` when there is no
+provider id. It includes the device, because two phones may reuse provider
+row ids, and the direction, so an inbound and an outbound message of the
+same conversation cannot collapse into one row. A replayed batch is
+therefore all duplicates, not new rows.
+
+`received_at` must be ≥ 2000-01-01 and not more than 24 h in the future;
+the ±24 h drift rule of live ingestion does not apply, because an import
+exists to carry years of history. An import bumps `rev` once per request
+(scope: device, no thread), only when something was inserted.
 
 ## 4. API and auth contracts
 
@@ -369,7 +411,7 @@ renames a device, sets it as the default and revokes it.
 | Dedupe | `util/Dedupe.kt`, `util/SenderNormalizer.kt` | prevent double capture across paths |
 | Provider | `sms/SmsProviderWriter.kt`, `sms/SmsSubscriptionLookup.kt` | write inbox rows when default app; infer SIM |
 | Local queue | `data/MessageRecord.kt`, `data/MessageDao.kt`, `data/AppDatabase.kt` | Room message state and migrations |
-| Upload | `work/UploadWorker.kt`, `net/RelayClient.kt` | sequential upload and result classification |
+| Upload | `work/UploadWorker.kt`, `net/RelayClient.kt`, `work/ImportWorker.kt` | sequential upload, historical import paging, result classification |
 | Commands | `work/CommandWorker.kt`, `data/HandledCommandDao.kt`, `data/CommandDatabase.kt` | poll, guard, execute, report |
 | SMS sending | `sms/SmsSender.kt`, `sms/CommandPartTracker.kt`, `sms/FallbackPartTracker.kt` | SIM choice, multipart tracking |
 | Fallback | `sms/FallbackPolicy.kt`, `sms/FallbackSender.kt`, `sms/SendStatusReceiver.kt` | confirmed-failure fallback and caps |
@@ -419,6 +461,30 @@ Android invariants:
   dropped.
 - A fallback send is confirmed only when every part reports through the
   status receiver; caps count confirmed sends only.
+
+Historical import (`work/ImportWorker.kt`):
+
+- Query: `Telephony.Sms.CONTENT_URI` with projection
+  `_ID, ADDRESS, BODY, DATE, SUBSCRIPTION_ID, TYPE`, selection
+  `_ID > cursor AND TYPE IN (INBOX, SENT)`, sort `_ID ASC LIMIT 100`.
+  Received and sent rows share that provider table, so one `_ID` cursor
+  orders the whole history; `BATCH = 100`.
+- Type: `MESSAGE_TYPE_SENT` becomes `ImportMessage.DIRECTION_OUT`
+  (`"out"`), everything else `DIRECTION_IN` (`"in"`). For a sent row
+  `ADDRESS` is the recipient, which is still the other side of the thread.
+- Cursor: `SettingsStore.importCursor` holds the highest imported `_ID`.
+  `SettingsStore.importCursorFormat` describes what that cursor means:
+  `0` is a pre-1.3.2 install that only ever imported the inbox, `2`
+  (`ImportWorker.CURSOR_FORMAT`) means the shared store with sent rows. When
+  the stored value is not `2`, the worker resets the cursor to `0` and
+  writes `2` **before** the loop, so the one-time restart happens once per
+  install and not on every run.
+- Rows are sent directly and never written to Room; MMS is not imported.
+  Bodies are never logged.
+- Known one-time effect: the first run after 1.3.2 re-reads the store from
+  row 0. The backend deduplicates the inbound rows it already has, so the
+  cost is a longer run and `duplicates` counters, not a second copy in the
+  Mini App.
 
 The app is **not built on the VPS**: there is no Android toolchain there. Say
 so in the log whenever the Android code changes.
@@ -604,39 +670,43 @@ VPS.
    the Phone B fallback itself is frozen and off by default.
 5. The backend accepts 3–4 digit `short:` threads; Android requires 5 digits
    to dial, so those threads are read-only in practice.
-6. `ImportWorker` sends 100 items and treats 413 as permanent; a large batch
-   can stall the import cursor.
-7. Filters match raw sender strings and case-sensitive keyword substrings;
+6. `ImportWorker` sends 100 items (both directions share the `_ID` cursor)
+   and treats 413 as permanent; a large batch can stall the import cursor.
+7. Import dedupe is a ±60 s window on identical text in one conversation, so
+   two genuinely distinct messages with the same text inside a minute (a
+   repeated "ok", a duplicate send) collapse into one row in either
+   direction. That is the price of making a replayed import idempotent.
+8. Filters match raw sender strings and case-sensitive keyword substrings;
    they are not applied to imported history.
-8. The Telegram update offset is in memory; a restart can redeliver a command.
-9. Fallback candidates are the 50 newest rows in 48 hours; older failures can
+9. The Telegram update offset is in memory; a restart can redeliver a command.
+10. Fallback candidates are the 50 newest rows in 48 hours; older failures can
    starve.
-10. Multi-chunk sends are retried from chunk 1, so a later failure can duplicate
+11. Multi-chunk sends are retried from chunk 1, so a later failure can duplicate
     earlier chunks.
-11. After 8 attempts any error, including `timeout`, becomes `failed`; this can
+12. After 8 attempts any error, including `timeout`, becomes `failed`; this can
     authorize a fallback for a message Telegram may have accepted.
-12. FastAPI `/docs` and `/openapi.json` are reachable through the proxy unless
+13. FastAPI `/docs` and `/openapi.json` are reachable through the proxy unless
     explicitly disabled.
-13. **After the upgrade every phone has to pair again.** The shared phone
+14. **After the upgrade every phone has to pair again.** The shared phone
     token is gone; an old APK that still uses it gets a 401 on every request.
     The app keeps its Room queue and its device id, so a fresh pairing
     restores the same device row with its old history.
-14. The archived `legacy` device holds the history of the previous phone. It
+15. The archived `legacy` device holds the history of the previous phone. It
     is read-only: it cannot pair, cannot poll commands and cannot send, and
     the Mini App shows it as archived.
-15. The old device-less Mini App routes (`/app/api/chats…`,
+16. The old device-less Mini App routes (`/app/api/chats…`,
     `/app/api/contacts`) always answer **410**. A client that still has the
     old bundle therefore shows an error until the new device-first bundle
     reaches it. That is intentional: a stale client fails loudly instead of
     reading a mixed inbox.
-16. The pairing claim limiter counts only the *wrong* secrets, per pairing
+17. The pairing claim limiter counts only the *wrong* secrets, per pairing
     (and per address for an unknown pairing id). A valid poll is never
     rate-limited, because every phone shares one address behind Caddy.
-17. The Telegram bot's contact search (`flow.py`) still falls back to the
+18. The Telegram bot's contact search (`flow.py`) still falls back to the
     global legacy `contacts` table when the resolved device has no matching
     contact. The Mini App readers are strictly per-device; the bot picker
     can mix legacy names until it is made device-aware.
-18. Starting a new pairing cancels older pending/approved pairings for the
+19. Starting a new pairing cancels older pending/approved pairings for the
     same device. An approved-but-unclaimed device row (`token_hash` NULL)
     may be approved again; one with an active token is refused until it is
     revoked. If the admin approves an old QR after the phone generated a

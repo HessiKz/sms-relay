@@ -571,6 +571,70 @@ def find_import_duplicate(conn: sqlite3.Connection, thread_key: str,
     return row["id"] if row is not None else None
 
 
+def find_import_command_duplicate(conn: sqlite3.Connection,
+                                  device_id: str | None, thread_key: str,
+                                  body: str, created_at: int,
+                                  window: int = 60) -> str | None:
+    """The id of a sent command that already covers an imported item.
+
+    The Sent folder of the phone overlaps with the commands the relay
+    itself queued: a message sent through the Mini App and later imported
+    from the phone's Sent folder is one message, not two. A command in the
+    same conversation with the same text within a minute of the Sent
+    timestamp is treated as the same one. Any source matches, because the
+    import is a replay of what the phone already has.
+    """
+    sql = ("SELECT id FROM sms_commands WHERE thread_key = ? AND body = ?")
+    params: list = [thread_key, body]
+    if device_id is not None:
+        sql += " AND device_id = ?"
+        params.append(device_id)
+    sql += " AND created_at BETWEEN ? AND ? LIMIT 1"
+    params.extend([created_at - window, created_at + window])
+    with _WRITE_LOCK:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    return row["id"] if row is not None else None
+
+
+def record_imported_command(conn: sqlite3.Connection, cmd: dict) -> bool:
+    """Store a message the phone already sent, as history.
+
+    The row is written with a terminal status so it can never be handed to
+    a phone by :func:`pending_commands`: an imported message is not work to
+    do. Nothing is enqueued and Telegram is not involved. Returns whether
+    the row was inserted, so a replay counts as a duplicate.
+    """
+    status = cmd.get("status") or "sent"
+    if status not in COMMAND_STATUSES:
+        raise ValueError(f"invalid command status: {status}")
+    created_at = int(cmd["created_at"])
+    device_id = cmd.get("device_id")
+    key = cmd.get("thread_key")
+    if key is None:
+        key = phones.thread_key(cmd["target"])
+        if key is None:
+            key = phones.raw_key(cmd["target"])
+    target = cmd["target"]
+    body = cmd["body"]
+    source = cmd.get("source") or "import"
+    sub_id = int(cmd.get("sub_id") or 0)
+    command_id = cmd["id"]
+
+    def fn() -> bool:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO sms_commands"
+            " (id, created_at, target, body, source, status, result,"
+            "  reply_to_telegram_id, thread_key, sub_id, client_ref,"
+            "  device_id, updated_at, finished_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?)",
+            (command_id, created_at, target, body, source, status, key,
+             sub_id, device_id, created_at, created_at),
+        )
+        return cur.rowcount == 1
+
+    return bool(_write_tx(conn, fn))
+
+
 def count_jobs(conn: sqlite3.Connection) -> int:
     with _WRITE_LOCK:
         row = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()

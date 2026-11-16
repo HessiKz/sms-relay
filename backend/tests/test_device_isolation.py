@@ -358,3 +358,36 @@ def test_a_live_sms_is_not_swallowed_by_imported_history(client):
     conn = client.app.state.db_conn
     assert db.counts_by_state(conn) == {"received": 1, "pending": 1}
     assert db.count_jobs(conn) == 1
+
+
+def test_imported_outbound_history_belongs_to_one_device(client):
+    # Both phones send to the same number, and both import the same
+    # provider row id from their own Sent folder.
+    token = _second_device(client)
+    for headers, body in ((device_headers(), "from a"),
+                          (device_headers(token), "from b")):
+        response = client.post("/import", json={"items": [
+            {"provider_id": "sent-1", "sender": SENDER_A, "body": body,
+             "received_at": NOW - 7200, "direction": "out"}]},
+            headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["imported"] == 1
+
+    conn = client.app.state.db_conn
+    rows = conn.execute(
+        "SELECT id, device_id, body FROM sms_commands").fetchall()
+    assert len(rows) == 2
+    assert {row["device_id"] for row in rows} == {DEVICE_ID, SECOND_DEVICE_ID}
+    assert len({row["id"] for row in rows}) == 2
+
+    # Neither phone is handed its own history as work to do.
+    for headers in (device_headers(), device_headers(token)):
+        assert client.get("/commands", headers=headers).json()["commands"] == []
+
+    # And neither phone sees the other phone's outbound history.
+    a = _timeline(client, DEVICE_ID, THREAD_A)["events"]
+    b = _timeline(client, SECOND_DEVICE_ID, THREAD_A)["events"]
+    assert [(event["direction"], event["body"]) for event in a] == [
+        ("out", "from a")]
+    assert [(event["direction"], event["body"]) for event in b] == [
+        ("out", "from b")]

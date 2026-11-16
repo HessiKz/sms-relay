@@ -76,7 +76,7 @@ sms-relay/
 │   │   ├── db.py                schema, migrations, queries, queue helpers
 │   │   ├── pairing.py           QR pairing, approval and per-device tokens
 │   │   ├── ingest.py            POST /sms
-│   │   ├── importer.py          POST /import (historical inbox)
+│   │   ├── importer.py          POST /import (historical inbox + sent)
 │   │   ├── api.py               device/admin REST API
 │   │   ├── delivery.py          Telegram delivery worker and retries
 │   │   ├── tg.py                Telegram Bot API client and error taxonomy
@@ -231,13 +231,38 @@ excludes `source='import'`.
 
 ### 4. Historical import
 
-The Android app uploads the phone's existing inbox in batches of 100
-items (the backend accepts up to 200). The backend stores these rows with
-`source='import'`,
-`state='received'` and a deterministic id, scoped to the authenticating
-device only: an import never touches another device's history. They never
-enter the Telegram delivery queue and they are never resumed; their purpose
-is to make old conversations visible in that device's Mini App threads.
+The Android app reads the phone's SMS store (`content://sms`), not just the
+inbox: received and sent rows live in the same provider table, so one cursor
+covers both folders. Each item carries a `direction` (`in` for received,
+`out` for sent), and the phone uploads them in batches of 100 items (the
+backend accepts up to 200). MMS is not imported.
+
+Both directions are history, and both are scoped to the authenticating
+device only: an import never touches another device's history.
+
+- **Inbound** (`direction='in'`, also the default, so an older client keeps
+  working) is stored in `messages` with `source='import'`,
+  `state='received'` and a deterministic `imp-<hash>` id.
+- **Sent** (`direction='out'`) is stored in `sms_commands` with
+  `source='import'` and `status='sent'`. It is therefore outbound history:
+  it is never pending, never handed to a phone by `GET /commands`, and never
+  forwarded to Telegram. Its `target` is the other side of the conversation
+  (the recipient, as the provider reports it).
+
+Neither direction enters the Telegram delivery queue, neither is resumed, and
+neither is queued for the phone; the only effect is that old conversations
+become visible in that device's Mini App threads, on both sides.
+
+Dedupe is server-side, per device: an item is skipped when the same
+conversation already has the same text within ±60 s, and a sent item that
+matches an existing `sms_commands` row (whatever its source) is treated as
+the same message. An imported sent row is terminal history, so it never
+authorizes a fallback and never becomes a status message.
+
+The first import after upgrading to APK 1.3.2 re-reads the provider from the
+start, because the old inbox-only cursor cannot say which sent rows were
+already seen. That replay is safe: server-side dedupe skips the inbound rows
+the backend already has, and the only cost is one longer import run.
 
 ### 5. Send from Telegram
 
@@ -297,7 +322,7 @@ old shared-token APK — is answered with `401`.
 | `POST /pair/start` | public, rate limited | begin pairing; returns pairing id, scan code, QR payload, expiry |
 | `POST /pair/claim` | public (claim secret) | phone polls; the token is handed out exactly once |
 | `POST /sms` | device | ingest one live SMS |
-| `POST /import` | device | ingest historical SMS in batches for that device |
+| `POST /import` | device | ingest historical SMS (received and sent) in batches for that device |
 | `GET /sms-state?ids=...` | either | delivery states for Android's fallback sweep |
 | `GET /messages` | admin | paged message history, optionally filtered by device |
 | `GET /commands` | device | that device's pending outbound commands + heartbeat |
@@ -616,8 +641,8 @@ relying on the affected behavior.
 
 ## Testing
 
-The backend suite is the primary automated safety net: 569 tests across 23
-modules; 565 pass and four are known pre-existing failures. It uses fakes for
+The backend suite is the primary automated safety net: 578 tests across 23
+modules; 575 pass and four are known pre-existing failures. It uses fakes for
 Telegram, so no real message is sent. The Android app has no instrumentation
 tests, and the Mini App has only Python-side static assertions.
 

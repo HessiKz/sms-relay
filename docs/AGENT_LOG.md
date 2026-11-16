@@ -737,3 +737,87 @@ names.
 - **Follow-ups:** use exactly these two provider/model IDs for every future
   subagent in this project, and re-read `AGENTS.md` when starting a session
   so the policy applies from the first delegation.
+
+## 2026-11-16 — Import sent SMS as well as received ones
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, subagent).
+- **Task:** The historical import read only the phone's inbox, so every
+  conversation in the Mini App showed only one side of the exchange. The
+  operator asked for the phone's Sent folder to be imported too, as history,
+  without ever turning old outbound messages into work for a phone or into
+  Telegram messages.
+- **Files:** `backend/app/importer.py`, `backend/app/db.py`,
+  `backend/tests/test_import.py`, `backend/tests/test_device_isolation.py`,
+  `README.md`, `docs/AGENT_GUIDE.md`, `docs/AGENT_LOG.md`; the Android side
+  (`android-app/app/src/main/java/dev/smsrelay/work/ImportWorker.kt`,
+  `net/RelayClient.kt`, `SettingsStore.kt`,
+  `src/main/res/values/strings.xml`, `app/build.gradle.kts`) was committed
+  separately as `a4f8f0a`.
+- **Changed:** `ImportItem` gained `direction` (`"in"`/`"out"`, default
+  `"in"` so an older APK keeps working). An inbound item is still a
+  `messages` row with `source='import'` and `state='received'`; an outbound
+  item is now written to `sms_commands` by the new
+  `db.record_imported_command()` with `source='import'`, terminal
+  `status='sent'`, and `result`/`reply_to_telegram_id` NULL, so
+  `pending_commands()` (which filters `status='pending'`) can never hand it
+  to a phone and no delivery path reads it. Import ids are deterministic and
+  now include the device and the direction, so two phones may reuse a
+  provider row id and an inbound and an outbound message of the same
+  conversation cannot collapse. Dedupe is server-side and per device:
+  `db.find_import_duplicate()` for inbound and the new
+  `db.find_import_command_duplicate()` for outbound, both a ±60 s window on
+  identical text in one conversation; the outbound check matches any
+  `sms_commands` row of the device, so a message the relay queued and the
+  phone later re-imported from Sent is one row. An import bumps `rev` once
+  per request (device scope, no thread) only when something was inserted.
+  Android now queries `content://sms` (not `Sms.Inbox`) with `TYPE` in the
+  projection and `TYPE IN (INBOX, SENT)` in the selection, maps
+  `MESSAGE_TYPE_SENT` to `"out"`, and adds `SettingsStore.importCursorFormat`
+  (0 by default, 2 in this build) so an inbox-only install restarts its
+  import from row 0 exactly once. APK bumped to versionCode 7 /
+  versionName 1.3.2, and the import strings mention received and sent
+  messages. README flow 4 and the guide's importer contract, data model,
+  message-state diagram, Android map and trap list were updated.
+- **Verification:** `cd backend && /opt/sms-relay/venv/bin/python -m pytest
+  tests -q` collected 578 tests: **575 passed**, 3 failed and 1 error — the
+  same four pre-existing failures in `test_commands.py` (contact search,
+  uploaded contacts) and `test_db.py` (chat search), plus the
+  `test_app_assembly.py` shutdown error. `pytest` was not present in the
+  live venv, so it was installed there for the run only and uninstalled
+  afterwards (`pip uninstall pytest pluggy iniconfig packaging`); the
+  service was not restarted and `/health` returned `{"ok":true}` before and
+  after. The new tests cover: direction
+  defaulting, an outbound import landing in `sms_commands` with
+  `status='sent'` and no job or Telegram id, replay as duplicate, overlap
+  with a relay-queued command, the outbound row visible in the Mini App
+  timeline as `out`, and two devices sharing a provider id. `GET
+  /health` on `127.0.0.1:8090` returns `{"ok":true}` HTTP 200; the service
+  was **not** restarted or redeployed by this entry. `cmp` shows
+  `/opt/sms-relay/app/app/importer.py` and `/opt/sms-relay/app/app/db.py`
+  byte-identical to the repository versions, i.e. the deployed code already
+  is this change. Android build run `43944337415` finished successfully and
+  published `sms-relay-debug.apk` for 1.3.2 with the stable debug key; that
+  build and the APK came from CI, not from this host. The live database had
+  29,418 imported messages before this change and no sent import had run
+  yet, because no APK 1.3.2 is installed on the phone.
+- **Decisions / risks:** the first import after 1.3.2 re-reads the whole
+  provider from the start, so it can be long and can report many
+  duplicates; server-side dedupe makes the inbound replay a no-op, but the
+  ±60 s window can still merge two genuinely distinct identical texts inside
+  a minute in either direction. Imported outbound rows are terminal history:
+  they never authorize a fallback, never produce a status message and can
+  never be edited or retried. MMS is not imported, so picture messages stay
+  missing from both sides. Two phones that imported the same conversation
+  each keep their own copy, because everything is device-scoped. The
+  outbound dedupe matches on canonical thread key, so a sender form that
+  normalizes to the same key is treated as the same conversation — that is
+  intended, but it means an imported Sent row can be considered a duplicate
+  of a relay command sent from a different SIM.
+- **Follow-ups:** install APK 1.3.2 on the phone and run the import; then
+  confirm in the Mini App that device threads now show sent rows on the
+  right with `status='sent'`, that no imported outbound row appears in
+  `GET /commands`, and that `/status` queue depth stays unchanged. Expect
+  the first run to re-read the whole store; if it stalls, check the 413 /
+  batch-size trap before touching the cursor. Consider a separate log entry
+  once the sent rows actually exist, since this entry can only verify the
+  code path, not the live import.
