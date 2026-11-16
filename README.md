@@ -557,7 +557,11 @@ The app targets SDK 35 and supports API 26+. On Android 10+ it must be made
 the default SMS app to receive the SMS permission group, or the user must
 grant notification access and rely on the notification-listener capture
 path. `RoleState` reports at startup which capture paths are actually
-available, so the UI never lies about the default-SMS role.
+available, so the UI never lies about the default-SMS role. The manifest
+also carries the MMS/WAP-push part of the role contract (`RECEIVE_MMS`,
+`RECEIVE_WAP_PUSH`, and a `WAP_PUSH_DELIVER` receiver); the relay does not
+implement MMS, and the receiver exists so Android and OEM role pickers list
+the app as a messaging app.
 
 Android **1.3.3 (versionCode 8)**, commit `149504e`, stops the dual-broadcast
 duplicate: some vendor builds (MIUI among them) deliver both `SMS_DELIVER`
@@ -567,20 +571,15 @@ were stored because the local dedupe deliberately keeps same-source repeats.
 role, so `SMS_DELIVER` is the only copy. The non-default case (notification
 listener) and the cross-path dedupe are unchanged.
 
-The rolling debug APK is built by GitHub Actions and published at
-<https://github.com/HessiKz/sms-relay/releases/download/android-latest/sms-relay-debug.apk>.
+The 1.3.3 build was produced by GitHub Actions run `43960881846`, which
+finished clean and published `sms-relay-debug.apk` as the rolling
+`android-latest` asset (URL above).
 
 Historical import keeps its own contract: the phone reads
 `content://sms` (`TYPE IN (INBOX, SENT)`) with one `_ID` cursor, sends
 batches of 100, and the backend stores received rows as `messages` and sent
 rows as terminal `sms_commands` history. Neither direction is forwarded to
 Telegram. See [Historical import](#4-historical-import).
-
-The manifest
-also carries the MMS/WAP-push part of the role contract (`RECEIVE_MMS`,
-`RECEIVE_WAP_PUSH`, and a `WAP_PUSH_DELIVER` receiver); the relay does not
-implement MMS, and the receiver exists so Android and OEM role pickers list
-the app as a messaging app.
 
 Pairing and token storage live in the app: `PairingController` drives the QR
 flow, `QrCode` renders the payload on the phone, `PairingClient` talks to
