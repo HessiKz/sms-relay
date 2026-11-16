@@ -13,6 +13,13 @@
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.WRITE_SMS" />
 
+    <!-- The default-SMS-app role also requires the MMS/WAP-push
+         permissions and a WAP_PUSH_DELIVER receiver, even though this
+         relay only forwards SMS. Without them Android and several OEMs
+         do not list the app as a messaging app. -->
+    <uses-permission android:name="android.permission.RECEIVE_MMS" />
+    <uses-permission android:name="android.permission.RECEIVE_WAP_PUSH" />
+
     <!-- Needed to list the active SIMs (dual SIM). -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
 
@@ -110,6 +117,20 @@
             <intent-filter android:priority="999">
                 <action android:name="android.provider.Telephony.SMS_DELIVER" />
                 <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Required by the default-SMS-app role. The relay does not
+             implement MMS; this receiver exists so Android and OEM role
+             pickers recognise the app as a messaging app. MMS pushes are
+             acknowledged and ignored. -->
+        <receiver
+            android:name=".receiver.MmsReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_WAP_PUSH">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.WAP_PUSH_DELIVER" />
+                <data android:mimeType="application/vnd.wap.mms-message" />
             </intent-filter>
         </receiver>
 
