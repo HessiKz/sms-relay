@@ -500,3 +500,34 @@ names.
   run the manual Telegram/Android checks; make the bot contact search
   device-aware; remove `PHONE_A_TOKEN` from the live env file during
   the upgrade.
+
+## 2026-11-16 — GitHub Actions APK build and rolling release
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, lead), with GitHub Actions
+  as the builder.
+- **Task:** The operator asked to push the APK to GitHub, ensure it
+  builds without errors, provide a download URL, and make that
+  mandatory on every Android edit.
+- **Files:** `.github/workflows/android-build.yml`, `AGENTS.md`,
+  `README.md`, `.gitignore`, `docs/AGENT_LOG.md`.
+- **Changed:** the workflow now has `contents: write`, a serialized
+  `android-latest` concurrency group, and a release step that stages the
+  APK as `sms-relay-debug.apk` and publishes it on the rolling
+  `android-latest` GitHub release (replacing the old asset). The
+  project rules and README now require every Android change to build in
+  GitHub Actions and publish that asset; Actions artifact URLs are not
+  accepted as downloads. The local `.serena/` cache is ignored.
+- **Verification:** pushed the implementation and workflow commits
+  (`48e2bb5`, `202bf34`); workflow run `43921509808` completed with
+  `success`; the release has one asset, `sms-relay-debug.apk`
+  (7,315,405 bytes, state `uploaded`). An anonymous download returned
+  HTTP 200 and the file is a valid APK zip (909 entries). No local
+  Android build, deployment, or service change was performed.
+- **Decisions / risks:** the rolling release is marked prerelease and
+  its URL is stable; the APK is a debug build signed with the debug
+  keystore, so installing over a release-signed build may require
+  uninstalling the old app. The workflow triggers only for changes
+  under `android-app/` or the workflow itself.
+- **Follow-ups:** install the APK on a phone and run the pairing,
+  default-SMS, upload and command checks; keep the release URL in the
+  rule.
