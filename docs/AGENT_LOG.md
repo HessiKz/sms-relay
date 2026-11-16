@@ -964,3 +964,115 @@ names.
   lengthening the scan code; that is a server-side `_SCAN_CODE_LEN` change
   and the phone renders whatever it is given, so no APK update is needed.
 - **Commit:** see the pushed commit on `main` for this entry.
+
+## 2026-11-16 — Duplicate inbound SMS: diagnosis, Android 1.3.3 receiver guard
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode subagent).
+- **Task:** Inbound SMS appeared twice in Telegram and in the Mini App. Two
+  sources of duplication had to be separated: a live capture duplicate and
+  the bulk historical re-import, and the live one had to be stopped without
+  losing genuinely repeated messages.
+- **Files:** `android-app/app/src/main/java/dev/smsrelay/receiver/SmsReceiver.kt`,
+  `android-app/app/build.gradle.kts`, `docs/AGENT_LOG.md`.
+- **Changed:** `SmsReceiver` now returns early when the broadcast is
+  `SMS_RECEIVED` and this app holds the default-SMS-app role
+  (`if (!isDefaultSmsApp && RoleState.isDefaultSmsApp(context)) return`),
+  so `SMS_DELIVER` is the single canonical copy. Vendor builds (MIUI among
+  them) deliver both broadcasts to the default app; both copies were stored
+  with `source='sms'` and both were uploaded, because the local dedupe keeps
+  same-source repeats on purpose (two genuine "ok" messages must both
+  survive). The non-default case — where `SMS_RECEIVED` is the only
+  broadcast — and the cross-path dedupe are unchanged. Version bumped to
+  `versionCode 8` / `versionName 1.3.3`. Commit `149504e`.
+- **Verification:** diagnosis against the live database copy: **1** extra
+  live pair was attributable to the dual broadcast, and the bulk re-import
+  produced **1,039 duplicate groups / 5,039 rows**, none of which were ever
+  forwarded to Telegram (they are imported history). The APK was built by
+  GitHub Actions run **43960881846**, which finished clean and published
+  `sms-relay-debug.apk` on the rolling `android-latest` release; the asset
+  was downloaded and its contents verified at
+  <https://github.com/HessiKz/sms-relay/releases/download/android-latest/sms-relay-debug.apk>.
+  This was not built on the VPS (no Android toolchain there).
+- **Decisions / risks:** The fix is deliberately in the receiver, not in the
+  local dedupe: weakening same-source dedupe would silently drop real
+  repeats. A vendor build that sends only `SMS_RECEIVED` while the app is the
+  default app would lose that message — no such build is known, and the
+  platform contract delivers `SMS_DELIVER` to the default app. **The existing
+  duplicate rows were not cleaned up**: the live pair and the 1,039 imported
+  groups are still in the database.
+- **Follow-ups:** Installing 1.3.3 stops new live duplicates, but existing
+  duplicate rows remain. Cleaning them is a separate, deliberate data
+  operation on the live database (not performed here) and needs its own
+  backup and confirmation.
+
+## 2026-11-16 — Notification-only Telegram delivery with a deletion reaper
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode subagent).
+- **Task:** Every forwarded SMS put the whole message body into the Telegram
+  chat, which is server-mediated and keeps the text forever. The chat should
+  be a heads-up only; the content belongs in the Mini App.
+- **Files:** `backend/app/db.py`, `backend/app/delivery.py`,
+  `backend/app/tg.py`, `backend/app/main.py`,
+  `backend/tests/test_delivery.py`, `backend/tests/test_db.py`,
+  `backend/tests/test_miniapp_inbox.py`, `backend/tests/test_tg.py`,
+  `backend/tests/test_app_assembly.py`, `README.md`, `docs/AGENT_GUIDE.md`,
+  `docs/AGENT_LOG.md`.
+- **Changed:** `DeliveryWorker` no longer chunks and no longer sends
+  `messages.body`; it posts one notification —
+  `📥 New SMS`, `📱 <device name>`, the sender (device contact name, then the
+  name the phone attached, then the normalized number), the UTC timestamp,
+  and one `Open chat` `web_app` inline button built by
+  `delivery.thread_url(miniapp_url, thread_key, device_id)`. Device and
+  contact lookups degrade to `Unknown device` / raw sender instead of failing
+  the delivery. The obsolete `MAX_CHUNK_LEN`, `_split_html()` and `_chunks()`
+  were removed with it. `messages` gained `seen_at`, `telegram_sent_at`,
+  `telegram_delete_at`, `telegram_deleted_at` (additive `_ensure_column`
+  migrations plus the partial index `idx_messages_tg_delete`);
+  `telegram_msg_id` is kept and still powers reply-to-SMS and the
+  `details:`/`showmsg:` callbacks. `db.mark_message_notified()` records the
+  send and writes the deletion deadline: `sent_at + 86400` by default,
+  `sent_at + 300` when the message already has `seen_at`.
+  `db.mark_thread_read()` now sets `seen_at = COALESCE(seen_at, now)` for the
+  rows the read cursor covers and pulls that device/thread's notification
+  deadlines forward to `now + 300` (never back). `db.due_notifications()`
+  selects only rows with `telegram_sent_at`/`telegram_msg_id` set and no
+  `telegram_deleted_at`, excluding imports. `tg.delete_message()` with
+  `_interpret_ok()` treats a 2xx with `ok: true` **and** a 400
+  "message to delete not found" as success. `delivery.NotificationReaper`
+  runs every `REAPER_INTERVAL_S = 30` s on up to `REAPER_BATCH = 20` rows,
+  clears the pointer via `db.mark_notification_deleted()` on success or a
+  bad id, and calls `db.reschedule_notification()` (+`REAPER_RETRY_S = 300` s)
+  on a transient `TGError` or unexpected exception, so no row spins the loop.
+  `main.create_app()` starts the reaper next to the delivery worker, only
+  when `run_workers=True`.
+- **Verification:** full backend suite
+  `/tmp/opencode/venv311/bin/python -m pytest tests -q` →
+  **629 passed, 3 failed, 1 error** (632 collected), i.e. exactly the four
+  known pre-existing failures (`test_commands` ×2, `test_db` chat search,
+  `test_app_assembly` shutdown timing) and nothing new. `git diff --check`
+  is clean. Before deployment an online backup of the live database was taken
+  to `/var/backups/sms-relay/sms-relay-20261116-220253-pre-notify.db`
+  (integrity `ok`) and the backend files were installed to
+  `/opt/sms-relay/app/app/`; `systemctl is-active sms-relay-api` is `active`
+  and `/health` returns `{"ok":true}`. **No live test notification was
+  sent**, and the service was not restarted as part of this documentation
+  task. The live `db.py`, `delivery.py`, `tg.py`, `main.py` were confirmed
+  byte-identical to the repository.
+- **Decisions / risks:** Old forwarded messages stay in the chat as full
+  bodies and are never touched by the reaper (they have no
+  `telegram_sent_at`), and Telegram cannot delete anything older than 48 h
+  anyway — so the default deadline is 24 h, safely inside that limit.
+  Deleting a notification keeps the message row and its body; only the
+  Telegram pointer and deadline are cleared. Reply-to-SMS and the
+  `details:`/`showmsg:` callbacks rely on `telegram_msg_id`, so once a
+  notification is reaped there is nothing to reply to; that is intended.
+  A notification whose delete is permanently rejected (wrong bot rights, chat
+  migrated) is rescheduled every 300 s forever — one indexed row, not a
+  crash, but it never disappears. The reaper only runs when the workers are
+  enabled, so `create_app(run_workers=False)` never deletes anything.
+- **Follow-ups:** Existing duplicate rows (1,039 imported groups / 5,039 rows
+  and the one live pair) are still present; cleanup is pending and was **not**
+  performed. Watch the journal for `reaper rescheduled` after a day of live
+  traffic to confirm the default 24 h deadline deletes cleanly, and verify
+  the bot keeps the delete right in the admin chat.
+- **Commit:** see the pushed commit on `main` for this entry.

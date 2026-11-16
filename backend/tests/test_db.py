@@ -637,3 +637,189 @@ def test_device_seen_upserts_and_preserves_missing_fields(tmp_path):
     assert third["sims_json"] == "[]"
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM device_status").fetchone()["n"] == 1
+
+
+# --- Notification deadlines ---------------------------------------------
+
+def _notified_msg(conn, msg_id="n1", device=DEVICE, sender="09121234567",
+                  received_at=1_700_000_000):
+    db.record_message(conn, {"id": msg_id, "sender": sender, "body": "x",
+                             "received_at": received_at, "state": "delivered",
+                             "device_id": device})
+    return msg_id
+
+
+def _row(conn, msg_id):
+    return conn.execute("SELECT * FROM messages WHERE id = ?",
+                        (msg_id,)).fetchone()
+
+
+def test_migration_adds_the_notification_columns(tmp_path):
+    path = str(tmp_path / "old.db")
+    _old_db(path)
+
+    conn = db.open_db(path)
+    try:
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(messages)")}
+        assert {"seen_at", "telegram_sent_at", "telegram_delete_at",
+                "telegram_deleted_at", "telegram_msg_id"} <= columns
+        conn.execute("UPDATE messages SET telegram_msg_id = '9' WHERE id = 'm1'")
+        conn.execute("UPDATE messages SET seen_at = 5 WHERE id = 'm1'")
+        db.migrate(conn)
+        db.migrate(conn)
+        row = _row(conn, "m1")
+        assert row["telegram_msg_id"] == "9"
+        assert row["seen_at"] == 5
+        assert db.counts_by_state(conn) == {"delivered": 2}
+    finally:
+        conn.close()
+
+
+def test_mark_message_notified_sets_id_time_and_24h_default(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    _notified_msg(conn)
+
+    db.mark_message_notified(conn, "n1", 42, 2_000_000_000)
+
+    row = _row(conn, "n1")
+    assert row["telegram_msg_id"] == "42"
+    assert row["telegram_sent_at"] == 2_000_000_000
+    assert row["telegram_delete_at"] == 2_000_000_000 + 86400
+    assert row["telegram_deleted_at"] is None
+
+
+def test_mark_message_notified_after_a_read_uses_five_minutes(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    _notified_msg(conn)
+    conn.execute("UPDATE messages SET seen_at = 1 WHERE id = 'n1'")
+
+    db.mark_message_notified(conn, "n1", 43, 2_000_000_000)
+
+    row = _row(conn, "n1")
+    assert row["telegram_delete_at"] == 2_000_000_000 + 300
+
+
+def test_mark_message_notified_unknown_id_raises(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    with pytest.raises(LookupError):
+        db.mark_message_notified(conn, "missing", 1, 2)
+
+
+def test_mark_notification_deleted_clears_the_pointer(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    _notified_msg(conn)
+    db.mark_message_notified(conn, "n1", 42, 2_000_000_000)
+
+    db.mark_notification_deleted(conn, "n1", 2_000_000_500)
+
+    row = _row(conn, "n1")
+    assert row["telegram_deleted_at"] == 2_000_000_500
+    assert row["telegram_msg_id"] is None
+    assert row["telegram_delete_at"] is None
+    assert db.due_notifications(conn, 2_000_001_000) == []
+
+
+def test_due_notifications_only_returns_live_due_rows(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 2_000_000_000
+    for msg_id in ("due", "later", "deleted", "noid", "imported", "legacy"):
+        _notified_msg(conn, msg_id=msg_id)
+    db.mark_message_notified(conn, "due", 1, now)
+    db.mark_message_notified(conn, "later", 2, now)
+    db.mark_message_notified(conn, "deleted", 3, now)
+    db.mark_message_notified(conn, "noid", 4, now)
+    db.mark_message_notified(conn, "imported", 5, now)
+    conn.execute("UPDATE messages SET telegram_delete_at = ? WHERE id = 'later'",
+                 (now + 86400 + 60,))
+    conn.execute("UPDATE messages SET telegram_deleted_at = ? WHERE id = 'deleted'",
+                 (now,))
+    conn.execute("UPDATE messages SET telegram_msg_id = NULL WHERE id = 'noid'")
+    conn.execute("UPDATE messages SET source = 'import' WHERE id = 'imported'")
+    # A row forwarded by the old code: a message id, no sent time.
+    conn.execute("UPDATE messages SET telegram_msg_id = '6',"
+                 " telegram_sent_at = NULL WHERE id = 'legacy'")
+
+    rows = db.due_notifications(conn, now + 86400 + 1)
+
+    assert [row["id"] for row in rows] == ["due"]
+    assert rows[0]["telegram_msg_id"] == "1"
+
+
+def test_mark_thread_read_marks_only_that_device_and_thread_seen(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    _notified_msg(conn, msg_id="a-old", received_at=now - 10)
+    _notified_msg(conn, msg_id="a-new", received_at=now + 100)
+    _notified_msg(conn, msg_id="a-other", sender="09120000001",
+                  received_at=now - 10)
+    _notified_msg(conn, msg_id="b-old", device="device-b", received_at=now - 10)
+
+    db.mark_thread_read(conn, DEVICE, "989121234567", now)
+
+    assert _row(conn, "a-old")["seen_at"] is not None
+    assert _row(conn, "a-new")["seen_at"] is None
+    assert _row(conn, "a-other")["seen_at"] is None
+    assert _row(conn, "b-old")["seen_at"] is None
+
+
+def test_mark_thread_read_shortens_only_the_notified_rows_to_five_minutes(
+        tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = int(time.time())
+    _notified_msg(conn, msg_id="tg-live", received_at=now - 10)
+    _notified_msg(conn, msg_id="tg-gone", received_at=now - 10)
+    _notified_msg(conn, msg_id="no-tg", received_at=now - 10)
+    db.mark_message_notified(conn, "tg-live", 1, now - 1000)
+    db.mark_message_notified(conn, "tg-gone", 2, now - 1000)
+    conn.execute("UPDATE messages SET telegram_deleted_at = ? WHERE id = 'tg-gone'",
+                 (now - 500,))
+    db.mark_message_notified(conn, "no-tg", 3, now - 1000)
+    conn.execute("UPDATE messages SET telegram_msg_id = NULL,"
+                 " telegram_delete_at = NULL WHERE id = 'no-tg'")
+
+    db.mark_thread_read(conn, DEVICE, "989121234567", now)
+
+    live = _row(conn, "tg-live")
+    assert live["seen_at"] in (now, now + 1, now + 2)
+    assert now + 300 <= live["telegram_delete_at"] <= now + 302
+    gone = _row(conn, "tg-gone")
+    assert gone["telegram_delete_at"] == now - 1000 + 86400
+    assert gone["telegram_deleted_at"] == now - 500
+    assert _row(conn, "no-tg")["telegram_delete_at"] is None
+
+
+def test_mark_thread_read_does_not_extend_a_sooner_deadline(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    _notified_msg(conn, msg_id="soon")
+    db.mark_message_notified(conn, "soon", 1, now - 1000)
+    conn.execute("UPDATE messages SET telegram_delete_at = ? WHERE id = 'soon'",
+                 (100,))
+
+    db.mark_thread_read(conn, DEVICE, "989121234567", now)
+
+    assert _row(conn, "soon")["telegram_delete_at"] == 100
+
+
+def test_mark_thread_read_keeps_the_first_seen_at(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    _notified_msg(conn, msg_id="once", received_at=now - 10)
+
+    db.mark_thread_read(conn, DEVICE, "989121234567", now)
+    first = _row(conn, "once")["seen_at"]
+    db.mark_thread_read(conn, DEVICE, "989121234567", now + 50)
+
+    assert first is not None
+    assert _row(conn, "once")["seen_at"] == first
+
+
+def test_reschedule_notification_pushes_the_deadline(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    _notified_msg(conn, msg_id="push")
+    db.mark_message_notified(conn, "push", 1, 1000)
+
+    db.reschedule_notification(conn, "push", 5000, delay=300)
+
+    assert _row(conn, "push")["telegram_delete_at"] == 5300

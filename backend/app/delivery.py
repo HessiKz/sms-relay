@@ -2,7 +2,13 @@ import asyncio
 import logging
 import random
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote
+
+import app.db as db
+from app import phones
+from app.tg import TGError
+
 
 def _html_escape(value: str) -> str:
     return (value.replace("&", "&amp;")
@@ -10,42 +16,8 @@ def _html_escape(value: str) -> str:
             .replace(">", "&gt;"))
 
 
-def _split_html(text: str, limit: int):
-    """Split escaped HTML without cutting an entity in half.
-
-    The cut is backed up to the start of a trailing ``&...;`` entity, so
-    a chunk never ends with ``&``, ``&am`` or similar. ``limit`` is the
-    maximum length of every returned piece.
-    """
-    limit = max(1, int(limit))
-    if len(text) <= limit:
-        return [text]
-    pieces = []
-    while len(text) > limit:
-        cut = limit
-        amp = text.rfind("&", 0, cut)
-        semicolon = text.rfind(";", 0, cut)
-        if amp > semicolon:
-            cut = amp
-        if cut <= 0:
-            # An entity longer than the limit: nothing safe to back up
-            # to. This cannot happen with MAX_CHUNK_LEN in practice.
-            cut = limit
-        pieces.append(text[:cut])
-        text = text[cut:]
-    if text:
-        pieces.append(text)
-    return pieces
-
-
-from datetime import datetime, timezone
-
-import app.db as db
-from app.tg import TGError
-
 log = logging.getLogger(__name__)
 
-MAX_CHUNK_LEN = 4090  # Telegram accepts 4096; the header is included
 MIN_RETRY_AFTER = 1
 MAX_RETRY_AFTER = 3600
 RETRY_AFTER_FALLBACK = 60
@@ -57,6 +29,13 @@ STALE_LOCK_SECONDS = 300
 ERROR_DETAIL_MAX = 200
 ERROR_COOLDOWN = 5.0
 _AMBIGUOUS_KINDS = frozenset({"timeout", "network", "unavailable"})
+
+# A notification is a short heads-up, not a copy of the SMS: it carries
+# the device, the sender and the time, and a button into the Mini App.
+REAPER_INTERVAL_S = 30.0
+REAPER_BATCH = 20
+REAPER_RETRY_S = 300
+DEVICE_FALLBACK = "Unknown device"
 
 
 def thread_url(base: str | None, thread_key: str | None,
@@ -181,29 +160,22 @@ class DeliveryWorker:
         msg_id = row["id"]
         chat_id = self.settings.telegram_chat_id
         try:
-            telegram_msg_id = None
-            chunks = self._chunks(row)
-            for index, chunk in enumerate(chunks):
-                keyboard = None
-                if index == len(chunks) - 1:
-                    buttons = [{"text": "\U0001F50D More details",
-                                "callback_data": f"details:{row['id']}"}]
-                    thread_key = (row["thread_key"]
-                                  if "thread_key" in row.keys() else None)
-                    device_id = (row["device_id"]
-                                 if "device_id" in row.keys() else None)
-                    url = thread_url(self.settings.miniapp_url, thread_key,
-                                     device_id)
-                    if url:
-                        buttons.append({"text": "Open chat",
-                                        "web_app": {"url": url}})
-                    keyboard = {"inline_keyboard": [buttons]}
-                result = await self.telegram.send_to_chat(
-                    chat_id, chunk, keyboard=keyboard, parse_mode="HTML")
-                value = result.get("message_id") if isinstance(result, dict) else None
-                if not isinstance(value, int):
-                    raise TGError("api_error", detail="response missing message_id")
-                telegram_msg_id = str(value)
+            text = self._notification_text(row)
+            thread_key = (row["thread_key"]
+                          if "thread_key" in row.keys() else None)
+            device_id = (row["device_id"]
+                         if "device_id" in row.keys() else None)
+            keyboard = None
+            url = thread_url(self.settings.miniapp_url, thread_key, device_id)
+            if url:
+                keyboard = {"inline_keyboard": [[
+                    {"text": "Open chat", "web_app": {"url": url}}]]}
+            result = await self.telegram.send_to_chat(
+                chat_id, text, keyboard=keyboard, parse_mode="HTML")
+            value = result.get("message_id") if isinstance(result, dict) else None
+            if not isinstance(value, int):
+                raise TGError("api_error", detail="response missing message_id")
+            telegram_msg_id = str(value)
         except ValueError as exc:
             self._record_outcome(msg_id, "failed", attempts, now, None,
                                  f"invalid_input: {str(exc)[:ERROR_DETAIL_MAX]}"
@@ -219,6 +191,14 @@ class DeliveryWorker:
         else:
             db.update_state(self.db_conn, msg_id, "delivered", attempts, now,
                             telegram_msg_id=telegram_msg_id, last_error=None)
+            try:
+                db.mark_message_notified(self.db_conn, msg_id,
+                                         telegram_msg_id, now)
+            except Exception as exc:
+                # The notification is already in the chat; a failed
+                # deadline bookkeeping must not fail the delivery.
+                log.warning("sms-relay notify bookkeeping failed msg_id=%s"
+                            " kind=%s", msg_id, type(exc).__name__)
             log.info("sms-relay delivered msg_id=%s attempts=%d", msg_id, attempts)
 
     def _record_outcome(self, msg_id, state, attempts, next_attempt_at,
@@ -249,55 +229,53 @@ class DeliveryWorker:
             return f"{exc.kind}: {detail}"[:ERROR_DETAIL_MAX]
         return exc.kind
 
-    def _chunks(self, row):
-        header = self._header(row)
-        body = _html_escape(row["body"] or "")
-        text = header + body
-        if len(text) <= MAX_CHUNK_LEN:
-            return [text]
-        slice_len = max(1, MAX_CHUNK_LEN - len(header))
-        return [header + piece for piece in _split_html(body, slice_len)]
+    def _notification_text(self, row):
+        """The one-line notification of an inbound SMS.
 
-    def _device_label(self, row):
-        """The `📱 <b>name</b>` line for the device that captured the SMS.
-
-        Every forwarded inbound SMS lands in one shared chat, so the
-        label is what tells the admin which phone it came from. A
-        message with no device, or one whose device row has vanished,
-        simply gets no label: a failed lookup must never block
-        delivery.
+        The body never leaves the relay: the admin gets the device, the
+        sender and the time, and opens the Mini App for the content.
         """
-        try:
-            if "device_id" not in row.keys():
-                return ""
-            device_id = row["device_id"]
-            if not device_id:
-                return ""
-            device = db.device_by_id(self.db_conn, device_id)
-            name = device.get("name") if device else None
-            if not name:
-                return ""
-            return f"📱 <b>{_html_escape(str(name))}</b>\n"
-        except Exception:
-            log.warning("sms-relay delivery device label lookup failed",
-                        exc_info=True)
-            return ""
-
-    def _header(self, row):
-        id8 = str(row["id"])[:8]
-        seq = int(row["part_index"]) + 1
-        parts = max(int(row["parts"] or 1), 1)
+        device = DEVICE_FALLBACK
+        device_id = row["device_id"] if "device_id" in row.keys() else None
+        if device_id:
+            try:
+                found = db.device_by_id(self.db_conn, device_id)
+                name = found.get("name") if found else None
+                if name:
+                    device = str(name)
+            except Exception:
+                log.warning("sms-relay delivery device lookup failed",
+                            exc_info=True)
+        sender = self._sender_label(row)
         ts = datetime.fromtimestamp(int(row["received_at"]), tz=timezone.utc)
-        sender = (row["sender_name"] if "sender_name" in row.keys() else None) or row["sender"]
-        sender = _html_escape(str(sender))
-        raw_sender = _html_escape(str(row["sender"]))
-        suffix = ""
-        if sender != raw_sender:
-            suffix = f"  <code>{raw_sender}</code>"
-        return (f"<b>{sender}</b>{suffix}\n"
-                f"<i>{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC</i>\n"
-                f"{self._device_label(row)}"
-                f"\n")
+        return (f"\U0001F4E5 <b>New SMS</b>\n"
+                f"\U0001F4F1 <b>{_html_escape(device)}</b>\n"
+                f"<b>{_html_escape(sender)}</b>\n"
+                f"<i>{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
+
+    def _sender_label(self, row):
+        """The contact name of the thread, otherwise the sender number.
+
+        The device's own contact list wins over the name the phone
+        attached to the SMS, which in turn wins over the sender number.
+        """
+        thread_key = row["thread_key"] if "thread_key" in row.keys() else None
+        device_id = row["device_id"] if "device_id" in row.keys() else None
+        if thread_key:
+            try:
+                name = db.device_contact_name_for_key(
+                    self.db_conn, device_id, thread_key)
+                if name:
+                    return str(name)
+            except Exception:
+                log.warning("sms-relay delivery contact lookup failed",
+                            exc_info=True)
+        name = row["sender_name"] if "sender_name" in row.keys() else None
+        if name:
+            return str(name)
+        if thread_key and not thread_key.startswith("raw:"):
+            return phones.display_number(thread_key)
+        return str(row["sender"])
 
     def _idle_delay(self):
         """Seconds until the next claimable job is due.
@@ -324,3 +302,75 @@ class DeliveryWorker:
             # caller yields to the event loop before continuing.
             return 0.0
         return float(min(IDLE_DELAY, delay))
+
+
+class NotificationReaper:
+    """Deletes Telegram notifications that have outlived their deadline.
+
+    A notification is removed 5 minutes after the Mini App read the
+    message, or 24 hours after it was sent when it was never read. The
+    worker is cheap: one indexed query per interval, and a failure on
+    one notification never stops the others.
+    """
+
+    def __init__(self, db_conn, settings, telegram, *,
+                 interval=REAPER_INTERVAL_S, batch_size=REAPER_BATCH):
+        self.db_conn = db_conn
+        self.settings = settings
+        self.telegram = telegram
+        self.interval = max(1.0, float(interval))
+        self.batch_size = max(1, int(batch_size))
+
+    def poke(self):
+        """Compatibility hook: the reaper only polls, nothing to signal."""
+        return None
+
+    async def run(self, stop):
+        while not stop.is_set():
+            try:
+                await self.run_once()
+            except Exception as exc:
+                log.warning("sms-relay reaper cycle aborted kind=%s",
+                            type(exc).__name__)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def run_once(self, now=None):
+        now = int(time.time()) if now is None else int(now)
+        chat_id = self.settings.telegram_chat_id
+        removed = 0
+        for row in db.due_notifications(self.db_conn, now,
+                                        limit=self.batch_size):
+            msg_id = row["id"]
+            raw = row["telegram_msg_id"]
+            try:
+                message_id = int(raw)
+            except (TypeError, ValueError):
+                # A row that cannot name its Telegram message would be
+                # retried forever: clear it instead.
+                log.warning("sms-relay reaper dropped msg_id=%s kind=bad_id",
+                            msg_id)
+                db.mark_notification_deleted(self.db_conn, msg_id, now)
+                continue
+            try:
+                await self.telegram.delete_message(chat_id, message_id)
+            except ValueError:
+                log.warning("sms-relay reaper dropped msg_id=%s kind=bad_input",
+                            msg_id)
+                db.mark_notification_deleted(self.db_conn, msg_id, now)
+            except TGError as exc:
+                log.warning("sms-relay reaper rescheduled msg_id=%s kind=%s",
+                            msg_id, exc.kind)
+                db.reschedule_notification(self.db_conn, msg_id, now,
+                                           REAPER_RETRY_S)
+            except Exception as exc:
+                log.warning("sms-relay reaper rescheduled msg_id=%s kind=%s",
+                            msg_id, type(exc).__name__)
+                db.reschedule_notification(self.db_conn, msg_id, now,
+                                           REAPER_RETRY_S)
+            else:
+                db.mark_notification_deleted(self.db_conn, msg_id, now)
+                removed += 1
+        return removed

@@ -81,6 +81,28 @@ class TelegramClient:
             raise TGError("network", detail=f"transport failure ({type(exc).__name__})") from exc
         return self._interpret(response)
 
+    async def delete_message(self, chat_id: Any, message_id: int) -> dict:
+        """Delete one bot message from the chat.
+
+        Used by the notification reaper. Telegram answers ``True``, so
+        the shared ``_interpret`` (which expects a message id) cannot be
+        reused here.
+        """
+        if chat_id is None or chat_id == "":
+            raise ValueError("chat_id is required")
+        if not isinstance(message_id, int):
+            raise ValueError("message_id must be an int")
+        payload: dict[str, Any] = {"chat_id": chat_id,
+                                   "message_id": message_id}
+        url = f"{self.base_url}/bot{self.bot_token}/deleteMessage"
+        try:
+            response = await self.http.post(url, json=payload)
+        except httpx.TimeoutException as exc:
+            raise TGError("timeout", detail=f"timed out ({type(exc).__name__})") from exc
+        except httpx.TransportError as exc:
+            raise TGError("network", detail=f"transport failure ({type(exc).__name__})") from exc
+        return self._interpret_ok(response)
+
     async def get_updates(self, offset: int | None, timeout: int) -> list[dict]:
         """Long-poll Telegram getUpdates; param types come from the API spec."""
         params: dict[str, Any] = {"timeout": timeout}
@@ -159,6 +181,38 @@ class TelegramClient:
             await self.http.post(url, json=payload)
         except (httpx.TimeoutException, httpx.TransportError):
             pass
+
+    def _interpret_ok(self, response: httpx.Response) -> dict:
+        """Interpret a call whose Telegram result is ``true`` (deleteMessage).
+
+        A "message to delete not found" answer is a success for the
+        reaper: the notification is already gone, so its row must be
+        cleared, not retried forever.
+        """
+        status = response.status_code
+        if status == 429:
+            body = _json_body(response)
+            parameters = body.get("parameters") if body is not None else None
+            if isinstance(parameters, dict) and isinstance(parameters.get("retry_after"), int):
+                retry_after = parameters["retry_after"]
+            else:
+                retry_after = _parse_retry_after(response.headers.get("retry-after"))
+            raise TGError("rate_limited", retry_after=retry_after, detail="rate limited (429)")
+        if 200 <= status < 300:
+            body = _json_body(response)
+            if body is not None and body.get("ok") is True:
+                return {"ok": True}
+            raise TGError("api_error", detail="malformed response body")
+        if status >= 500:
+            raise TGError("api_error", detail=f"telegram server error (status {status})")
+        body = _json_body(response)
+        description = body.get("description") if body is not None else None
+        detail = str(description)[:200] if description is not None else ""
+        if detail and "not found" in detail.lower():
+            return {"ok": True, "already_gone": True}
+        if body is not None and body.get("ok") is False:
+            raise TGError("bad_request", detail=f"telegram rejected request (status {status}): {detail}".strip())
+        raise TGError("api_error", detail=f"unexpected response (status {status})")
 
     def _interpret(self, response: httpx.Response) -> dict:
         status = response.status_code

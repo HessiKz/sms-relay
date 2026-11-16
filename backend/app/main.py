@@ -15,7 +15,7 @@ from starlette.datastructures import Headers
 
 import app.db as db
 from app import api, config, importer, ingest, miniapp, pairing, rev, security
-from app.delivery import DeliveryWorker
+from app.delivery import DeliveryWorker, NotificationReaper
 from app.tg import TelegramClient
 from app.updater import Updater
 
@@ -239,6 +239,11 @@ def create_app(settings, *, run_workers=True) -> FastAPI:
             tasks = [asyncio.create_task(worker.run(stop),
                                          name="delivery-worker")]
             app.state.delivery_worker = worker
+            reaper = NotificationReaper(app.state.db_conn,
+                                        app.state.settings, app.state.tg)
+            tasks.append(asyncio.create_task(reaper.run(stop),
+                                             name="notification-reaper"))
+            app.state.notification_reaper = reaper
             if not _updater_disabled():
                 updater = Updater(app.state.db_conn, app.state.settings,
                                   app.state.poll_tg, poke_event=poke,

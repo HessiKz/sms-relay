@@ -392,3 +392,105 @@ async def test_get_updates_connect_error_maps_to_network():
         await telegram.get_updates(None, 30)
 
     assert exc_info.value.kind == "network"
+
+
+@pytest.mark.anyio
+async def test_delete_message_posts_chat_and_message_id():
+    handler, calls = _handler_factory(
+        _tg_response(200, {"ok": True, "result": True})
+    )
+    telegram = _make_client(handler)
+
+    result = await telegram.delete_message("-100", 77)
+
+    assert result == {"ok": True}
+    request = calls[0]
+    assert request.method == "POST"
+    assert request.url.path == f"/bot{BOT_TOKEN}/deleteMessage"
+    assert _body(request) == {"chat_id": "-100", "message_id": 77}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chat_id,message_id", [(None, 1), ("", 1),
+                                                ("-100", "77"),
+                                                ("-100", None)])
+async def test_delete_message_validates_arguments(chat_id, message_id):
+    handler, calls = _handler_factory(
+        _tg_response(200, {"ok": True, "result": True})
+    )
+    telegram = _make_client(handler)
+
+    with pytest.raises(ValueError):
+        await telegram.delete_message(chat_id, message_id)
+
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_delete_message_not_found_is_treated_as_gone():
+    handler, _ = _handler_factory(_tg_response(
+        400, {"ok": False, "error_code": 400,
+              "description": "Bad Request: message to delete not found"}))
+    telegram = _make_client(handler)
+
+    result = await telegram.delete_message("-100", 5)
+
+    assert result == {"ok": True, "already_gone": True}
+
+
+@pytest.mark.anyio
+async def test_delete_message_400_maps_to_bad_request():
+    handler, _ = _handler_factory(_tg_response(
+        400, {"ok": False, "error_code": 400,
+              "description": "Bad Request: message can't be deleted"}))
+    telegram = _make_client(handler)
+
+    with pytest.raises(TGError) as exc_info:
+        await telegram.delete_message("-100", 5)
+
+    assert exc_info.value.kind == "bad_request"
+    assert "can't be deleted" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_delete_message_429_maps_to_rate_limited():
+    handler, _ = _handler_factory(_tg_response(429, {"ok": False}))
+    telegram = _make_client(handler)
+
+    with pytest.raises(TGError) as exc_info:
+        await telegram.delete_message("-100", 5)
+
+    assert exc_info.value.kind == "rate_limited"
+
+
+@pytest.mark.anyio
+async def test_delete_message_5xx_maps_to_api_error():
+    handler, _ = _handler_factory(_tg_response(503, {"ok": False}))
+    telegram = _make_client(handler)
+
+    with pytest.raises(TGError) as exc_info:
+        await telegram.delete_message("-100", 5)
+
+    assert exc_info.value.kind == "api_error"
+
+
+@pytest.mark.anyio
+async def test_delete_message_timeout_and_network_map_to_transient():
+    for transport_error, kind in ((httpx.ReadTimeout("t"), "timeout"),
+                                  (httpx.ConnectError("n"), "network")):
+        handler, _ = _handler_factory(raise_error=transport_error)
+        telegram = _make_client(handler)
+        with pytest.raises(TGError) as exc_info:
+            await telegram.delete_message("-100", 5)
+        assert exc_info.value.kind == kind
+
+
+@pytest.mark.anyio
+async def test_delete_message_malformed_body_maps_to_api_error():
+    handler, _ = _handler_factory(_tg_response(200, {"ok": False}))
+    telegram = _make_client(handler)
+
+    with pytest.raises(TGError) as exc_info:
+        await telegram.delete_message("-100", 5)
+
+    assert exc_info.value.kind == "api_error"

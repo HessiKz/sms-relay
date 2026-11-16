@@ -599,3 +599,97 @@ def test_an_unknown_device_is_404(client):
     assert client.post(f"{missing}/chats/989121234567/messages",
                        json={"body": "hi", "client_ref": "ref-unknown-1"},
                        headers=ADMIN).status_code == 404
+
+
+# --- Reading a thread schedules the notification deletion ----------------
+
+def _message_row(client, msg_id):
+    conn = client.app.state.db_conn
+    return conn.execute("SELECT * FROM messages WHERE id = ?",
+                        (msg_id,)).fetchone()
+
+
+def _notify(client, msg_id, telegram_id=11, sent_at=None):
+    conn = client.app.state.db_conn
+    db.mark_message_notified(conn, msg_id, telegram_id,
+                             _now() if sent_at is None else sent_at)
+
+
+def test_read_marks_messages_seen_and_shortens_the_notification(client):
+    now = _now()
+    _send(client, "seen-1", body="first", ts=now - 60)
+    _notify(client, "seen-1", sent_at=now - 120)
+
+    response = client.post(f"/app/api/devices/{DEVICE_ID}/chats/{THREAD}/read",
+                           json={"until_ts": now}, headers=ADMIN)
+
+    assert response.status_code == 200
+    row = _message_row(client, "seen-1")
+    assert row["seen_at"] is not None
+    assert row["telegram_deleted_at"] is None
+    assert row["telegram_delete_at"] is not None
+    # 5 minutes, not the 24 h the notification was sent with.
+    assert row["telegram_delete_at"] <= now + 305
+    assert row["telegram_delete_at"] >= now + 280
+
+
+def test_read_leaves_a_later_message_unseen_and_its_deadline_long(client):
+    now = _now()
+    _send(client, "early-1", body="one", ts=now - 60)
+    _send(client, "late-1", body="two", ts=now + 120)
+    conn = client.app.state.db_conn
+    # Both have a notification; only the earlier one is covered by until_ts.
+    conn.execute("UPDATE messages SET telegram_msg_id = '21',"
+                 " telegram_sent_at = ?, telegram_delete_at = ?"
+                 " WHERE id = 'early-1'", (now - 120, now - 120 + 86400))
+    conn.execute("UPDATE messages SET telegram_msg_id = '22',"
+                 " telegram_sent_at = ?, telegram_delete_at = ?"
+                 " WHERE id = 'late-1'", (now - 120, now - 120 + 86400))
+
+    client.post(f"/app/api/devices/{DEVICE_ID}/chats/{THREAD}/read",
+                json={"until_ts": now}, headers=ADMIN)
+
+    early = _message_row(client, "early-1")
+    late = _message_row(client, "late-1")
+    assert early["seen_at"] is not None
+    assert late["seen_at"] is None
+    assert early["telegram_delete_at"] <= now + 305
+    assert late["telegram_delete_at"] == now - 120 + 86400
+
+
+def test_read_does_not_touch_another_threads_notification(client):
+    now = _now()
+    _send(client, "thread-1", body="one", ts=now - 60)
+    _send(client, "other-1", sender="09120000009", body="two", ts=now - 60)
+    conn = client.app.state.db_conn
+    conn.execute("UPDATE messages SET telegram_msg_id = '31',"
+                 " telegram_sent_at = ?, telegram_delete_at = ?"
+                 " WHERE id = 'thread-1'", (now - 120, now - 120 + 86400))
+    conn.execute("UPDATE messages SET telegram_msg_id = '32',"
+                 " telegram_sent_at = ?, telegram_delete_at = ?"
+                 " WHERE id = 'other-1'", (now - 120, now - 120 + 86400))
+
+    client.post(f"/app/api/devices/{DEVICE_ID}/chats/{THREAD}/read",
+                json={"until_ts": now}, headers=ADMIN)
+
+    assert _message_row(client, "thread-1")["seen_at"] is not None
+    assert _message_row(client, "other-1")["seen_at"] is None
+    assert _message_row(client, "other-1")["telegram_delete_at"] == now - 120 + 86400
+
+
+def test_read_of_a_deleted_notification_does_not_resurrect_it(client):
+    now = _now()
+    _send(client, "gone-1", body="one", ts=now - 60)
+    conn = client.app.state.db_conn
+    conn.execute("UPDATE messages SET telegram_msg_id = NULL,"
+                 " telegram_sent_at = ?, telegram_delete_at = NULL,"
+                 " telegram_deleted_at = ? WHERE id = 'gone-1'",
+                 (now - 120, now - 30))
+
+    client.post(f"/app/api/devices/{DEVICE_ID}/chats/{THREAD}/read",
+                json={"until_ts": now}, headers=ADMIN)
+
+    row = _message_row(client, "gone-1")
+    assert row["seen_at"] is not None
+    assert row["telegram_deleted_at"] is not None
+    assert row["telegram_delete_at"] is None

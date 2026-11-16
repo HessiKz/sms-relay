@@ -16,8 +16,10 @@ A multi-device SMS bridge for a single admin:
   poll for outbound commands and send through their own SIM. A phone is not
   trusted by default: it has to be paired with the backend through a QR
   hand-shake before it may talk to it.
-- **Backend (VPS)** receives, stores, filters and forwards messages to one
-  private Telegram chat. Every forwarded message carries the name of the
+- **Backend (VPS)** receives, stores and filters messages, and posts one short
+  notification per inbound SMS to one private Telegram chat: device name,
+  sender, UTC time, and an "Open chat" button. The SMS body never goes to
+  Telegram; it lives in SQLite and in the Mini App. Every notification carries the name of the
   device that captured it. It also runs the admin bot and serves the Mini App.
 - **Mini App** is a Telegram WebApp with a composer. It is device-first: the
   admin picks a device and sees only that device's conversations. It talks to
@@ -31,9 +33,10 @@ Three rules shape everything else:
   `(device_id, thread_key)`: the same phone number on two phones is two
   different threads, and a device never sees the history, the contacts or
   the unread counters of another device.
-- **One shared Telegram chat.** There is no per-device chat. The device label
-  on the forwarded message and the device-first Mini App keep the streams
-  apart; the bot routes a reply back to the device that captured the message.
+- **One shared Telegram chat.** There is no per-device chat. The device line
+  of the notification and the device-first Mini App keep the streams apart;
+  the bot routes a reply back to the device that captured the message, as
+  long as the notification still exists (`telegram_msg_id`).
 - **The Phone B fallback is frozen.** The fallback to a second phone over its
   own SIM is deprecated in this model and off by default. The live fallback
   configuration is the phone's local `SettingsStore`, not the backend
@@ -67,6 +70,10 @@ own bearer token.
    with 404 so a phone cannot even learn that the command exists.
 5. **Durability before network.** Android writes to Room before uploading.
    The backend writes `messages` + `jobs` before calling Telegram.
+   **The body never leaves the relay over Telegram.** `DeliveryWorker` sends a
+   notification (device, sender, UTC time, Mini App button), never
+   `messages.body`. Do not add the body back to the notification, and do not
+   log it.
 6. **No message body in logs.** Log ids, kinds, counts, and state, never SMS
    text, phone numbers, contact names, tokens, or initData.
 7. **Fallback is conservative.** Only a confirmed backend `failed` state (or a
@@ -91,8 +98,8 @@ own bearer token.
 | `backend/app/importer.py` | `POST /import` historical inbox and sent folder | import format, direction, limits, import dedupe |
 | `backend/app/api.py` | device/admin REST API, status, settings, filters | REST contracts or admin controls |
 | `backend/app/pairing.py` | public pairing endpoints (`/pair/start`, `/pair/claim`) and the Mini App pairing/device endpoints | pairing flow, device lifecycle, device list |
-| `backend/app/delivery.py` | delivery worker, chunking, retry policy, Telegram buttons, device label | forwarding behavior |
-| `backend/app/tg.py` | Telegram HTTP client and error taxonomy | Bot API calls, error classification |
+| `backend/app/delivery.py` | delivery worker, notification text, retry policy, Telegram button, `NotificationReaper` | notification behavior, notification deletion |
+| `backend/app/tg.py` | Telegram HTTP client and error taxonomy, including `deleteMessage` (`_interpret_ok`) | Bot API calls, error classification |
 | `backend/app/updater.py` | long-poll loop, bot commands, callbacks, command creation, default-device routing | bot commands and Telegram UX |
 | `backend/app/flow.py` | in-memory guided conversation state | button conversation steps |
 | `backend/app/tg_ui.py` | keyboard builders, masking, number normalization | keyboard layout, typed-number parsing |
@@ -138,8 +145,27 @@ first 11 characters are kept in `devices.token_prefix` for the UI).
   - `source` is `sms`, `notification`, or `import`.
   - `state` is one of `received`, `pending`, `delivered`, `failed`,
     `uncertain`.
-  - `telegram_msg_id` stores the last successfully sent Telegram message id;
-    it powers reply-to-SMS.
+  - `telegram_msg_id` stores the Telegram message id of the last notification
+    sent for this row. It powers reply-to-SMS (`db.find_by_telegram_id`) and
+    the `details:`/`showmsg:` edit callbacks. `NotificationReaper` clears it
+    when the notification is deleted.
+  - `telegram_sent_at` is when Telegram accepted the notification. It is the
+    marker of "this row was delivered as a notification": imported history and
+    rows forwarded by the old body-forwarding code have it NULL, so the reaper
+    never queues them.
+  - `seen_at` is when the Mini App read this row. `mark_thread_read()` fills
+    it with `COALESCE(seen_at, now)` for the rows the read cursor covers; it
+    never moves back.
+  - `telegram_delete_at` is the deletion deadline. `mark_message_notified()`
+    writes `sent_at + 86400`, or `sent_at + 300` when `seen_at` is already
+    set. A read pulls it forward with `MIN(COALESCE(...), now + 300)` — never
+    back. `db.reschedule_notification()` pushes it forward by 300 s after a
+    transient delete failure.
+  - `telegram_deleted_at` is set once the notification is confirmed gone (or
+    answered "message to delete not found"). `mark_notification_deleted()`
+    writes it and clears `telegram_msg_id`/`telegram_delete_at`.
+  - `idx_messages_tg_delete` is a partial index on `telegram_delete_at`, so
+    `db.due_notifications()` scans only the live deadlines.
 - `jobs`: one row per message that still needs forwarding. It has its own
   `attempts`, `next_attempt_at`, and `locked_at`. A job lock older than 300 s
   is stale and can be reclaimed after a crash.
@@ -192,7 +218,62 @@ imported sent history ─► sms_commands, status='sent'  (terminal, no job)
   a replay of the phone's own inbox, not something to forward. It can be
   limited to one device (`device_id=...`) or to all of them.
 - `db.find_recent_duplicate()` treats only another capture path of the same
-  device as a twin; an import never swallows a live SMS.
+  device as a twin; an import never swallows a live SMS. Same-source repeats
+  are kept on purpose (two genuine "ok" messages must both survive), which is
+  why the duplicate capture has to be stopped in Android, not here: 1.3.3
+  ignores `SMS_RECEIVED` while the app holds the default-SMS role.
+- Delivered means "the notification was accepted", not "every chunk was
+  sent". The body is not part of the Telegram message any more, so there is
+  no chunking on the delivery path and no partial-send retry.
+
+### Delivery and the notification reaper
+
+Two tasks run when workers are enabled (`main.create_app(run_workers=True)`):
+
+| Task | Class | Cycle |
+|---|---|---|
+| `delivery-worker` | `delivery.DeliveryWorker` | claims up to 5 due jobs, pokes on insert, idles up to 120 s |
+| `notification-reaper` | `delivery.NotificationReaper` | every `REAPER_INTERVAL_S = 30` s, `REAPER_BATCH = 20` due rows |
+
+`DeliveryWorker._deliver()`:
+
+1. `_notification_text(row)` builds four lines: `📥 New SMS`, `📱 <device>`,
+   the sender, and the UTC timestamp. The device name comes from
+   `db.device_by_id` (fallback `Unknown device`); the sender from
+   `_sender_label()`: `db.device_contact_name_for_key()` first, then
+   `sender_name` from the phone, then `phones.display_number(thread_key)`,
+   then the raw sender. Both lookups are wrapped: a failure logs a warning and
+   degrades to the fallback, it never fails the delivery.
+2. `delivery.thread_url(miniapp_url, thread_key, device_id)` builds the
+   `Open chat` `web_app` button. No URL means no button; the notification is
+   still sent.
+3. One `send_to_chat(..., parse_mode="HTML")`. The result must carry an int
+   `message_id`; anything else is `api_error`.
+4. `db.update_state(..., "delivered", telegram_msg_id=...)` then
+   `db.mark_message_notified()`. The bookkeeping is wrapped separately: the
+   notification is already in the chat, so a failure there must not turn a
+   delivered message into a retry (which would post it twice).
+
+`NotificationReaper.run_once()`:
+
+1. `db.due_notifications(now, limit=batch)` — `telegram_delete_at <= now`,
+   `telegram_msg_id`/`telegram_sent_at` NOT NULL, `telegram_deleted_at` NULL,
+   `source != 'import'`, ordered by deadline.
+2. `int(telegram_msg_id)`; a value that is not an int clears the row
+   (`bad_id`) instead of retrying forever.
+3. `tg.delete_message(chat_id, message_id)`. `_interpret_ok` treats a 2xx with
+   `ok: true` **and** a 400 whose description contains "not found" as success
+   (`already_gone`); 429 raises `rate_limited` with `retry_after`.
+4. Success/`ValueError`/not-found → `db.mark_notification_deleted()`.
+   `TGError` or any other exception → `db.reschedule_notification(now,
+   REAPER_RETRY_S=300)` and a warning; one row never stops the loop.
+5. The cycle itself is wrapped: an exception logs `reaper cycle aborted` and
+   the loop sleeps again.
+
+`deleteMessage` limits: the bot may delete only messages it posted itself, in
+a chat where it has the right, and never a message older than **48 hours**.
+That is why the reaper only touches rows with `telegram_sent_at` and why the
+default deadline is 24 h — a deadline beyond 48 h would be undeletable.
 
 ### Command state machine
 
@@ -414,7 +495,7 @@ renames a device, sets it as the default and revokes it.
 
 | Area | Files | Responsibility |
 |---|---|---|
-| Capture | `receiver/SmsReceiver.kt`, `receiver/MmsReceiver.kt`, `sms/SmsNotificationListener.kt` | default-SMS broadcast path, MMS role stub, notification-listener path |
+| Capture | `receiver/SmsReceiver.kt`, `receiver/MmsReceiver.kt`, `sms/SmsNotificationListener.kt` | default-SMS broadcast path (`SMS_DELIVER` canonical; `SMS_RECEIVED` ignored while default), MMS role stub, notification-listener path |
 | Dedupe | `util/Dedupe.kt`, `util/SenderNormalizer.kt` | prevent double capture across paths |
 | Provider | `sms/SmsProviderWriter.kt`, `sms/SmsSubscriptionLookup.kt` | write inbox rows when default app; infer SIM |
 | Local queue | `data/MessageRecord.kt`, `data/MessageDao.kt`, `data/AppDatabase.kt` | Room message state and migrations |
@@ -456,6 +537,20 @@ Pairing and secrets:
   the platform intent on Android 8/9, and it re-reads the role instead of
   trusting the result code, because a vendor build can refuse the change
   without a word.
+
+Android capture invariant (1.3.3, versionCode 8, commit `149504e`):
+
+- `SMS_DELIVER` is the canonical copy of a message when the app is the
+  default SMS app. Some vendor builds (MIUI among them) also deliver
+  `SMS_RECEIVED` to the default app; `SmsReceiver` returns early in that case
+  (`if (!isDefaultSmsApp && RoleState.isDefaultSmsApp(context)) return`).
+  Without the guard both copies were stored with `source='sms'` and both were
+  uploaded, because local dedupe keeps same-source repeats on purpose.
+- The non-default case is unchanged: `SMS_RECEIVED` is the only broadcast
+  there, and the notification-listener path still dedupes across paths.
+- Do not "fix" the duplicate by making local dedupe drop same-source repeats:
+  two genuine messages with the same text a second apart are both real. Stop
+  the second capture at the receiver.
 
 Android invariants:
 
@@ -559,15 +654,26 @@ so in the log whenever the Android code changes.
 5. Bump the Android `versionCode`/`versionName` only when shipping an APK.
    The app is not built on the VPS.
 
-### Change the forwarding labels or the Telegram routing
+### Change the notification format or the Telegram routing
 
-1. `delivery.py` builds the header: the sender, the timestamp and the
-   `📱 <b>device name</b>` line. A missing device row must not block the
-   delivery, it only drops the label.
-2. The Mini App link in the "Open chat" button is built by
+1. `delivery.NotificationReaper` and `delivery.DeliveryWorker` are separate
+   tasks; a change to one must not make the other depend on it. Both start
+   only when `run_workers=True`.
+2. `delivery.py` builds the notification: `📥 New SMS`, `📱 <b>device</b>`,
+   the sender, and the UTC timestamp. **Do not add the body.** A missing
+   device row must not block the delivery, it degrades to `Unknown device`.
+3. The Mini App link in the "Open chat" button is built by
    `delivery.thread_url(base, thread_key, device_id)`; the device id has to
    be in the URL, otherwise the Mini App cannot open the right conversation.
-3. A reply to a forwarded message goes back to the device that captured it
+4. The deadline written by `db.mark_message_notified()` and the one written by
+   `db.mark_thread_read()` are the same contract: 86400 s by default, 300 s
+   after a read, 300 s retry after a failed delete. Change all three together,
+   and keep the default under 48 h (Telegram's delete limit).
+5. Tests: `test_delivery.py` (format, button, deadline, reaper outcomes),
+   `test_tg.py` (`deleteMessage`, not-found, 429), `test_db.py` (schema,
+   `seen_at`, `due_notifications`, rescheduling), `test_miniapp_inbox.py`
+   (read sets `seen_at` and shortens the deadline).
+6. A reply to a notification goes back to the device that captured it
    (`updater._handle_reply`). A device that is no longer active cannot be
    replied to: say so instead of queueing a command nobody would run.
 4. The bot never broadcasts: `db.resolve_command_device()` picks exactly one
@@ -598,9 +704,9 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests -q
 ```
 
-The suite collects **569 tests**. Four of them do not pass for reasons that
-predate the multi-device work and are still open (three failures and one
-error):
+The suite collects **632 tests**; **629 pass**. Four of them do not pass for
+reasons that predate the multi-device work and are still open (three failures
+and one error):
 
 - `tests/test_commands.py::test_search_by_name_suggests_contacts`
 - `tests/test_commands.py::test_contacts_are_uploaded_and_searchable`
@@ -609,8 +715,16 @@ error):
 - `tests/test_app_assembly.py::test_shutdown_is_prompt_when_updater_blocked_in_long_poll`
   (the shutdown-timing error)
 
-Everything else passes. Do not report the suite as green, and do not treat
-these four as new regressions.
+Everything else passes, including the notification tests in
+`test_delivery.py` (format, no body, button, deadline, reaper outcome and
+retry). Do not report the suite as green, and do not treat these four as new
+regressions.
+
+Everything else passes, including the notification tests:
+`test_tg.py` (`deleteMessage`, already-gone, 429),
+`test_db.py` (new columns, `seen_at`, `due_notifications`, rescheduling),
+`test_miniapp_inbox.py` (read sets `seen_at` and shortens the deadline) and
+`test_app_assembly.py` (the reaper task starts with the workers).
 
 Useful focused runs:
 
@@ -670,8 +784,12 @@ VPS.
    flood the chat.
 2. `find_recent_duplicate()` never treats an import as another capture
    path, so a live SMS that overlaps an imported row is not swallowed.
-3. `delivery.MAX_CHUNK_LEN=4090` is larger than `tg.MAX_TEXT_LEN=4000`; chunks
-   in between raise `ValueError` and become permanently `failed`.
+3. **Old messages in the chat are full bodies.** The reaper only deletes rows
+   it sent as notifications (`telegram_sent_at` set). Everything forwarded
+   before that change stays in the chat, and Telegram refuses to delete a
+   message older than 48 hours anyway. Do not "fix" this by backfilling
+   `telegram_sent_at`: that would make the reaper try to delete history it
+   cannot delete.
 4. `/fallback` and `/phoneb` write backend settings that Android never reads.
    The phone's local `SettingsStore` is the real fallback configuration, and
    the Phone B fallback itself is frozen and off by default.
@@ -688,8 +806,12 @@ VPS.
 9. The Telegram update offset is in memory; a restart can redeliver a command.
 10. Fallback candidates are the 50 newest rows in 48 hours; older failures can
    starve.
-11. Multi-chunk sends are retried from chunk 1, so a later failure can duplicate
-    earlier chunks.
+11. **The reaper only runs with the workers.** `main.create_app(run_workers=
+    False)` (tests, tooling) starts neither the delivery worker nor the
+    reaper, so nothing is deleted in that mode. A notification whose delete
+    is permanently rejected (wrong rights, chat migrated) is rescheduled every
+    300 s forever — one indexed row, not a crash, but it never disappears.
+    Check `telegram_delete_at` and the journal `reaper rescheduled` lines.
 12. After 8 attempts any error, including `timeout`, becomes `failed`; this can
     authorize a fallback for a message Telegram may have accepted.
 13. FastAPI `/docs` and `/openapi.json` are reachable through the proxy unless
@@ -701,24 +823,42 @@ VPS.
 15. The archived `legacy` device holds the history of the previous phone. It
     is read-only: it cannot pair, cannot poll commands and cannot send, and
     the Mini App shows it as archived.
-16. The old device-less Mini App routes (`/app/api/chats…`,
+16. **`telegram_msg_id` is cleared by the reaper.** Reply-to-SMS and the
+    `details:`/`showmsg:` callbacks look a message up by that id. Once the
+    notification is deleted, a reply to it has nothing to resolve: the admin
+    must use `/sms` or the Mini App. A delete that succeeds clears the column
+    on purpose; do not keep a stale pointer "just in case".
+17. The old device-less Mini App routes (`/app/api/chats…`,
     `/app/api/contacts`) always answer **410**. A client that still has the
     old bundle therefore shows an error until the new device-first bundle
     reaches it. That is intentional: a stale client fails loudly instead of
     reading a mixed inbox.
-17. The pairing claim limiter counts only the *wrong* secrets, per pairing
+18. The pairing claim limiter counts only the *wrong* secrets, per pairing
     (and per address for an unknown pairing id). A valid poll is never
     rate-limited, because every phone shares one address behind Caddy.
-18. The Telegram bot's contact search (`flow.py`) still falls back to the
+19. The Telegram bot's contact search (`flow.py`) still falls back to the
     global legacy `contacts` table when the resolved device has no matching
     contact. The Mini App readers are strictly per-device; the bot picker
     can mix legacy names until it is made device-aware.
-19. Starting a new pairing cancels older pending/approved pairings for the
+20. Starting a new pairing cancels older pending/approved pairings for the
     same device. An approved-but-unclaimed device row (`token_hash` NULL)
     may be approved again; one with an active token is refused until it is
     revoked. If the admin approves an old QR after the phone generated a
     newer code, the approval returns `410`. The app must show the current
     code; do not let two live codes coexist.
+21. **Duplicate capture is an Android problem, not a backend one.** Vendor
+    builds may deliver `SMS_DELIVER` and `SMS_RECEIVED` for one SMS; 1.3.3
+    ignores `SMS_RECEIVED` while the app is the default SMS app. The backend
+    dedupe keeps same-source repeats on purpose, so do not "fix" the duplicate
+    there. Existing duplicate rows from before 1.3.3 and from the bulk
+    re-import (1,039 groups / 5,039 rows, never forwarded to Telegram) are
+    still in the database: **no cleanup has been performed**, and deleting
+    them is a deliberate, separate data operation.
+22. **Deleting a notification does not delete the message.** The row, its
+    body and its `seen_at` stay; only `telegram_msg_id`/`telegram_delete_at`
+    are cleared and `telegram_deleted_at` is set. A reaper bug that deletes
+    chat messages must never be able to reach the history through
+    `messages`.
 
 ## 11. Definition of done
 - [ ] The requested behavior is implemented or the investigation is complete.

@@ -126,9 +126,11 @@ def test_assembly_starts_and_stops_workers(settings, monkeypatch):
     with TestClient(app) as test_client:
         seed_device(test_client.app.state.db_conn, DEVICE_ID, DEVICE_TOKEN)
         assert app.state.workers_enabled is True
-        assert len(app.state.worker_tasks) == 2
+        # delivery + notification reaper + updater
+        assert len(app.state.worker_tasks) == 3
         assert app.state.delivery_worker.poke_event is app.state.poke_event
         assert app.state.updater.poke_event is app.state.poke_event
+        assert app.state.notification_reaper is not None
         assert app.state.stop_event is not None
         _wait_for(lambda: fake.polls >= 1)
         r = test_client.get("/status", headers=DEVICE_HEADERS)
@@ -156,7 +158,7 @@ def test_assembly_updater_failure_tolerated(settings, monkeypatch):
     monkeypatch.setattr(app.state, "tg", fake)
     monkeypatch.setattr(app.state, "poll_tg", fake)
     with TestClient(app):
-        assert len(app.state.worker_tasks) == 2
+        assert len(app.state.worker_tasks) == 3
     assert all(task.done() for task in app.state.worker_tasks)
 
 
@@ -164,8 +166,8 @@ def test_assembly_env_var_disables_updater(settings, monkeypatch):
     monkeypatch.setenv("RELAY_DISABLE_UPDATER", "1")
     app = create_app(settings, run_workers=True)
     with TestClient(app):
-        assert len(app.state.worker_tasks) == 1
-    assert app.state.worker_tasks[0].done()
+        assert len(app.state.worker_tasks) == 2
+    assert all(task.done() for task in app.state.worker_tasks)
 
 
 def test_413_rejects_declared_oversize_payload(client):

@@ -42,6 +42,10 @@ _SCHEMA = [
         telegram_msg_id TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
+        seen_at INTEGER,
+        telegram_sent_at INTEGER,
+        telegram_delete_at INTEGER,
+        telegram_deleted_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )
@@ -49,6 +53,9 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_messages_state ON messages(state)",
     "CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(received_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_key, received_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_tg_delete"
+    " ON messages(telegram_delete_at)"
+    " WHERE telegram_delete_at IS NOT NULL",
     """
     CREATE TABLE IF NOT EXISTS jobs (
         msg_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -210,6 +217,14 @@ _COLUMNS = (
      "ALTER TABLE contacts ADD COLUMN number_key TEXT"),
     ("messages", "device_id",
      "ALTER TABLE messages ADD COLUMN device_id TEXT"),
+    ("messages", "seen_at",
+     "ALTER TABLE messages ADD COLUMN seen_at INTEGER"),
+    ("messages", "telegram_sent_at",
+     "ALTER TABLE messages ADD COLUMN telegram_sent_at INTEGER"),
+    ("messages", "telegram_delete_at",
+     "ALTER TABLE messages ADD COLUMN telegram_delete_at INTEGER"),
+    ("messages", "telegram_deleted_at",
+     "ALTER TABLE messages ADD COLUMN telegram_deleted_at INTEGER"),
     ("sms_commands", "device_id",
      "ALTER TABLE sms_commands ADD COLUMN device_id TEXT"),
 )
@@ -1509,16 +1524,95 @@ def miniapp_contacts(conn: sqlite3.Connection, device_id: str, query: str = "",
     return [_asdict(row) for row in rows]
 
 
+def mark_message_notified(conn: sqlite3.Connection, msg_id: str,
+                          telegram_msg_id: str | int, now: int) -> None:
+    """Record that the notification of a message reached Telegram.
+
+    The notification lives in the chat for 24 hours by default, or only
+    5 minutes when the Mini App already read the message: there is no
+    reason to keep a notification the admin has seen.
+    """
+    value = str(telegram_msg_id)
+    stamp = int(now)
+
+    def fn() -> None:
+        row = conn.execute(
+            "SELECT seen_at FROM messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"message not found: {msg_id}")
+        delay = 300 if row["seen_at"] is not None else 86400
+        conn.execute(
+            "UPDATE messages SET telegram_msg_id = ?, telegram_sent_at = ?,"
+            " telegram_delete_at = ?, updated_at = ? WHERE id = ?",
+            (value, stamp, stamp + delay, stamp, msg_id),
+        )
+
+    _write_tx(conn, fn)
+
+
+def mark_notification_deleted(conn: sqlite3.Connection, msg_id: str,
+                              now: int) -> None:
+    """Clear the Telegram pointer once the notification is gone."""
+    stamp = int(now)
+    _write_tx(conn, lambda: conn.execute(
+        "UPDATE messages SET telegram_deleted_at = ?, telegram_msg_id = NULL,"
+        " telegram_delete_at = NULL, updated_at = ? WHERE id = ?",
+        (stamp, stamp, msg_id),
+    ))
+
+
+def due_notifications(conn: sqlite3.Connection, now: int,
+                      limit: int = 20) -> list[dict]:
+    """Notifications whose delete deadline has passed.
+
+    ``telegram_sent_at`` is the marker of a message that was delivered as
+    a notification. Rows forwarded by the old code, and imported history,
+    carry no sent time and are never queued here: Telegram cannot delete
+    a message older than 48 hours anyway.
+    """
+    limit = max(1, min(int(limit), 200))
+    with _WRITE_LOCK:
+        rows = conn.execute(
+            "SELECT id, device_id, telegram_msg_id, telegram_delete_at"
+            " FROM messages"
+            " WHERE telegram_delete_at IS NOT NULL"
+            "   AND telegram_delete_at <= ?"
+            "   AND telegram_msg_id IS NOT NULL"
+            "   AND telegram_sent_at IS NOT NULL"
+            "   AND telegram_deleted_at IS NULL"
+            "   AND source != 'import'"
+            " ORDER BY telegram_delete_at, id LIMIT ?",
+            (int(now), limit),
+        ).fetchall()
+    return [_asdict(row) for row in rows]
+
+
+def reschedule_notification(conn: sqlite3.Connection, msg_id: str,
+                            now: int, delay: int = 300) -> None:
+    """Push a failed delete back, so the reaper does not spin on it."""
+    stamp = int(now)
+    _write_tx(conn, lambda: conn.execute(
+        "UPDATE messages SET telegram_delete_at = ?, updated_at = ?"
+        " WHERE id = ? AND telegram_deleted_at IS NULL",
+        (stamp + int(delay), stamp, msg_id),
+    ))
+
+
 def mark_thread_read(conn: sqlite3.Connection, device_id: str,
                      thread_key: str, until_ts: int) -> int:
     """Advance the read cursor of a thread, never moving it backwards.
 
     The marker belongs to the device: reading a thread of one phone never
-    marks the same conversation of another phone as read.
+    marks the same conversation of another phone as read. Reading a
+    message also schedules the deletion of its Telegram notification:
+    what the admin has seen in the Mini App does not need to sit in the
+    chat for another day.
     """
     if not isinstance(device_id, str) or not device_id:
         return 0
     now = _now()
+    until = int(until_ts)
 
     def fn() -> int:
         conn.execute(
@@ -1529,7 +1623,23 @@ def mark_thread_read(conn: sqlite3.Connection, device_id: str,
             "  last_read_at = MAX(thread_reads_scoped.last_read_at,"
             "                     excluded.last_read_at),"
             "  updated_at = excluded.updated_at",
-            (device_id, thread_key, int(until_ts), now),
+            (device_id, thread_key, until, now),
+        )
+        conn.execute(
+            "UPDATE messages SET seen_at = COALESCE(seen_at, ?)"
+            " WHERE device_id = ? AND thread_key = ?"
+            "   AND received_at <= ? AND seen_at IS NULL",
+            (now, device_id, thread_key, until),
+        )
+        conn.execute(
+            "UPDATE messages SET telegram_delete_at = MIN("
+            "  COALESCE(telegram_delete_at, ?), ?)"
+            " WHERE device_id = ? AND thread_key = ?"
+            "   AND received_at <= ?"
+            "   AND telegram_msg_id IS NOT NULL"
+            "   AND telegram_sent_at IS NOT NULL"
+            "   AND telegram_deleted_at IS NULL",
+            (now + 300, now + 300, device_id, thread_key, until),
         )
         row = conn.execute(
             "SELECT last_read_at FROM thread_reads_scoped"

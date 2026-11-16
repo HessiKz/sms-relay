@@ -7,7 +7,7 @@ import pytest
 
 import app.db as db
 import app.delivery as delivery
-from app.delivery import DeliveryWorker
+from app.delivery import DeliveryWorker, NotificationReaper
 from app.tg import TGError
 
 FIXED_TS = 1_700_000_000
@@ -15,10 +15,13 @@ FIXED_ISO = "2023-11-14 22:13:20"
 
 
 class FakeTelegram:
-    def __init__(self, error=None):
+    def __init__(self, error=None, delete_error=None, delete_gone=False):
         self.sent = []
         self.keyboards = []
+        self.deleted = []
         self._error = error
+        self._delete_error = delete_error
+        self._delete_gone = delete_gone
         self._n = 0
 
     async def send_to_chat(self, chat_id, text, *, reply_to=None, keyboard=None, parse_mode=None):
@@ -29,6 +32,15 @@ class FakeTelegram:
             error, self._error = self._error, None
             raise error
         return {"ok": True, "message_id": self._n}
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        if isinstance(self._delete_error, BaseException):
+            error, self._delete_error = self._delete_error, None
+            raise error
+        if self._delete_gone:
+            return {"ok": True, "already_gone": True}
+        return {"ok": True}
 
 
 def _seed(conn, *, msg_id="aabbccdd11223344", sender="+15550001111", body="hi",
@@ -80,7 +92,6 @@ def test_success_marks_delivered_records_msg_id_and_removes_job(conn, settings):
     assert len(telegram.sent) == 1
     assert telegram.sent[0][0] == "test-chat-id"
     assert "<b>+15550001111</b>" in telegram.sent[0][1]
-    assert "hi" in telegram.sent[0][1]
     msg = _message(conn, msg_id)
     assert msg["state"] == "delivered"
     assert msg["attempts"] == 1
@@ -202,25 +213,135 @@ def test_invalid_input_last_error_composed_capped_at_200(conn, settings):
     assert last_error.startswith("invalid_input: ")
 
 
-def test_large_body_sends_three_chunks_with_header_on_each(conn, settings):
+def test_large_body_sends_one_short_notification_without_the_body(conn, settings):
+    """A 9 KB SMS still produces exactly one short notification.
+
+    The body is never forwarded, so there is nothing to chunk: the
+    notification only says who wrote, on which phone and when.
+    """
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
-    body = "x" * 9000
+    body = "SECRETBODY" * 900
     msg_id = _seed(conn, body=body)
-    header = f"<b>+15550001111</b>\n<i>{FIXED_ISO} UTC</i>\n\n"
 
     processed = asyncio.run(worker.run_once(time.time() + 5))
 
     assert processed == 1
-    assert [chat for chat, _ in telegram.sent] == ["test-chat-id"] * 3
-    chunks = [text for _, text in telegram.sent]
-    assert all(text.startswith(header) for text in chunks)
-    assert all(len(text) <= delivery.MAX_CHUNK_LEN for text in chunks)
-    assert "".join(text[len(header):] for text in chunks) == body
+    assert len(telegram.sent) == 1
+    text = telegram.sent[0][1]
+    assert "SECRETBODY" not in text
+    assert len(text) < 500
+    assert f"<i>{FIXED_ISO} UTC</i>" in text
     msg = _message(conn, msg_id)
     assert msg["state"] == "delivered"
-    assert msg["telegram_msg_id"] == "3"
+    assert msg["telegram_msg_id"] == "1"
     assert db.next_jobs(conn, time.time() + 60, limit=5) == []
+
+
+def test_notification_names_the_device_the_sender_and_the_time(conn, settings):
+    db.activate_device(conn, "dev-pixel-0009", "Pixel 8", "android", "1.0",
+                       int(time.time()))
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="notify00-aaaa", sender="+15550001111",
+          body="the body must stay in the relay",
+          device_id="dev-pixel-0009")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "Pixel 8" in text
+    assert "+15550001111" in text
+    assert f"{FIXED_ISO} UTC" in text
+    assert "the body must stay in the relay" not in text
+
+
+def test_notification_uses_the_device_contact_name(conn, settings):
+    db.activate_device(conn, "dev-pixel-0010", "Pixel 8", "android", "1.0",
+                       int(time.time()))
+    db.replace_device_contacts(conn, "dev-pixel-0010",
+                               [{"number": "+15550001111", "name": "Alice"}])
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    msg_id = _seed(conn, msg_id="named00-aaaa", sender="+15550001111",
+                   device_id="dev-pixel-0010")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "<b>Alice</b>" in text
+    assert _message(conn, msg_id)["sender"] == "+15550001111"
+
+
+def test_notification_escapes_device_and_sender(conn, settings):
+    db.activate_device(conn, "dev-pixel-0011", "Pixel <8> & co", "android",
+                       "1.0", int(time.time()))
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="escape01-aaaa", sender="AD<BANK>",
+          body="<b>bank</b> & co", device_id="dev-pixel-0011")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "Pixel &lt;8&gt; &amp; co" in text
+    assert "AD&lt;BANK&gt;" in text
+    assert "<8>" not in text
+    assert "<b>bank</b>" not in text
+
+
+def test_notification_falls_back_to_an_unknown_device_label(conn, settings):
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="nodevic-aaaa", body="no device")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "Unknown device" in text
+    assert _message(conn, "nodevic-aaaa")["state"] == "delivered"
+
+
+def test_notification_falls_back_to_unknown_device_for_a_missing_row(conn, settings):
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="missing1-aaaa", body="gone device",
+          device_id="dev-gone-00000")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "Unknown device" in text
+    assert _message(conn, "missing1-aaaa")["state"] == "delivered"
+
+
+def test_notification_sets_sent_time_and_24h_deadline(conn, settings):
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    msg_id = _seed(conn, msg_id="deadlin0-aaaa")
+    now = int(time.time()) + 5
+
+    asyncio.run(worker.run_once(now))
+
+    msg = _message(conn, msg_id)
+    assert msg["telegram_msg_id"] == "1"
+    assert msg["telegram_sent_at"] == now
+    assert msg["telegram_delete_at"] == now + 86400
+    assert msg["telegram_deleted_at"] is None
+
+
+def test_seen_before_send_uses_the_five_minute_deadline(conn, settings):
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    msg_id = _seed(conn, msg_id="seenbef0-aaaa", device_id="device-a")
+    # The Mini App read the thread while the notification was still queued.
+    db.mark_thread_read(conn, "device-a", "15550001111", int(time.time()) + 600)
+    now = int(time.time()) + 5
+
+    asyncio.run(worker.run_once(now))
+
+    msg = _message(conn, msg_id)
+    assert msg["telegram_delete_at"] == now + 300
 
 
 def test_paused_setting_skips_cycle_and_leaves_jobs_untouched(conn, settings):
@@ -256,7 +377,7 @@ def test_batch_size_claims_and_processes_at_most_batch(conn, settings):
     assert remaining == {"batch0005-aaaa", "batch0006-aaaa"}
 
 
-def test_last_chunk_offers_details_and_the_thread_deep_link(conn, settings):
+def test_last_notification_offers_the_thread_deep_link(conn, settings):
     configured = replace(settings, miniapp_url="https://ai-barrow.ir/relay/app/")
     telegram = FakeTelegram()
     worker = _worker(conn, configured, telegram)
@@ -265,10 +386,8 @@ def test_last_chunk_offers_details_and_the_thread_deep_link(conn, settings):
     asyncio.run(worker.run_once(time.time() + 5))
 
     buttons = telegram.keyboards[-1]["inline_keyboard"][0]
-    assert [item["text"] for item in buttons] == ["\U0001F50D More details",
-                                                  "Open chat"]
-    assert buttons[0]["callback_data"] == f"details:{msg_id}"
-    url = buttons[1]["web_app"]["url"]
+    assert [item["text"] for item in buttons] == ["Open chat"]
+    url = buttons[0]["web_app"]["url"]
     thread_key = _message(conn, msg_id)["thread_key"]
     assert parse_qs(urlsplit(url).query)["thread"] == [thread_key]
 
@@ -285,7 +404,7 @@ def test_deep_link_carries_the_device_id(conn, settings):
 
     asyncio.run(worker.run_once(time.time() + 5))
 
-    url = telegram.keyboards[-1]["inline_keyboard"][0][1]["web_app"]["url"]
+    url = telegram.keyboards[-1]["inline_keyboard"][0][0]["web_app"]["url"]
     query = parse_qs(urlsplit(url).query)
     assert query["thread"] == [_message(conn, msg_id)["thread_key"]]
     assert query["device"] == ["dev-pixel-0003"]
@@ -299,7 +418,7 @@ def test_deep_link_omits_the_device_parameter_without_a_device(conn, settings):
 
     asyncio.run(worker.run_once(time.time() + 5))
 
-    url = telegram.keyboards[-1]["inline_keyboard"][0][1]["web_app"]["url"]
+    url = telegram.keyboards[-1]["inline_keyboard"][0][0]["web_app"]["url"]
     assert "device=" not in url
     assert "thread=" in url
 
@@ -323,22 +442,27 @@ def test_open_chat_button_is_absent_without_a_miniapp_url(conn, settings):
 
     asyncio.run(worker.run_once(time.time() + 5))
 
-    buttons = telegram.keyboards[-1]["inline_keyboard"][0]
-    assert [item["text"] for item in buttons] == ["\U0001F50D More details"]
+    assert telegram.keyboards[-1] is None
+    assert len(telegram.sent) == 1
 
 
-def test_only_the_last_chunk_carries_the_buttons(conn, settings):
+def test_open_chat_button_opens_the_device_thread(conn, settings):
     configured = replace(settings, miniapp_url="https://ai-barrow.ir/relay/app/")
+    db.activate_device(conn, "dev-pixel-0004", "Pixel 8", "android", "1.0",
+                       int(time.time()))
     telegram = FakeTelegram()
     worker = _worker(conn, configured, telegram)
-    _seed(conn, msg_id="aabbccdd11223344", body="x" * 9000)
+    msg_id = _seed(conn, msg_id="openchat-aaaa", body="hello",
+                   device_id="dev-pixel-0004")
 
     asyncio.run(worker.run_once(time.time() + 5))
 
-    assert len(telegram.keyboards) == 3
-    assert telegram.keyboards[0] is None
-    assert telegram.keyboards[1] is None
-    assert telegram.keyboards[2]["inline_keyboard"][0][1]["text"] == "Open chat"
+    assert len(telegram.sent) == 1
+    buttons = telegram.keyboards[-1]["inline_keyboard"][0]
+    assert [item["text"] for item in buttons] == ["Open chat"]
+    query = parse_qs(urlsplit(buttons[0]["web_app"]["url"]).query)
+    assert query["thread"] == [_message(conn, msg_id)["thread_key"]]
+    assert query["device"] == ["dev-pixel-0004"]
 
 
 def test_header_format_single_part(conn, settings):
@@ -349,16 +473,16 @@ def test_header_format_single_part(conn, settings):
     asyncio.run(worker.run_once(time.time() + 5))
 
     text = telegram.sent[0][1]
-    assert text.startswith("<b>")
+    assert text.startswith("📥 <b>New SMS</b>")
     assert "<i>" in text
-    assert "hello" in text
+    assert "hello" not in text
 
 
 def test_device_label_shows_the_device_name(conn, settings):
     """An SMS from a known device carries a compact `📱 <b>name</b>` line.
 
     The device name is user-controlled, so it is HTML-escaped like the
-    rest of the header.
+    rest of the notification.
     """
     db.activate_device(conn, "dev-pixel-0001", "Pixel <8>", "android", "1.0",
                        int(time.time()))
@@ -374,39 +498,23 @@ def test_device_label_shows_the_device_name(conn, settings):
     assert _message(conn, "label000-aaaa")["state"] == "delivered"
 
 
-def test_device_label_omitted_when_device_row_is_missing(conn, settings):
-    """A device_id without a devices row must not break delivery.
-
-    The label is simply left out; the header stays the plain
-    sender/timestamp format.
-    """
-    telegram = FakeTelegram()
-    worker = _worker(conn, settings, telegram)
-    _seed(conn, msg_id="missing0-aaaa", body="orphan device",
-          device_id="dev-gone-00000")
-
-    asyncio.run(worker.run_once(time.time() + 5))
-
-    text = telegram.sent[0][1]
-    assert "📱" not in text
-    assert text.startswith("<b>+15550001111</b>\n<i>")
-    assert _message(conn, "missing0-aaaa")["state"] == "delivered"
-
-
-def test_device_label_appears_on_every_chunk(conn, settings):
+def test_notification_is_one_message_per_part(conn, settings):
+    """A multi-part SMS produces one notification per captured part."""
     db.activate_device(conn, "dev-pixel-0002", "Pixel 8", "android", "1.0",
                        int(time.time()))
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
-    _seed(conn, msg_id="chunklbl-aaaa", body="x" * 9000,
-          device_id="dev-pixel-0002")
+    _seed(conn, msg_id="part0000-aaaa", body="x" * 9000, parts=3,
+          part_index=0, device_id="dev-pixel-0002")
+    _seed(conn, msg_id="part0001-aaaa", body="y" * 9000, parts=3,
+          part_index=1, device_id="dev-pixel-0002")
 
     asyncio.run(worker.run_once(time.time() + 5))
 
-    chunks = [text for _, text in telegram.sent]
-    assert len(chunks) == 3
-    assert all("📱 <b>Pixel 8</b>" in text for text in chunks)
-    assert all(len(text) <= delivery.MAX_CHUNK_LEN for text in chunks)
+    assert len(telegram.sent) == 2
+    assert all("📱 <b>Pixel 8</b>" in text for _, text in telegram.sent)
+    assert all("x" * 10 not in text and "y" * 10 not in text
+               for _, text in telegram.sent)
 
 
 def test_run_once_with_no_work_returns_zero(conn, settings):
@@ -541,9 +649,9 @@ async def test_paused_worker_does_not_spin(conn, settings):
     assert task.exception() is None
 
 
-# --- Phase 1: HTML escaping and entity-safe chunking --------------------
+# --- The notification payload never carries the SMS body -----------------
 
-def test_body_is_html_escaped_before_sending(conn, settings):
+def test_body_is_never_forwarded(conn, settings):
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
     _seed(conn, msg_id="escape00-aaaa", body="<b>bank</b> & co")
@@ -551,39 +659,172 @@ def test_body_is_html_escaped_before_sending(conn, settings):
     asyncio.run(worker.run_once(time.time() + 5))
 
     text = telegram.sent[0][1]
-    assert "&lt;b&gt;bank&lt;/b&gt; &amp; co" in text
-    assert "<b>bank</b>" not in text
+    assert "bank" not in text
+    assert "&lt;b&gt;" not in text
     assert _message(conn, "escape00-aaaa")["state"] == "delivered"
 
 
-def test_split_html_never_cuts_an_entity():
-    assert delivery._split_html("xxxx&amp;y", 6) == ["xxxx", "&amp;y"]
-    assert delivery._split_html("abc", 10) == ["abc"]
-    text = "a&amp;b&lt;c&gt;d"
-    for limit in range(5, len(text) + 1):
-        pieces = delivery._split_html(text, limit)
-        assert "".join(pieces) == text
-        assert all(len(piece) <= limit for piece in pieces)
+# --- Reaper --------------------------------------------------------------
+
+def _notified(conn, msg_id, *, sent_at, delete_at, msg_number="11",
+              state="delivered"):
+    conn.execute(
+        "UPDATE messages SET state = ?, telegram_msg_id = ?,"
+        " telegram_sent_at = ?, telegram_delete_at = ? WHERE id = ?",
+        (state, msg_number, sent_at, delete_at, msg_id))
+    return msg_id
 
 
-def test_chunking_never_splits_an_entity_across_chunks(conn, settings):
+def _reaper(conn, settings, telegram):
+    return NotificationReaper(conn, settings, telegram)
+
+
+def test_reaper_deletes_a_due_notification_and_clears_the_fields(conn, settings):
+    telegram = FakeTelegram()
+    _seed(conn, msg_id="due00000-aaaa", device_id="device-a")
+    _notified(conn, "due00000-aaaa", sent_at=1000, delete_at=1100)
+    now = 1200
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(now))
+
+    assert removed == 1
+    assert telegram.deleted == [("test-chat-id", 11)]
+    msg = _message(conn, "due00000-aaaa")
+    assert msg["telegram_deleted_at"] == now
+    assert msg["telegram_msg_id"] is None
+    assert msg["telegram_delete_at"] is None
+
+
+def test_reaper_ignores_not_due_notifications(conn, settings):
+    telegram = FakeTelegram()
+    _seed(conn, msg_id="notdue00-aaaa")
+    _notified(conn, "notdue00-aaaa", sent_at=1000, delete_at=5000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(1200))
+
+    assert removed == 0
+    assert telegram.deleted == []
+    assert _message(conn, "notdue00-aaaa")["telegram_msg_id"] == "11"
+
+
+def test_reaper_ignores_rows_without_a_telegram_message_id(conn, settings):
+    telegram = FakeTelegram()
+    _seed(conn, msg_id="noid0000-aaaa")
+    conn.execute(
+        "UPDATE messages SET telegram_delete_at = ? WHERE id = ?",
+        (1000, "noid0000-aaaa"))
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(1200))
+
+    assert removed == 0
+    assert telegram.deleted == []
+
+
+def test_reaper_ignores_imported_history(conn, settings):
+    """Imported history has no notification and no job to reap."""
+    telegram = FakeTelegram()
+    db.record_message(conn, {
+        "id": "imported-aaaa", "sender": "+15550002222", "body": "old",
+        "parts": 1, "part_index": 0, "received_at": 900, "state": "received",
+        "source": "import", "device_id": "device-a"})
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(1200))
+
+    assert removed == 0
+    assert telegram.deleted == []
+
+
+def test_reaper_treats_already_deleted_as_success(conn, settings):
+    telegram = FakeTelegram(delete_gone=True)
+    _seed(conn, msg_id="gone0000-aaaa")
+    _notified(conn, "gone0000-aaaa", sent_at=1000, delete_at=1100)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(1200))
+
+    assert removed == 1
+    msg = _message(conn, "gone0000-aaaa")
+    assert msg["telegram_deleted_at"] == 1200
+    assert msg["telegram_msg_id"] is None
+
+
+def test_reaper_reschedules_a_failed_delete(conn, settings):
+    telegram = FakeTelegram(delete_error=TGError("network"))
+    _seed(conn, msg_id="retry000-aaaa")
+    _notified(conn, "retry000-aaaa", sent_at=1000, delete_at=1100)
+    now = 1200
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(now))
+
+    assert removed == 0
+    msg = _message(conn, "retry000-aaaa")
+    assert msg["telegram_msg_id"] == "11"
+    assert msg["telegram_delete_at"] == now + delivery.REAPER_RETRY_S
+    assert msg["telegram_deleted_at"] is None
+
+
+def test_one_failed_delete_does_not_stop_the_others(conn, settings):
+    telegram = FakeTelegram(delete_error=TGError("api_error"))
+    _seed(conn, msg_id="batch000-aaaa")
+    _seed(conn, msg_id="batch001-aaaa")
+    _notified(conn, "batch000-aaaa", sent_at=1000, delete_at=1100, msg_number="21")
+    _notified(conn, "batch001-aaaa", sent_at=1000, delete_at=1101, msg_number="22")
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(1200))
+
+    # Only the first raise is armed; the second row still gets deleted.
+    assert removed == 1
+    assert [mid for _, mid in telegram.deleted] == [21, 22]
+    assert _message(conn, "batch000-aaaa")["telegram_msg_id"] == "21"
+    assert _message(conn, "batch001-aaaa")["telegram_deleted_at"] == 1200
+
+
+@pytest.mark.anyio
+async def test_reaper_run_terminates_cleanly_on_stop(conn, settings):
+    telegram = FakeTelegram()
+    reaper = NotificationReaper(conn, settings, telegram, interval=0.05)
+    stop = asyncio.Event()
+    task = asyncio.create_task(reaper.run(stop))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+    assert task.done() and not task.cancelled()
+    assert task.exception() is None
+
+
+def test_reaper_is_idempotent_after_a_delete(conn, settings):
+    telegram = FakeTelegram()
+    _seed(conn, msg_id="twice000-aaaa")
+    _notified(conn, "twice000-aaaa", sent_at=1000, delete_at=1100)
+    reaper = _reaper(conn, settings, telegram)
+
+    assert asyncio.run(reaper.run_once(1200)) == 1
+    assert asyncio.run(reaper.run_once(1200)) == 0
+    assert telegram.deleted == [("test-chat-id", 11)]
+
+
+def test_bookkeeping_failure_does_not_undo_a_successful_send(conn, settings,
+                                                             monkeypatch):
+    """The notification is already in the chat when bookkeeping runs.
+
+    A failure there must not mark the message failed or re-queue it: the
+    admin would get the notification twice.
+    """
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
-    msg_id = _seed(conn, msg_id="entity00-aaaa", body="placeholder")
-    row = _message(conn, msg_id)
-    header = worker._header(row)
-    slice_len = delivery.MAX_CHUNK_LEN - len(header)
-    body = "a" * (slice_len - 1) + "&" + "b" * 20
-    row["body"] = body
+    msg_id = _seed(conn, msg_id="bookke00-aaaa")
 
-    chunks = worker._chunks(row)
+    def boom(c, i, t, n):
+        raise RuntimeError("db hiccup")
 
-    assert len(chunks) == 2
-    assert all(len(chunk) <= delivery.MAX_CHUNK_LEN for chunk in chunks)
-    pieces = [chunk[len(header):] for chunk in chunks]
-    assert "".join(pieces) == delivery._html_escape(body)
-    for piece in pieces:
-        # no trailing fragment of &amp;/&lt;/&gt; at a chunk boundary
-        assert not any(piece.endswith(fragment) for fragment in
-                       ("&", "&a", "&am", "&amp"))
-    assert pieces[1].startswith("&amp;")
+    monkeypatch.setattr(db, "mark_message_notified", boom)
+
+    processed = asyncio.run(worker.run_once(time.time() + 5))
+
+    assert processed == 1
+    assert len(telegram.sent) == 1
+    msg = _message(conn, msg_id)
+    assert msg["state"] == "delivered"
+    assert msg["telegram_msg_id"] == "1"
+    assert db.next_jobs(conn, time.time() + 60, limit=5) == []
