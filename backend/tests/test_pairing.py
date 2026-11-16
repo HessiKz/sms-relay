@@ -100,9 +100,12 @@ def test_pair_start_rate_limits_one_address(client):
 def test_pair_start_caps_the_pending_pairings(client, monkeypatch):
     import app.pairing as pairing
     monkeypatch.setattr(pairing, "MAX_PENDING_PAIRINGS", 2)
-    assert client.post("/pair/start", json=_body()).status_code == 200
-    assert client.post("/pair/start", json=_body()).status_code == 200
-    assert client.post("/pair/start", json=_body()).status_code == 429
+    assert client.post("/pair/start",
+                       json=_body(device_id="cap-phone-1")).status_code == 200
+    assert client.post("/pair/start",
+                       json=_body(device_id="cap-phone-2")).status_code == 200
+    assert client.post("/pair/start",
+                       json=_body(device_id="cap-phone-3")).status_code == 429
 
 
 def test_qr_payload_uses_the_bot_username(settings):
@@ -195,6 +198,45 @@ def test_pair_approve_rejects_an_active_duplicate(client):
                                  "scan_code": pairing["scan_code"]},
                            headers=admin_headers())
     assert response.status_code == 409
+
+
+def test_a_new_code_supersedes_the_previous_code(client):
+    first = _start(client, device_id="new-phone")
+    second = _start(client, device_id="new-phone")
+    conn = client.app.state.db_conn
+    assert db.pairing_by_id(conn, first["pairing_id"])["status"] == "cancelled"
+    assert db.pairing_by_id(conn, second["pairing_id"])["status"] == "pending"
+
+    # The old QR must not be able to approve the device after the phone
+    # has generated a newer code.
+    old = client.post("/app/api/pair/approve",
+                      json={"pairing_id": first["pairing_id"],
+                            "scan_code": first["scan_code"]},
+                      headers=admin_headers())
+    assert old.status_code == 410
+
+    new = client.post("/app/api/pair/approve",
+                      json={"pairing_id": second["pairing_id"],
+                            "scan_code": second["scan_code"]},
+                      headers=admin_headers())
+    assert new.status_code == 200
+
+
+def test_pair_approve_of_an_unclaimed_device_can_be_retried(client):
+    first = _start(client, device_id="new-phone")
+    approve_pairing(client, first)
+    conn = client.app.state.db_conn
+    assert db.device_by_id(conn, "new-phone")["token_hash"] is None
+
+    # The approval expired before the phone claimed it. A fresh code and
+    # approval must finish the pairing instead of reporting "already
+    # paired" on the unclaimed row.
+    second = _start(client, device_id="new-phone")
+    approve_pairing(client, second)
+    claimed = claim_pairing(client, second)
+    assert claimed["status_code"] == 200
+    assert claimed["json"]["token"]
+    assert db.device_by_id(conn, "new-phone")["token_hash"] is not None
 
 
 def test_pair_approve_reactivates_a_revoked_device(client):

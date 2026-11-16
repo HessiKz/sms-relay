@@ -636,6 +636,12 @@ VPS.
     global legacy `contacts` table when the resolved device has no matching
     contact. The Mini App readers are strictly per-device; the bot picker
     can mix legacy names until it is made device-aware.
+18. Starting a new pairing cancels older pending/approved pairings for the
+    same device. An approved-but-unclaimed device row (`token_hash` NULL)
+    may be approved again; one with an active token is refused until it is
+    revoked. If the admin approves an old QR after the phone generated a
+    newer code, the approval returns `410`. The app must show the current
+    code; do not let two live codes coexist.
 
 ## 11. Definition of done
 - [ ] The requested behavior is implemented or the investigation is complete.

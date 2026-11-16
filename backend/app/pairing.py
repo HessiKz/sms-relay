@@ -32,7 +32,7 @@ from app import rev
 from app.miniapp_auth import require_miniapp
 from app.security import RateLimiter
 
-PAIRING_TTL_S = 300
+PAIRING_TTL_S = 600
 MAX_PENDING_PAIRINGS = 50
 MAX_PAIRINGS_PER_IP = 10
 PAIRING_WINDOW_S = 60.0
@@ -271,6 +271,8 @@ def build_router(settings) -> APIRouter:
         if pairing.get("expires_at", 0) <= now:
             db.pairing_expire(conn, pairing["id"])
             raise HTTPException(410, "pairing expired")
+        if status in ("cancelled", "expired"):
+            raise HTTPException(410, "pairing expired or replaced")
         if status == "pending":
             # Not approved yet: the phone keeps waiting.
             return JSONResponse(status_code=202,
@@ -309,6 +311,8 @@ def build_miniapp_router(settings) -> APIRouter:
         if pairing.get("expires_at", 0) <= now:
             db.pairing_expire(conn, pairing["id"])
             raise HTTPException(410, "pairing expired")
+        if pairing.get("status") in ("cancelled", "expired"):
+            raise HTTPException(410, "pairing expired or replaced")
         return {
             "pairing_id": pairing["id"],
             "device_id": pairing["device_id"],
@@ -329,13 +333,21 @@ def build_miniapp_router(settings) -> APIRouter:
         if pairing.get("expires_at", 0) <= now:
             db.pairing_expire(conn, pairing["id"])
             raise HTTPException(410, "pairing expired")
+        if pairing.get("status") in ("cancelled", "expired"):
+            raise HTTPException(410, "pairing expired or replaced")
         if pairing.get("status") == "claimed":
             raise HTTPException(409, "pairing already claimed")
         device_id = pairing["device_id"]
         existing = db.device_by_id(conn, device_id)
         if existing is not None and existing.get("archived"):
             raise HTTPException(409, "the archived device cannot be paired")
-        if existing is not None and existing.get("revoked_at") is None:
+        if (existing is not None
+                and existing.get("revoked_at") is None
+                and existing.get("token_hash")):
+            # A device that already holds a token is actively paired.
+            # An unclaimed row (no token) is not: the previous approval
+            # may have expired before the phone could claim it, so a new
+            # approval must be able to finish the pairing.
             raise HTTPException(409, "device is already paired")
         admin = getattr(request.state, "tg_user", {}) or {}
         approved = db.pairing_approve(conn, pairing["id"], now,

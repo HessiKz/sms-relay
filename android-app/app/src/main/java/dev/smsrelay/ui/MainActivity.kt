@@ -229,7 +229,7 @@ class MainActivity : AppCompatActivity() {
         buttonSyncContacts.setOnClickListener { syncContactsNow() }
         buttonImportSms.setOnClickListener { confirmImport() }
         buttonPair.setOnClickListener { startPairing() }
-        buttonNewCode.setOnClickListener { startPairing() }
+        buttonNewCode.setOnClickListener { confirmNewPairingCode() }
         observeImport()
         refreshPairingUi()
     }
@@ -344,8 +344,48 @@ class MainActivity : AppCompatActivity() {
     /**
      * Asks the server for a code and shows it. The admin approves the
      * code in the mini app, the phone picks the token up afterwards.
+     *
+     * If a code is already live, the same pairing is resumed instead of
+     * silently creating another one. The Mini App may still be showing
+     * the old QR; two live codes would let the admin approve a code the
+     * phone is no longer polling.
      */
     private fun startPairing() {
+        if (hasActivePairing()) {
+            showPairMessage(getString(R.string.pair_state_waiting))
+            pairing.resume()
+            return
+        }
+        startNewPairing()
+    }
+
+    /** True when a code exists and has not passed its expiry. */
+    private fun hasActivePairing(): Boolean {
+        if (settings.pairingState != SettingsStore.STATE_PAIRING) return false
+        if (settings.pairingId.isBlank()) return false
+        val expiresAt = settings.pairingExpiresAt
+        return expiresAt <= 0L ||
+            expiresAt > System.currentTimeMillis() / 1000L
+    }
+
+    /** Replaces the live code, after warning that the old QR dies. */
+    private fun confirmNewPairingCode() {
+        if (!hasActivePairing()) {
+            startNewPairing()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.pair_replace_title)
+            .setMessage(R.string.pair_replace_message)
+            .setPositiveButton(R.string.action_new_code) { _, _ ->
+                startNewPairing()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** Starts a brand-new pairing; an older code is superseded. */
+    private fun startNewPairing() {
         val name = inputDeviceName.text.toString().trim()
         if (name.isBlank()) {
             showPairMessage(getString(R.string.pair_error_name))

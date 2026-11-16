@@ -78,6 +78,8 @@
     <string name="pair_error_expired">Code expired — generate a new code.</string>
     <string name="pair_error_invalid">This code is no longer valid — generate a new one.</string>
     <string name="pair_error_qr">The code could not be drawn — generate a new one.</string>
+    <string name="pair_replace_title">Replace the pairing code?</string>
+    <string name="pair_replace_message">The QR code currently shown in the Mini App will stop working. Generate a new code and scan the new QR.</string>
 
     <!-- Writing a message -->
     <string name="hint_compose_number">Number or contact name</string>

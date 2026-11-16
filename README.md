@@ -195,7 +195,11 @@ reset: the token is dropped, the queued messages stay queued and the phone
 asks to be paired again with the same device id. Changing the server URL
 drops the token as well, because a token belongs to one server only.
 Approving a pairing for a device that is still active is refused (`409`,
-already paired); re-pairing a revoked device reactivates it.
+already paired); re-pairing a revoked device reactivates it. Starting a new
+code cancels any older pending or approved-but-unclaimed code for the same
+device, so an old QR cannot be approved after the phone has moved on. A
+device row that never claimed its token can be approved again; an actively
+paired device must be revoked first.
 
 ### 2. Incoming SMS
 

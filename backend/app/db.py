@@ -2028,6 +2028,15 @@ def pairing_create(conn: sqlite3.Connection, pairing_id: str,
                     app_version: str | None, created_at: int,
                     expires_at: int) -> None:
     def fn() -> None:
+        # A phone must not have two live pairing codes. The admin may
+        # still have an old QR on screen; starting a new code supersedes
+        # it so that an old scan cannot approve a device after the phone
+        # has moved on to a newer code.
+        conn.execute(
+            "UPDATE pairings SET status = 'cancelled'"
+            " WHERE device_id = ? AND status IN ('pending', 'approved')",
+            (device_id,),
+        )
         conn.execute(
             "INSERT INTO pairings"
             " (id, scan_code_hash, claim_secret_hash, device_id,"
