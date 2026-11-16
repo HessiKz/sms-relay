@@ -566,3 +566,36 @@ names.
   its QR in the Mini App, then verify default-SMS role, SMS upload,
   command delivery, and the new device-first Mini App on a real
   Telegram client. Remove the old APK from the phones.
+
+## 2026-11-16 — Stable signing for rolling CI APKs
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, lead).
+- **Task:** A GitHub-hosted runner would generate a different debug
+  signing key on each run, so the next APK would not install over the
+  previous one. Make the rolling release update-safe.
+- **Files:** `.github/workflows/android-build.yml`,
+  `android-app/app/build.gradle.kts`, `.gitignore`, `README.md`,
+  `AGENTS.md`, `docs/AGENT_LOG.md`.
+- **Changed:** generated a dedicated PKCS12 debug key and stored only
+  the base64 keystore, password, alias and key password in GitHub
+  Actions secrets. The workflow decodes the keystore before the build
+  and passes the signing environment to Gradle; local builds without
+  those variables keep the platform debug key. The keystore path is
+  ignored by git. The README and binding APK rule now state that the
+  signing key must not be rotated without warning, because rotation
+  changes the update signature.
+- **Verification:** workflow run `43923060224` completed with
+  `success`; the rolling release asset `sms-relay-debug.apk` was
+  replaced (7,315,405 bytes) and downloads with HTTP 200. Parsing the
+  APK v2 signature block shows subject `CN = SMS Relay Debug, O = SMS
+  Relay, C = US`, fingerprint
+  `88:4E:7C:4E:7D:9D:6B:91:1B:0D:D7:8D:8B:0B:49:EF:36:57:45:D3:0C:47:BC:44:37:CD:44:C2:DF:1A:EC:1B`,
+  not a runner-generated Android debug key. No APK or keystore was
+  committed.
+- **Decisions / risks:** the key is a debug key stored in Actions
+  secrets; if the secrets are removed, future builds will not update
+  over old installs. A build signed by a previous, different debug key
+  must be uninstalled once before installing this one. The rule still
+  forbids deploying an APK the workflow did not build.
+- **Follow-ups:** install the latest asset, pair, and verify the
+  default-SMS and upload flows; retain the four signing secrets.
