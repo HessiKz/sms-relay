@@ -4,6 +4,8 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+val stableDebugStore = System.getenv("ANDROID_KEYSTORE_PATH")
+
 android {
     namespace = "dev.smsrelay"
     compileSdk = 35
@@ -20,6 +22,21 @@ android {
         buildConfig = true
     }
 
+    // GitHub Actions supplies a stable debug signing key through secrets,
+    // so a newly built APK can update the previous one. A local build
+    // without the environment keeps the platform debug key.
+    signingConfigs {
+        if (!stableDebugStore.isNullOrBlank()) {
+            create("stableDebug") {
+                storeFile = file(stableDebugStore)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+                storeType = "PKCS12"
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -30,6 +47,9 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            if (!stableDebugStore.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("stableDebug")
+            }
         }
     }
 

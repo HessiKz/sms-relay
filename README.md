@@ -439,7 +439,8 @@ debug build is published as a public release asset:
 
 Do not commit an APK to the repository or hand out an Actions artifact URL
 (artifacts require a GitHub login). If the workflow fails, fix the build before
-deploying.
+deploying. The workflow signs the APK with a stable debug key stored in GitHub
+Actions secrets, so a newly downloaded build can update the previous one.
 
 The app targets SDK 35 and supports API 26+. On Android 10+ it must be made
 the default SMS app to receive the SMS permission group, or the user must

@@ -55,7 +55,21 @@ jobs:
           cd android-app
           gradle wrapper --gradle-version 8.11.1
 
+      # Keep one signing key across CI runs so a new APK can update the
+      # previous one. The keystore lives only in Actions secrets.
+      - name: Install the stable debug signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > android-app/debug.keystore
+
       - name: Assemble debug APK
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/android-app/debug.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           cd android-app
           ./gradlew assembleDebug --no-daemon

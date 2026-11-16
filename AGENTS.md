@@ -38,6 +38,9 @@ the rolling `android-latest` release. Report this download URL:
 Do not hand out an Actions artifact URL (it requires GitHub authentication), do
 not commit an APK to the repository, and do not deploy an APK that this
 workflow did not build. If the build fails, fix it and rerun before finishing.
+The workflow uses a stable debug signing key stored in GitHub Actions secrets;
+do not remove or rotate it without rebuilding and telling the operator that
+the update signature changes.
 
 ## The non-negotiable rule: update the agent log
 
