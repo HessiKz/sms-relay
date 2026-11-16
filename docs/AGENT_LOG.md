@@ -531,3 +531,38 @@ names.
 - **Follow-ups:** install the APK on a phone and run the pairing,
   default-SMS, upload and command checks; keep the release URL in the
   rule.
+
+## 2026-11-16 — Production deployment of the multi-device build
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, lead), with explicit
+  operator authorization.
+- **Task:** Deploy the new multi-device backend and Mini App bundle to
+  `ai-barrow.ir/relay` after the GitHub APK release.
+- **Files:** live `/opt/sms-relay/app` (new backend + static bundle),
+  `/etc/sms-relay/env` (`PHONE_A_TOKEN` removed), live
+  `/var/lib/sms-relay/sms.db` (additive migration), and this log.
+- **Changed:** stopped `sms-relay-api`, replaced the backend/static
+  bundle, copied `requirements.txt`, removed the obsolete shared phone
+  token from the live env, and started the service. The additive
+  migration created `devices`, `pairings`, `device_contacts`,
+  `thread_reads_scoped` and the `device_id` columns. The live database
+  contained no messages, commands, contacts or read markers, so no
+  archived `legacy` device was needed.
+- **Verification:** took an online SQLite backup, a tar of the previous
+  app directory, and an env copy under `/var/lib/backups/sms-relay/`.
+  Local and public `/health` return `{"ok":true}`. The public
+  `/relay/app/` serves the new shell (`<base href="/relay/app/">`,
+  `device-list`, `pair-sheet`). The old `PHONE_A_TOKEN` gets 401 on
+  `/commands`. `POST /pair/start` returns a 32-character pairing id, a
+  6-character code and a `t.me` QR payload. Telegram `getMe` succeeds
+  through sing-box; admin `/status` returns `paused=false`, queue 0, no
+  devices yet. No journal errors, conflict, or traceback.
+- **Decisions / risks:** this is a forced re-pair deployment: the old
+  APK is now unauthorized, and the new APK from the rolling release is
+  required. The live database had no pre-upgrade history to preserve.
+  The smoke-test pairing is unapproved and expires automatically. The
+  Mini App may need to be reopened to drop an old cached bundle.
+- **Follow-ups:** install the GitHub APK, pair each phone by scanning
+  its QR in the Mini App, then verify default-SMS role, SMS upload,
+  command delivery, and the new device-first Mini App on a real
+  Telegram client. Remove the old APK from the phones.
