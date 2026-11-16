@@ -78,6 +78,7 @@ jobs:
           tag="android-latest"
           asset="sms-relay-debug.apk"
           apk="android-app/app/build/outputs/apk/debug/app-debug.apk"
+          staged="${RUNNER_TEMP}/${asset}"
           notes="Rolling debug build from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})."
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" \
@@ -91,6 +92,10 @@ jobs:
               --prerelease \
               --target "$GITHUB_SHA"
           fi
-          gh release upload "$tag" "$apk#$asset" --clobber
+          # The asset name is the basename of the uploaded file. Stage it
+          # under the stable name so the documented URL never changes.
+          cp "$apk" "$staged"
+          gh release delete-asset "$tag" "app-debug.apk" --yes 2>/dev/null || true
+          gh release upload "$tag" "$staged" --clobber
           echo "APK: https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}" \
             >> "$GITHUB_STEP_SUMMARY"
