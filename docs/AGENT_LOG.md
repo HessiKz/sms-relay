@@ -629,3 +629,69 @@ names.
 - **Follow-ups:** install 1.3.0, open Settings → Default apps → SMS app
   (or tap the app's button), select SMS Relay, and verify incoming SMS
   capture and upload.
+
+## 2026-11-16 — Duplicate pairing codes, unclaimed retry, and APK 1.3.1
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode, subagent).
+- **Task:** A phone could hold two live pairing codes and an admin could
+  approve the older one, leaving the phone polling a superseded code. An
+  approved-but-unclaimed device row then blocked every later approval with
+  `409 device is already paired`. Fix both, ship APK 1.3.1, and verify the
+  build and the rolling APK.
+- **Files:** `android-app/app/src/main/java/dev/smsrelay/ui/MainActivity.kt`,
+  `android-app/app/src/main/res/values/strings.xml`,
+  `android-app/app/build.gradle.kts`, `backend/app/db.py`,
+  `backend/app/pairing.py`, `backend/tests/test_pairing.py`, `README.md`,
+  `docs/AGENT_GUIDE.md`, `docs/AGENT_LOG.md`.
+- **Changed:** `pairing_create` now marks older `pending`/`approved`
+  pairings of the same device `cancelled` before inserting the new code, so
+  an old QR cannot be approved after the phone moved on (the claim and
+  approve paths answer `410 pairing expired or replaced`). `pair_approve`
+  distinguishes an active device (has `token_hash`, not revoked → `409`)
+  from an unclaimed row (no token, e.g. the previous approval expired
+  before the phone claimed it), which may now be approved again. Pairing
+  TTL stays 600 s. On the phone, the Pair button resumes a live pairing
+  instead of silently minting a second code, `hasActivePairing()` checks
+  state + `pairingExpiresAt`, and the New-code button asks for confirmation
+  before replacing a live code. Version bumped to versionCode 6 /
+  versionName 1.3.1.
+- **Verification:** the push build ran as GitHub Actions run
+  `43932205731` (`push`, status `completed`, conclusion `success`; all
+  steps green, including "Install the stable debug signing key",
+  "Assemble debug APK", and "Publish rolling APK release"). The earlier
+  "Cancelled" line was the polling command, not the workflow. Release
+  `android-latest` has exactly one asset, `sms-relay-debug.apk`
+  (`state uploaded`, 7,317,165 bytes). An anonymous download returns
+  HTTP 200 with that same length. Androguard: package `dev.smsrelay`,
+  versionName `1.3.1`, versionCode `6`; `RECEIVE_MMS` and
+  `RECEIVE_WAP_PUSH` present; `MmsReceiver` handles `WAP_PUSH_DELIVER`,
+  `SmsReceiver` handles `SMS_DELIVER`, `ComposeSmsActivity` handles
+  `SENDTO`, `RespondViaMessageService` handles `RESPOND_VIA_MESSAGE`; the
+  dex contains the new `hasActivePairing`, `confirmNewPairingCode`, and
+  `startNewPairing` methods. The APK is v2-signed only (no v1/v3) by
+  subject `CN = SMS Relay Debug, O = SMS Relay, C = US`, SHA-256
+  `88:4E:7C:4E:7D:9D:6B:91:1B:0D:D7:8D:8B:0B:49:EF:36:57:45:D3:0C:47:BC:44:37:CD:44:C2:DF:1A:EC:1B`
+  — the same stable key as the previous release, so 1.3.1 updates in place.
+  `backend/tests/test_pairing.py` passes (46 tests). Live read-only checks:
+  `systemctl is-active sms-relay-api` → `active`, `GET /health` on
+  `127.0.0.1:8090` → `{"ok":true}`, and the deployed
+  `/opt/sms-relay/app` copies of `pairing.py`/`db.py` are byte-identical to
+  this repository, so the pairing fix is live. The DB shows no pending or
+  approved pairing for the Xiaomi device: its two 1.3.0 pairings are
+  `expired` (one was approved but never claimed), and `pairing_cleanup`
+  already deleted its unclaimed device row, so there is no Xiaomi row in
+  `devices` to inspect. The only pending pairing belongs to a `deploy-test`
+  device from the deploy smoke test and expires on its own.
+- **Decisions / risks:** the supersede rule is device-scoped, so a phone
+  that starts a code after a reset still only has one live code. An
+  approved-but-unclaimed row is now reusable, which means an approval can
+  be repeated until the TTL passes; that is intentional and bounded by the
+  600 s TTL. Cancelling the older pairing is not a security downgrade: it
+  only removes validity, and the claim/approve paths already refuse
+  cancelled rows. The APK is debug-signed; it is not a Play release.
+- **Follow-ups:** on the phone, install 1.3.1, open pairing, generate a
+  code, and approve that new code in the Mini App — the admin must do the
+  approval; this agent did not approve anything. Then confirm the device
+  row gains a token, check default-SMS selection, and send one test SMS
+  end to end. The test driver in `tests/test_pairing.py` covers the
+  supersede and unclaimed-retry cases, not the UI flow on a real handset.
