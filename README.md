@@ -446,7 +446,11 @@ The app targets SDK 35 and supports API 26+. On Android 10+ it must be made
 the default SMS app to receive the SMS permission group, or the user must
 grant notification access and rely on the notification-listener capture
 path. `RoleState` reports at startup which capture paths are actually
-available, so the UI never lies about the default-SMS role.
+available, so the UI never lies about the default-SMS role. The manifest
+also carries the MMS/WAP-push part of the role contract (`RECEIVE_MMS`,
+`RECEIVE_WAP_PUSH`, and a `WAP_PUSH_DELIVER` receiver); the relay does not
+implement MMS, and the receiver exists so Android and OEM role pickers list
+the app as a messaging app.
 
 Pairing and token storage live in the app: `PairingController` drives the QR
 flow, `QrCode` renders the payload on the phone, `PairingClient` talks to

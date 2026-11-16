@@ -599,3 +599,33 @@ names.
   forbids deploying an APK the workflow did not build.
 - **Follow-ups:** install the latest asset, pair, and verify the
   default-SMS and upload flows; retain the four signing secrets.
+
+## 2026-11-16 — Fix default-messaging-app role eligibility
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, lead).
+- **Task:** The installed APK was not listed as a messaging app and could
+  not be selected as the default SMS app.
+- **Files:** `android-app/app/src/main/AndroidManifest.xml`,
+  new `android-app/app/src/main/java/dev/smsrelay/receiver/MmsReceiver.kt`,
+  `android-app/app/build.gradle.kts`, `README.md`,
+  `docs/AGENT_GUIDE.md`, `docs/AGENT_LOG.md`.
+- **Changed:** added the MMS/WAP-push part of Android's default-SMS role
+  contract: `RECEIVE_MMS`, `RECEIVE_WAP_PUSH`, and an exported
+  `WAP_PUSH_DELIVER` receiver protected by `BROADCAST_WAP_PUSH` with the
+  MMS MIME type. `MmsReceiver` is a deliberate no-op because the relay
+  does not implement MMS; it exists so Android and OEM role pickers list
+  the app. Bumped the APK to versionCode 5 / versionName 1.3.0.
+- **Verification:** GitHub Actions run `43927798131` completed with
+  `success`; the rolling asset downloads with HTTP 200 (7,315,681
+  bytes). The published APK's merged manifest contains `RECEIVE_MMS`,
+  `RECEIVE_WAP_PUSH`, `SmsReceiver` for `SMS_DELIVER`, and `MmsReceiver`
+  for `WAP_PUSH_DELIVER` with `application/vnd.wap.mms-message`; the v2
+  signature is still the stable `CN = SMS Relay Debug` key. Not tested on
+  a physical device.
+- **Decisions / risks:** MMS is not forwarded; the receiver only
+  satisfies the role contract. Some OEMs may still impose their own
+  restrictions. Version 1.3.0 updates over the stable-signed 1.2.1; an
+  older differently signed debug build needs one uninstall.
+- **Follow-ups:** install 1.3.0, open Settings → Default apps → SMS app
+  (or tap the app's button), select SMS Relay, and verify incoming SMS
+  capture and upload.

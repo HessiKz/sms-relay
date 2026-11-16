@@ -365,7 +365,7 @@ renames a device, sets it as the default and revokes it.
 
 | Area | Files | Responsibility |
 |---|---|---|
-| Capture | `receiver/SmsReceiver.kt`, `sms/SmsNotificationListener.kt` | default-SMS broadcast path and notification-listener path |
+| Capture | `receiver/SmsReceiver.kt`, `receiver/MmsReceiver.kt`, `sms/SmsNotificationListener.kt` | default-SMS broadcast path, MMS role stub, notification-listener path |
 | Dedupe | `util/Dedupe.kt`, `util/SenderNormalizer.kt` | prevent double capture across paths |
 | Provider | `sms/SmsProviderWriter.kt`, `sms/SmsSubscriptionLookup.kt` | write inbox rows when default app; infer SIM |
 | Local queue | `data/MessageRecord.kt`, `data/MessageDao.kt`, `data/AppDatabase.kt` | Room message state and migrations |
