@@ -318,6 +318,19 @@ const SCAN_PROMPT = "Scan the QR code shown on the phone";
 export function scanQrAvailable() {
   return Boolean(webApp && typeof webApp.showScanQrPopup === "function");
 }
+// Dismissing the native scanner is a separate call from reading the
+// answer. A client that hands the text back but keeps the preview open
+// leaves the camera running, so the popup is closed once a code arrives.
+// Older clients have no such method, and one that throws on an already
+// closed popup must not turn a successful scan into a failure.
+function closeScanQrPopup() {
+  if (!webApp || typeof webApp.closeScanQrPopup !== "function") return;
+  try {
+    webApp.closeScanQrPopup();
+  } catch (err) {
+    // The camera state stays the client's business.
+  }
+}
 
 export function showScanQr() {
   if (!scanQrAvailable()) return Promise.resolve(null);
@@ -333,7 +346,12 @@ export function showScanQr() {
       } catch (err) {
         // The event may not be supported; the promise still settles.
       }
-      resolve(typeof value === "string" && value ? value : null);
+      const scanned = typeof value === "string" && value ? value : "";
+      // A scan does not dismiss the native preview by itself: without
+      // this the camera keeps running over the Mini App. Cancel
+      // (scanQrPopupClosed) already closed the popup on the client side.
+      if (scanned) closeScanQrPopup();
+      resolve(scanned || null);
     };
     const onClosed = () => finish(null);
     try {

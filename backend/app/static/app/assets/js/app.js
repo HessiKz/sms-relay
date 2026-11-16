@@ -7,7 +7,7 @@
 //   #/d/<device_id>                 the conversations of that device
 //   #/d/<device_id>/t/<thread_key>  a thread of that device
 
-import * as tg from "./telegram.js";
+import * as tg from "./telegram.js?v=20261116-scan";
 import * as store from "./store.js";
 import * as ui from "./ui.js";
 import { AuthError, NetworkError } from "./api.js";

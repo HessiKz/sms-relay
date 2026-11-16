@@ -2,7 +2,7 @@
 // The initData credential is sent only through the request header, never
 // in a URL, a cache key or a log line.
 
-import { initData } from "./telegram.js";
+import { initData } from "./telegram.js?v=20261116-scan";
 
 const API_ROOT = "api/";
 const AUTH_HEADER = "X-Telegram-Init-Data";

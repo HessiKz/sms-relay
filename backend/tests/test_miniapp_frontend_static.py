@@ -49,10 +49,13 @@ def test_shell_keeps_base_and_telegram_sdk():
     assert 'name="viewport"' in html
     assert "https://telegram.org/js/telegram-web-app.js?64" in html
     assert 'rel="stylesheet" href="assets/app.css"' in html
-    assert re.search(r'<script[^>]+type="module"[^>]+src="assets/js/app\.js"',
-                     html) or re.search(
-                         r'<script[^>]+type="module"[^>]+src="assets/app\.js"',
-                         html)
+    # The entry and the modulepreload of the entry carry the cache-buster,
+    # so an already installed WebView fetches the updated bundle.
+    assert re.search(
+        r'<script[^>]+type="module"[^>]+src="assets/app\.js\?v=20261116-scan"',
+        html)
+    assert 'rel="modulepreload" href="assets/js/app.js?v=20261116-scan"' \
+        in html
 
 
 def test_shell_has_no_inline_handlers_or_styles():
@@ -99,7 +102,9 @@ def test_no_third_party_urls_outside_telegram():
 
 def test_entry_module_loads_the_real_app():
     entry = (STATIC_ROOT / "assets" / "app.js").read_text(encoding="utf-8")
-    assert './js/app.js' in entry
+    assert './js/app.js?v=20261116-scan' in entry
+    # The entry is reached through the cache-busted URL of index.html.
+    assert 'src="assets/app.js?v=20261116-scan"' in _html()
 
 
 def test_nested_modules_are_served(client):
@@ -184,6 +189,9 @@ def test_the_qr_scanner_is_the_native_one_of_telegram():
     assert "scanQrPopupClosed" in telegram_js
     assert "export function showScanQr" in telegram_js
     assert "scanQrAvailable" in telegram_js
+    # The popup is dismissed once a code arrives, or the camera of the
+    # client keeps running behind the Mini App.
+    assert "closeScanQrPopup" in telegram_js
     # The shell sends camera=(), so the app must not ask for the camera.
     assert "getUserMedia" not in combined
     assert "mediaDevices" not in combined
@@ -202,6 +210,35 @@ def test_the_scanner_is_called_with_the_documented_signature():
     assert "result.then(" in telegram_js
     # The cancellation path of the popup stays.
     assert "scanQrPopupClosed" in telegram_js
+
+
+def test_the_scanned_code_closes_the_native_scanner():
+    telegram_js = _js("telegram.js")
+    # Feature-detect: older clients have no closeScanQrPopup.
+    assert 'typeof webApp.closeScanQrPopup !== "function"' in telegram_js
+    # The call sits in the scanner path, not in an unrelated helper.
+    show_scan = _function_source(telegram_js, "showScanQr")
+    assert "closeScanQrPopup()" in show_scan
+    # The scanned text is still resolved after the popup is dismissed.
+    assert "resolve(scanned || null)" in show_scan
+    # Dismissing is guarded: a client that throws must not lose the scan.
+    close_source = _function_source(telegram_js, "closeScanQrPopup")
+    assert "try {" in close_source and "catch (err)" in close_source
+
+
+def test_only_the_telegram_module_is_cache_busted():
+    app_js = _js("app.js")
+    api_js = _js("api.js")
+    # One version for the wrapper, or the bundle ends up with two copies
+    # of the module and its state is computed twice.
+    assert '"./telegram.js?v=20261116-scan"' in app_js
+    assert "./telegram.js?v=20261116-scan" in api_js
+    assert '"./telegram.js"' not in app_js
+    assert '"./telegram.js"' not in api_js
+    # The rest of the graph keeps its plain, stable specifiers.
+    assert '"./store.js"' in app_js and '"./ui.js"' in app_js
+    assert '"./api.js"' in app_js
+    assert '"./api.js"' in _js("store.js")
 
 
 def test_the_pairing_payload_forms_are_accepted():

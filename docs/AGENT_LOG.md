@@ -821,3 +821,61 @@ names.
   batch-size trap before touching the cursor. Consider a separate log entry
   once the sent rows actually exist, since this entry can only verify the
   code path, not the live import.
+
+
+## 2026-11-16 — Close the native QR scanner after a scan
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, subagent).
+- **Task:** The Mini App's pairing sheet opened Telegram's native QR
+  scanner through `showScanQrPopup()` but never dismissed it, so after a
+  code was read the camera preview kept running over the Mini App. The
+  scanned text was resolved correctly; only the popup stayed open.
+- **Files:** `backend/app/static/app/assets/js/telegram.js`,
+  `backend/app/static/app/assets/js/app.js`,
+  `backend/app/static/app/assets/js/api.js`,
+  `backend/app/static/app/assets/app.js`,
+  `backend/app/static/app/index.html`,
+  `backend/tests/test_miniapp_frontend_static.py`,
+  `docs/AGENT_LOG.md`.
+- **Changed:** `telegram.js` gained a private `closeScanQrPopup()` helper
+  that feature-detects `webApp.closeScanQrPopup` (`typeof
+  webApp.closeScanQrPopup !== "function"` returns early) and wraps the
+  call in `try/catch`, so an older client or a popup the client already
+  closed cannot turn a successful scan into a failure. `showScanQr()`'s
+  `finish()` now computes the scanned string first, calls the helper only
+  when that string is non-empty, and then resolves the same value — the
+  text is never lost and the cancel path (`scanQrPopupClosed` →
+  `finish(null)`) does not close anything a second time. A version query
+  `v=20261116-scan` was added to the `index.html` modulepreload and module
+  entry, to the entry's `import "./js/app.js?..."`, and to the
+  `./telegram.js` specifier in both `assets/js/app.js` and
+  `assets/js/api.js`, so exactly one cache-busted copy of the wrapper loads
+  in an existing Telegram WebView. No other module specifier was touched.
+- **Verification:** `node --input-type=module --check` on all six bundle
+  files (entry plus the five modules) passed. `cd backend &&
+  /tmp/opencode/venv311/bin/python -m pytest
+  tests/test_miniapp_frontend_static.py tests/test_miniapp_shell.py -q`
+  gave **40 passed**. The new assertions require `closeScanQrPopup` in the
+  scanner path, its feature detection and its `try/catch`, the unchanged
+  `showScanQrPopup(params, callback)` signature, the version query on the
+  shell entry and modulepreload, and that only `./telegram.js` carries it.
+  The changed static files were copied to
+  `/opt/sms-relay/app/app/static/app/` with paths preserved and the service
+  was **not** restarted. Live checks after the copy:
+  `https://ai-barrow.ir/relay/app/` serves
+  `assets/app.js?v=20261116-scan`,
+  `https://ai-barrow.ir/relay/app/assets/js/telegram.js?v=20261116-scan`
+  serves `closeScanQrPopup`, `systemctl is-active sms-relay-api` is
+  `active`, and `GET /health` on `127.0.0.1:8090` returns `{"ok":true}`.
+- **Decisions / risks:** `closeScanQrPopup()` is a documented Telegram
+  WebApp method, but a client that does not implement it keeps its old
+  camera behaviour — the fix is a no-op there, and the guard means no error
+  surfaces. Nothing server-side changed: the popup is client UI only, so a
+  queued call or a message state cannot be affected. The version query is
+  a manual cache-buster, so a future change to the wrapper needs a new
+  value or installed WebViews keep the old module.
+- **Follow-ups:** reopen the Mini App in Telegram (or reload the WebView)
+  so the cache-busted entry is fetched, then pair a device and confirm the
+  camera preview disappears as soon as the code is read. If it stays open
+  on a specific client version, treat it as that client lacking
+  `closeScanQrPopup` rather than a regression in the wrapper.
