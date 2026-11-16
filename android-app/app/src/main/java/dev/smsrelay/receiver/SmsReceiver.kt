@@ -10,6 +10,7 @@ import dev.smsrelay.data.AppDatabase
 import dev.smsrelay.sms.SmsProviderWriter
 import dev.smsrelay.sms.SmsSubscriptionLookup
 import dev.smsrelay.util.Dedupe
+import dev.smsrelay.util.RoleState
 import dev.smsrelay.work.Schedule
 import java.util.UUID
 
@@ -32,12 +33,27 @@ class SmsReceiver : BroadcastReceiver() {
         ) {
             return
         }
+        // The platform only delivers SMS_DELIVER to the default SMS app.
+        // When that is this app, the message must be stored in the provider
+        // inbox as well, otherwise it would vanish from the user's inbox.
+        val isDefaultSmsApp = intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION
+
+        // SOME OEM BUILDS SEND BOTH BROADCASTS.
+        //
+        // SMS_RECEIVED is meant for apps that are NOT the default SMS app:
+        // the canonical copy of a message is the SMS_DELIVER one. Some
+        // vendor builds (MIUI among them) hand SMS_RECEIVED to the default
+        // app as well, so both broadcasts reach this receiver for one SMS.
+        // Both were stored as source='sms' and the local dedupe only drops
+        // copies that came through a DIFFERENT path, on purpose: two
+        // genuine repeats of the same text must both be kept. The result
+        // was one message uploaded twice and shown twice in Telegram.
+        // The whole broadcast is dropped here instead: the SMS_DELIVER
+        // copy already carries the message.
+        if (!isDefaultSmsApp && RoleState.isDefaultSmsApp(context)) return
+
         val settings = SettingsStore(context)
         if (!settings.forwardEnabled) return
-        // The platform only delivers to the default SMS app. When that is
-        // this app, the message must be stored in the provider inbox as
-        // well, otherwise it would vanish from the user's inbox.
-        val isDefaultSmsApp = intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION
 
         val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
         if (messages.isEmpty()) return
