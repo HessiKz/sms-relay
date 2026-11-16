@@ -42,14 +42,26 @@ data class RelayCommand(
     val subId: Int = 0
 )
 
-/** One row of the phone's SMS inbox on its way to the server. */
+/**
+ * One row of the phone's SMS store on its way to the server.
+ *
+ * [direction] is `"in"` for a message the phone received and `"out"` for one
+ * it sent. The server needs it to place an imported row on the correct side
+ * of the thread; older servers ignore the unknown field.
+ */
 data class ImportMessage(
     val providerId: Long,
     val sender: String,
     val body: String,
     val receivedAt: Long,
-    val subId: Int
-)
+    val subId: Int,
+    val direction: String = DIRECTION_IN
+) {
+    companion object {
+        const val DIRECTION_IN = "in"
+        const val DIRECTION_OUT = "out"
+    }
+}
 
 /** Outcome of one import batch. */
 sealed class ImportResult {
@@ -175,6 +187,7 @@ class RelayClient(
                     put("body", message.body)
                     put("received_at", message.receivedAt)
                     put("sub_id", message.subId)
+                    put("direction", message.direction)
                 }
             )
         }

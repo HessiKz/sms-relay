@@ -17,12 +17,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Copies the phone's existing SMS inbox to the server, in batches.
+ * Copies the phone's existing SMS — received and sent — to the server, in
+ * batches.
  *
  * The worker resumes from the last imported row id, so stopping the app or
  * losing the connection does not start the import over. Rows are sent
  * directly; they are never written to the local Room database, and the
  * server stores them as history that is not forwarded to Telegram.
+ *
+ * Received and sent rows live in the same `content://sms` table, so one
+ * `_ID` cursor covers both folders. An install that imported only the
+ * inbox has a cursor that cannot describe sent rows; [CURSOR_FORMAT]
+ * makes such an install re-read the store from the beginning. The server
+ * deduplicates, so the inbound rows already imported are not stored twice.
  *
  * Message bodies are never logged.
  */
@@ -36,7 +43,7 @@ class ImportWorker(
         if (settings.baseUri.isBlank()) return@withContext failure(ERROR_SERVER)
         val token = settings.token
         if (token.isBlank()) {
-            // The phone is not paired: the inbox stays where it is.
+            // The phone is not paired: the SMS store stays where it is.
             return@withContext failure(ERROR_NOT_PAIRED)
         }
         if (!RoleState.isDefaultSmsApp(applicationContext)) {
@@ -47,6 +54,14 @@ class ImportWorker(
         )
         if (readSms != PackageManager.PERMISSION_GRANTED) {
             return@withContext failure(ERROR_NO_PERMISSION)
+        }
+
+        // An inbox-only cursor cannot say which sent rows were already
+        // seen, so a pre-1.3.2 install restarts from the first row. This
+        // happens before the loop and only once per install.
+        if (settings.importCursorFormat != CURSOR_FORMAT) {
+            settings.importCursor = 0L
+            settings.importCursorFormat = CURSOR_FORMAT
         }
 
         val client = RelayClient(settings.baseUri, token) { settings.handleUnauthorized() }
@@ -113,7 +128,12 @@ class ImportWorker(
     )
 
     /**
-     * One page of the inbox, oldest first.
+     * One page of the SMS store, oldest first.
+     *
+     * Received and sent rows are read from the same provider table, so a
+     * single `_ID` cursor orders the whole history. For a sent row
+     * [Telephony.Sms.ADDRESS] is the recipient, which is still the other
+     * side of the conversation the server threads on.
      *
      * The limit is also in the sort order, because not every SMS provider
      * honours it. Reading is capped at [BATCH] rows regardless, and the
@@ -125,15 +145,20 @@ class ImportWorker(
             Telephony.Sms.ADDRESS,
             Telephony.Sms.BODY,
             Telephony.Sms.DATE,
-            Telephony.Sms.SUBSCRIPTION_ID
+            Telephony.Sms.SUBSCRIPTION_ID,
+            Telephony.Sms.TYPE
         )
         val result = applicationContext.contentResolver.query(
-            Telephony.Sms.Inbox.CONTENT_URI,
+            Telephony.Sms.CONTENT_URI,
             projection,
-            "${Telephony.Sms._ID} > ?",
-            arrayOf(cursor.toString()),
+            "${Telephony.Sms._ID} > ? AND ${Telephony.Sms.TYPE} IN (?, ?)",
+            arrayOf(
+                cursor.toString(),
+                Telephony.Sms.MESSAGE_TYPE_INBOX.toString(),
+                Telephony.Sms.MESSAGE_TYPE_SENT.toString()
+            ),
             "${Telephony.Sms._ID} ASC LIMIT $BATCH"
-        ) ?: throw IllegalStateException("SMS inbox unavailable")
+        ) ?: throw IllegalStateException("SMS store unavailable")
 
         var rows = 0
         var lastId = cursor
@@ -147,6 +172,7 @@ class ImportWorker(
                 return Page(0, cursor, emptyList())
             }
             val subIndex = query.getColumnIndex(Telephony.Sms.SUBSCRIPTION_ID)
+            val typeIndex = query.getColumnIndex(Telephony.Sms.TYPE)
             while (rows < BATCH && query.moveToNext()) {
                 rows += 1
                 val id = query.getLong(idIndex)
@@ -157,13 +183,22 @@ class ImportWorker(
                 val seconds = epochSeconds(query.getLong(dateIndex))
                 if (!isUsable(sender, body, seconds)) continue
                 val subId = if (subIndex >= 0) query.getInt(subIndex) else 0
+                val direction =
+                    if (typeIndex >= 0 &&
+                        query.getInt(typeIndex) == Telephony.Sms.MESSAGE_TYPE_SENT
+                    ) {
+                        ImportMessage.DIRECTION_OUT
+                    } else {
+                        ImportMessage.DIRECTION_IN
+                    }
                 messages.add(
                     ImportMessage(
                         providerId = id,
                         sender = sender,
                         body = body,
                         receivedAt = seconds,
-                        subId = subId.coerceIn(0, 99)
+                        subId = subId.coerceIn(0, 99),
+                        direction = direction
                     )
                 )
             }
@@ -194,6 +229,13 @@ class ImportWorker(
 
     companion object {
         const val BATCH = 100
+
+        /**
+         * Cursor layout of this build. 2 = received and sent rows from the
+         * shared `content://sms` table.
+         */
+        const val CURSOR_FORMAT = 2
+
         const val MAX_SENDER = 64
         const val MAX_BODY = 16000
         const val MIN_RECEIVED_AT = 946684800L

@@ -49,7 +49,7 @@
     <string name="section_history_title">History</string>
     <string name="section_history_help">See the messages this phone received.</string>
     <string name="section_import_title">Old messages</string>
-    <string name="section_import_help">Copy the SMS that are already in this phone\'s inbox into the web inbox. They are not sent to Telegram.</string>
+    <string name="section_import_help">Copy the SMS that are already on this phone (received and sent) into the web inbox. They are not sent to Telegram.</string>
     <string name="section_advanced_title">Advanced settings (you can ignore these)</string>
 
     <string name="label_forward_enabled">Send every new message to Telegram</string>
@@ -118,7 +118,7 @@
     <!-- Importing the phone's old messages -->
     <string name="action_import_sms">Import old messages</string>
     <string name="import_confirm_title">Import old messages?</string>
-    <string name="import_confirm_message">Every SMS in this phone\'s inbox will be readable in the web inbox. They are not forwarded to Telegram, and messages that are already there are skipped. This can take a few minutes. Continue?</string>
+    <string name="import_confirm_message">Every SMS on this phone — received and sent — will be readable in the web inbox. They are not forwarded to Telegram, and messages that are already there are skipped. This can take a few minutes. Continue?</string>
     <string name="import_confirm_positive">Import</string>
     <string name="import_confirm_negative">Cancel</string>
     <string name="status_import_none">Old messages have not been imported yet.</string>

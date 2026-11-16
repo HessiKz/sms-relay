@@ -236,12 +236,25 @@ class SettingsStore(context: Context) {
         set(value) = prefs.edit().putLong(KEY_LAST_COMMAND_AT, value).apply()
 
     /**
-     * The highest SMS inbox row id that was imported. The worker resumes
+     * The highest SMS store row id that was imported. The worker resumes
      * from here, so an interrupted import never starts over.
      */
     var importCursor: Long
         get() = prefs.getLong(KEY_IMPORT_CURSOR, 0L)
         set(value) = prefs.edit().putLong(KEY_IMPORT_CURSOR, value).apply()
+
+    /**
+     * Layout of the cursor in [importCursor].
+     *
+     * Version 0 is an install that only ever imported the inbox; version 2
+     * imports received and sent rows from the shared SMS store. A mismatch
+     * makes the worker restart the import from the beginning, because an
+     * inbox-only cursor cannot say which sent rows were already seen. The
+     * server drops the inbound rows it already has.
+     */
+    var importCursorFormat: Int
+        get() = prefs.getInt(KEY_IMPORT_CURSOR_FORMAT, 0)
+        set(value) = prefs.edit().putInt(KEY_IMPORT_CURSOR_FORMAT, value).apply()
 
     /** Epoch millis of the last successful upload of the contact list. */
     var lastContactsSyncAt: Long
@@ -306,6 +319,7 @@ class SettingsStore(context: Context) {
         const val KEY_CONTACTS_COUNT = "contacts_count"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_IMPORT_CURSOR = "import_cursor"
+        const val KEY_IMPORT_CURSOR_FORMAT = "import_cursor_format"
         const val KEY_DEVICE_NAME = "device_name"
         const val KEY_PAIRED_NAME = "paired_device_name"
         const val KEY_PAIRED_BASE_URI = "paired_base_uri"
