@@ -6,15 +6,23 @@ request from the operator wins, but the logging rule below still applies.
 
 ## Lead delegation policy (binding)
 
-This project runs in a **lead/worker** model. The lead agent plans, splits,
-assigns, and reviews; it does not implement low- or medium-difficulty work
+This project runs in a **lead/worker** model. The session acting as project
+lead plans, decomposes, assigns, and reviews; it does not implement work
 itself.
 
-| Difficulty | Model | Typical work |
-|---|---|---|
-| Low | `opencode-go/glm-5.3-flash` | mechanical edits, single-file changes, formatting, straightforward doc/test updates |
-| Medium | `opencode-go/minimax-m3.1-flash` | multi-file changes, new endpoints/handlers, reproducible bug fixes, tests across modules |
-| High | Lead decomposes into low/medium packages | architecture, ambiguous requirements, cross-cutting redesigns |
+For this project, **every** subagent must use DeepSeek V4.1 Flash through one
+of these custom providers:
+
+- `100milionseek/deepseek-v4.1-flash-free`
+- `100milionseek-2/deepseek-v4.1-flash-free`
+
+Do not use MiniMax, GLM, Claude, GPT, or any other model or provider for
+subagent work unless the operator explicitly changes this rule. Prefer
+alternating the two providers for parallel subagents or when one is
+rate-limited; the model itself must stay DeepSeek V4.1 Flash.
+
+Use subagents for all implementation, verification, build, documentation, and
+log work. The lead only plans, assigns, reviews, and reports.
 
 Every delegated task must state the goal, files, constraints, acceptance
 criteria, and verification command. Child sessions start with fresh context,
@@ -23,8 +31,9 @@ invariants below, and owns the final `docs/AGENT_LOG.md` entry (or verifies
 the subagent wrote it). Never run overlapping subagents on the same files.
 
 The lead may perform the minimum unblocking action only when delegation is
-unavailable or keeps failing, and must say why. The safety rules in this file
-still apply to subagents.
+unavailable or keeps failing, and must say why. Irreversible actions (deploy,
+restart, push, credential or production-data changes) still require explicit
+operator confirmation. The safety rules in this file still apply to subagents.
 
 ## APK build and release rule (binding)
 

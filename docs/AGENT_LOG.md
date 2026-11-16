@@ -695,3 +695,45 @@ names.
   row gains a token, check default-SMS selection, and send one test SMS
   end to end. The test driver in `tests/test_pairing.py` covers the
   supersede and unclaimed-retry cases, not the UI flow on a real handset.
+
+## 2026-11-16 — DeepSeek-only subagent delegation policy
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode, subagent).
+- **Task:** The operator required every subagent to use the DeepSeek V4.1
+  Flash model from the two `100milionseek` providers, with the lead session
+  restricted to planning, decomposing, assigning, and reviewing work.
+- **Files:** `/opt/sms-relay-src/AGENTS.md`,
+  `/root/.config/opencode/AGENTS.md` (global, outside the repository),
+  `docs/AGENT_LOG.md`.
+- **Changed:** replaced the old GLM/MiniMax difficulty table in the "Lead
+  delegation policy (binding)" section with an explicit DeepSeek-only rule:
+  every subagent must use `100milionseek/deepseek-v4.1-flash-free` or
+  `100milionseek-2/deepseek-v4.1-flash-free`, alternating the providers for
+  parallel work or when one is rate-limited, and MiniMax, GLM, Claude, GPT,
+  or any other model or provider is prohibited unless the operator
+  explicitly changes the rule. Added the rule that subagents perform all
+  implementation, verification, build, documentation, and log work while the
+  lead only plans, assigns, reviews, and reports. Noted that irreversible
+  actions still need explicit operator confirmation. Retained the APK
+  build/release rule and the mandatory append-only log rule unchanged. The
+  same policy text was added to the global OpenCode instructions outside
+  this repository.
+- **Verification:** `grep -Ein
+  'glm|minimax|claude|gpt|opencode-go' AGENTS.md` returns only the
+  prohibition sentence, so no stale model assignments or difficulty table
+  remain; older entries in this log still name the models that were used at
+  the time, which is correct because the log is append-only. `git status
+  --short` shows only `AGENTS.md` modified before the
+  log entry, and only `AGENTS.md` plus `docs/AGENT_LOG.md` after it; no code,
+  README, `docs/AGENT_GUIDE.md`, deploy file, workflow, or live service or
+  database change was made.
+- **Decisions / risks:** the rule is an instruction, not an enforcement
+  mechanism, so a session that ignores `AGENTS.md` can still pick another
+  model. Both `100milionseek` providers serve the same DeepSeek V4.1 Flash
+  model, so alternating them changes routing and rate limits, not model
+  identity; free-tier availability and rate limits are the single point of
+  failure for delegated work. No Android workflow was triggered because
+  these paths do not match its filter.
+- **Follow-ups:** use exactly these two provider/model IDs for every future
+  subagent in this project, and re-read `AGENTS.md` when starting a session
+  so the policy applies from the first delegation.
