@@ -879,3 +879,88 @@ names.
   camera preview disappears as soon as the code is read. If it stays open
   on a specific client version, treat it as that client lacking
   `closeScanQrPopup` rather than a regression in the wrapper.
+
+## 2026-11-16 — Pair a phone from its six-character code alone
+- **Agent:** DeepSeek V4.1 Flash (OpenCode subagent).
+- **Task:** The phone shows a QR code and a six-character code, but the Mini
+  App's manual "Add device" input only accepted the full
+  `pair_<pairing_id>_<scan_code>` payload or a t.me link. A bare code failed
+  because the Mini App had no pairing id to send. Typing the displayed code
+  has to work exactly like a scan.
+- **Files:** `backend/app/pairing.py`, `backend/app/db.py`,
+  `backend/tests/test_pairing.py`,
+  `backend/tests/test_miniapp_frontend_static.py`,
+  `backend/app/static/app/assets/js/telegram.js`,
+  `backend/app/static/app/assets/js/store.js`,
+  `backend/app/static/app/assets/js/app.js`,
+  `backend/app/static/app/assets/js/api.js`,
+  `backend/app/static/app/assets/app.js`,
+  `backend/app/static/app/index.html`, `README.md`,
+  `docs/AGENT_GUIDE.md`, `docs/AGENT_LOG.md`.
+- **Changed:** `db.pairing_by_scan_code(conn, scan_code, now)` hashes the
+  normalized code once and compares it with `hmac.compare_digest` against
+  every `pending`/`approved` pairing that has not expired; cancelled,
+  expired and claimed rows are never candidates, so an old code cannot be
+  revived through this path. A short code can collide, so it returns all
+  matches and the caller decides. `POST /app/api/pair/lookup` in
+  `build_miniapp_router` (behind `require_miniapp`) takes
+  `{"scan_code": ...}`, trims, drops spaces and hyphens, uppercases, accepts
+  1..12 characters, and answers the same fields as
+  `/app/api/pair/preview`: `pairing_id`, `device_id`, `name`, `platform`,
+  `app_version`, `expires_at`, `status`. A miss is the generic `404 unknown
+  pairing`; two live pairings with the same code are `409 ambiguous code`
+  instead of a guess. The lookups are rate limited per admin user id
+  (`MAX_LOOKUPS_PER_ADMIN = 20` per 60 s). `telegram.js` gained
+  `bareScanCode()`, a helper separate from `pairToken()`: it strips
+  whitespace and hyphens, uppercases, and accepts only exactly six
+  characters of the scan alphabet, so the full payload parser is unchanged.
+  `store.pairLookup(scanCode)` posts `pair/lookup`. `previewPairing()` tries
+  `tg.pairToken()` first, and only when that fails tries
+  `tg.bareScanCode()`, resolves the code through `store.pairLookup()`, sets
+  `pairDraft = {pairingId: found.pairing_id, scanCode: code}` and renders
+  the preview with `found` plus the typed `scan_code`; the "not a pairing
+  code" error is only shown when neither path works. Approval keeps using
+  `pairDraft.pairingId` and `pairDraft.scanCode`. The pairing sheet copy,
+  the input placeholder (`ABC123 or pair_…`) and the 404/409 messages now
+  name the typed code. The cache-buster moved from `20261116-scan` to
+  `20261116-pair` because `telegram.js` changed again.
+- **Verification:** `cd backend && /tmp/opencode/venv311/bin/python -m pytest
+  tests/test_pairing.py -q` → **55 passed** (11 new tests: bare code,
+  lowercase/spaced/hyphenated code, wrong code 404, expired code 404,
+  cancelled code 404, approved status, seeded collision 409, 401 without the
+  admin credential, and the 20/min limit). The full suite gave **589 passed,
+  3 failed, 1 error** — exactly the four known pre-existing failures
+  (`test_commands` ×2, `test_db` chat search, `test_app_assembly` shutdown)
+  and nothing new. `tests/test_miniapp_frontend_static.py` plus
+  `test_miniapp_shell.py` → **43 passed**. `node --input-type=module --check`
+  passed on all five modules and the entry; a small Node harness confirmed
+  `bareScanCode("  abc-2w3 ") == "ABC2W3"`, rejected `ABC123`/`ABC1O3`/
+  a full payload, and that `pairToken` still parses both the raw payload and
+  a t.me link. Live: an online backup of `/var/lib/sms-relay/sms.db` was
+  taken to `/var/backups/sms-relay/` (integrity `ok`, 7 pairings) before the
+  change; only `pairing.py` and `db.py` were installed to
+  `/opt/sms-relay/app/app/`, stale `__pycache__` was removed, and
+  `sms-relay-api` was restarted (`active`, `/health` → `{"ok":true}`, zero
+  journal errors). The static files were copied with paths preserved and no
+  restart. Public checks: `https://ai-barrow.ir/relay/app/` serves
+  `v=20261116-pair`, the `six-character code` copy and the
+  `ABC123 or pair_…` placeholder; `assets/js/telegram.js` serves
+  `bareScanCode`; `assets/js/store.js` serves `pair/lookup`; the deployed
+  OpenAPI lists `/app/api/pair/lookup`; the endpoint answers `401` without
+  initData (as designed) and was **not** called with faked credentials.
+  `db.pairing_by_scan_code` was exercised against a copy of the live DB
+  (running a real lookup would have needed a live code and faked initData).
+- **Decisions / risks:** A six-character code has ~1.07e9 combinations, so a
+  collision between two live pairings is possible; that is answered with
+  `409` and the admin must use the full payload, never a guess. The lookup
+  limit is keyed by the admin user id, and behind the proxy everyone shares
+  one address, so an admin who retries quickly can hit `429`; the window is
+  one minute. The lookup reveals nothing beyond what a correct code already
+  proves: unknown, expired and cancelled codes all give the same `404`. The
+  full payload and link path is untouched, and a lookup does not change the
+  pairing state. Only the Mini App static files changed; the Android APK was
+  not touched and no Android workflow was triggered.
+- **Follow-ups:** If `409 ambiguous code` ever shows up in practice, consider
+  lengthening the scan code; that is a server-side `_SCAN_CODE_LEN` change
+  and the phone renders whatever it is given, so no APK update is needed.
+- **Commit:** see the pushed commit on `main` for this entry.

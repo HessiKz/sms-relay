@@ -175,8 +175,13 @@ There is no token that can be pasted into the app. A phone earns its token:
    `com.google.zxing:core`, no camera permission, no network round trip —
    plus the scan code in large letters and the time the code is still valid.
 3. The admin scans the payload with the Mini App's native scanner (the Mini
-   App never asks for the camera itself), or opens the t.me link; the Mini
-   App shows a preview of the pending pairing before the admin approves it. Approval creates or reactivates the device but still issues no token.
+   App never asks for the camera itself), opens the t.me link, or types the
+   six-character code shown on the phone. A bare code is resolved to its
+   pairing by `POST /app/api/pair/lookup` (admin token, rate limited), which
+   only considers live pending/approved pairings and answers `409` rather
+   than guessing when two of them share the code. The Mini App then shows a
+   preview of the pending pairing before the admin approves it. Approval
+   creates or reactivates the device but still issues no token.
 4. The phone polls `POST /pair/claim` every two seconds (longer after a
    network error) with its claim secret. While approval is pending the answer
    is `202`; when it is approved the token is returned **exactly once** and
@@ -351,6 +356,7 @@ fails loudly instead of reading a mixed inbox.
 | `POST /app/api/devices/{id}/revoke` | revoke a paired device |
 | `POST /app/api/devices/{id}/default` | choose the device for Telegram `/sms` |
 | `POST /app/api/pair/preview` | show a pending pairing before approval |
+| `POST /app/api/pair/lookup` | resolve the six-character code shown on the phone to its live pairing; `404` unknown, `409` ambiguous |
 | `POST /app/api/pair/approve` | approve the pairing shown on the phone |
 | `POST /app/api/pair/cancel` | cancel a pending pairing |
 | `GET /app/api/devices/{id}/chats` | the conversations of one device |

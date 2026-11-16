@@ -559,6 +559,15 @@ export async function setDefaultDevice(deviceId) {
 
 // --- pairing ----------------------------------------------------------
 
+// Resolve the short code the phone shows to the pairing behind it. The
+// backend answers the pairing id, so a typed code works exactly like a
+// scan without the admin having to copy the whole payload.
+export async function pairLookup(scanCode) {
+  return apiPost("pair/lookup", {
+    scan_code: String(scanCode || ""),
+  });
+}
+
 export async function pairPreview(pairingId, scanCode) {
   return apiPost("pair/preview", {
     pairing_id: String(pairingId || ""),

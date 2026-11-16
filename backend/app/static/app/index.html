@@ -7,8 +7,8 @@
   <title>SMS Relay</title>
   <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
   <link rel="stylesheet" href="assets/app.css">
-  <link rel="modulepreload" href="assets/js/app.js?v=20261116-scan">
-  <script type="module" src="assets/app.js?v=20261116-scan"></script>
+  <link rel="modulepreload" href="assets/js/app.js?v=20261116-pair">
+  <script type="module" src="assets/app.js?v=20261116-pair"></script>
 </head>
 <body>
   <div id="app" class="app" data-route="devices">
@@ -131,7 +131,8 @@
         <h2 id="pair-title" class="dialog-title">Add a device</h2>
         <p class="muted">
           On the phone open the relay app and choose “Pair this phone”.
-          Scan the QR code it shows, or paste the pairing code below.
+          Scan the QR code it shows, or type the six-character code below.
+          The full pairing link works too.
         </p>
         <button id="pair-scan" class="send-button" type="button">
           Scan QR code
@@ -140,7 +141,11 @@
           <label class="field-label" for="pair-code">Pairing code</label>
           <input id="pair-code" class="field-input" type="text"
                  autocomplete="off" spellcheck="false" maxlength="200"
-                 placeholder="pair_…">
+                 placeholder="ABC123 or pair_…">
+          <p class="muted">
+            Type the six characters shown under the QR code on the phone,
+            or paste the whole code (pair_…) or its link.
+          </p>
           <button id="pair-submit" class="secondary-button" type="submit">
             Show device
           </button>

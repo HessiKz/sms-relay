@@ -94,6 +94,21 @@ function matchPairToken(raw) {
   return matchPairParts(value.slice("pair_".length));
 }
 
+// The short code the phone prints next to its QR code. The admin may type
+// only that code, so it is normalized the same way the backend does:
+// spaces and hyphens are formatting, the case is not significant. Exactly
+// six characters of the scan alphabet ("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+// is a bare code; anything longer, or a character outside the alphabet, is
+// not, and the caller falls back to the full payload parser.
+const SCAN_CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/;
+
+export function bareScanCode(value) {
+  const code = String(value || "")
+    .replace(/[\s-]+/g, "")
+    .toUpperCase();
+  return SCAN_CODE_RE.test(code) ? code : null;
+}
+
 // Extract the pairing token from anything the user may hand over: the
 // raw payload, a bot link with a startapp parameter, a link with a pair
 // parameter, or a start parameter that begins with "pair_".

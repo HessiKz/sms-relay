@@ -52,9 +52,9 @@ def test_shell_keeps_base_and_telegram_sdk():
     # The entry and the modulepreload of the entry carry the cache-buster,
     # so an already installed WebView fetches the updated bundle.
     assert re.search(
-        r'<script[^>]+type="module"[^>]+src="assets/app\.js\?v=20261116-scan"',
+        r'<script[^>]+type="module"[^>]+src="assets/app\.js\?v=20261116-pair"',
         html)
-    assert 'rel="modulepreload" href="assets/js/app.js?v=20261116-scan"' \
+    assert 'rel="modulepreload" href="assets/js/app.js?v=20261116-pair"' \
         in html
 
 
@@ -102,9 +102,9 @@ def test_no_third_party_urls_outside_telegram():
 
 def test_entry_module_loads_the_real_app():
     entry = (STATIC_ROOT / "assets" / "app.js").read_text(encoding="utf-8")
-    assert './js/app.js?v=20261116-scan' in entry
+    assert './js/app.js?v=20261116-pair' in entry
     # The entry is reached through the cache-busted URL of index.html.
-    assert 'src="assets/app.js?v=20261116-scan"' in _html()
+    assert 'src="assets/app.js?v=20261116-pair"' in _html()
 
 
 def test_nested_modules_are_served(client):
@@ -231,8 +231,8 @@ def test_only_the_telegram_module_is_cache_busted():
     api_js = _js("api.js")
     # One version for the wrapper, or the bundle ends up with two copies
     # of the module and its state is computed twice.
-    assert '"./telegram.js?v=20261116-scan"' in app_js
-    assert "./telegram.js?v=20261116-scan" in api_js
+    assert '"./telegram.js?v=20261116-pair"' in app_js
+    assert "./telegram.js?v=20261116-pair" in api_js
     assert '"./telegram.js"' not in app_js
     assert '"./telegram.js"' not in api_js
     # The rest of the graph keeps its plain, stable specifiers.
@@ -252,6 +252,51 @@ def test_the_pairing_payload_forms_are_accepted():
     assert "pair/preview" in store_js
     assert "pair/approve" in store_js
     assert "pair/cancel" in store_js
+
+
+def test_a_bare_six_character_code_is_resolved_by_the_backend():
+    telegram_js = _js("telegram.js")
+    store_js = _js("store.js")
+    app_js = _js("app.js")
+    # The helper is separate from the full payload parser: it only
+    # accepts a code of the scan alphabet, never a whole payload.
+    assert "export function bareScanCode" in telegram_js
+    code_source = _function_source(telegram_js, "bareScanCode")
+    assert r"/[\s-]+/" in code_source or "/[\\s-]+/" in code_source
+    assert "toUpperCase()" in code_source
+    helper_re = re.search(r"const SCAN_CODE_RE = (/[^/]+/);", telegram_js)
+    assert helper_re, "the scan alphabet must be a literal pattern"
+    assert "{6}" in helper_re.group(1)
+    # The lookup endpoint carries only the typed code.
+    assert 'apiPost("pair/lookup"' in store_js
+    assert "scan_code: String(scanCode" in store_js
+    # A failed payload parse falls back to the bare code, and the draft
+    # uses the pairing id the backend resolved.
+    preview_source = _function_source(app_js, "previewPairing")
+    assert "tg.pairToken(payload)" in preview_source
+    assert "tg.bareScanCode(payload)" in preview_source
+    assert "store.pairLookup(" in preview_source
+    assert "preview.pairing_id" in preview_source
+    # The preview and the approval keep the typed code.
+    assert "scan_code: scanCode" in preview_source
+    assert "pairDraft.scanCode" in _function_source(app_js, "approvePairing")
+
+
+def test_the_manual_pairing_entry_documents_the_six_character_code():
+    html = _html()
+    assert "six-character code" in html
+    assert "ABC123" in html
+    assert "pair_…" in html
+    # The sheet explains both ways of entering a code.
+    assert "Type the six characters" in html
+    assert "full pairing link works too" in html
+
+
+def test_the_pairing_error_names_the_bare_code():
+    app_js = _js("app.js")
+    source = _function_source(app_js, "pairErrorMessage")
+    assert "six-character" in source
+    assert "ambiguous" in source
 
 
 def test_the_event_scope_names_the_device_and_the_thread():

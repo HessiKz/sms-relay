@@ -162,6 +162,107 @@ def test_pair_preview_with_a_wrong_code_is_404(client):
     assert response.status_code == 404
 
 
+def test_pair_lookup_resolves_the_six_character_code(client):
+    pairing = _start(client, device_id="new-phone", name="New Phone")
+    response = client.post("/app/api/pair/lookup",
+                           json={"scan_code": pairing["scan_code"]},
+                           headers=admin_headers())
+    assert response.status_code == 200
+    data = response.json()
+    assert data["pairing_id"] == pairing["pairing_id"]
+    assert data["device_id"] == "new-phone"
+    assert data["name"] == "New Phone"
+    assert data["platform"] == "android"
+    assert data["app_version"] == "2.0.0"
+    assert data["expires_at"] == pairing["expires_at"]
+    assert data["status"] == "pending"
+    # A lookup must not change the pairing.
+    assert db.pairing_by_id(client.app.state.db_conn,
+                            pairing["pairing_id"])["status"] == "pending"
+
+
+def test_pair_lookup_ignores_case_spaces_and_hyphens(client):
+    pairing = _start(client, device_id="new-phone")
+    code = pairing["scan_code"]
+    typed = ("  " + code[:3].lower() + " - " + code[3:].lower() + " ")
+    response = client.post("/app/api/pair/lookup", json={"scan_code": typed},
+                           headers=admin_headers())
+    assert response.status_code == 200
+    assert response.json()["pairing_id"] == pairing["pairing_id"]
+
+
+def test_pair_lookup_with_a_wrong_code_is_404(client):
+    _start(client, device_id="new-phone")
+    response = client.post("/app/api/pair/lookup", json={"scan_code": "ZZZZZZ"},
+                           headers=admin_headers())
+    assert response.status_code == 404
+    assert response.json()["detail"] == "unknown pairing"
+
+
+def test_pair_lookup_of_an_expired_code_is_404(client):
+    pairing = _start(client, device_id="new-phone")
+    _expire(client, pairing["pairing_id"])
+    response = client.post("/app/api/pair/lookup",
+                           json={"scan_code": pairing["scan_code"]},
+                           headers=admin_headers())
+    assert response.status_code == 404
+
+
+def test_pair_lookup_returns_the_status_of_an_approved_pairing(client):
+    pairing = _start(client, device_id="new-phone")
+    approve_pairing(client, pairing)
+    response = client.post("/app/api/pair/lookup",
+                           json={"scan_code": pairing["scan_code"]},
+                           headers=admin_headers())
+    assert response.status_code == 200
+    assert response.json()["status"] == "approved"
+
+
+def test_pair_lookup_of_a_cancelled_code_is_404(client):
+    first = _start(client, device_id="new-phone")
+    _start(client, device_id="new-phone")
+    response = client.post("/app/api/pair/lookup",
+                           json={"scan_code": first["scan_code"]},
+                           headers=admin_headers())
+    assert response.status_code == 404
+
+
+def test_pair_lookup_with_a_colliding_code_is_409(client):
+    first = _start(client, device_id="phone-1")
+    second = _start(client, device_id="phone-2")
+    # Two live pairings with the same short code. Seeding the digest is
+    # the only way to force the collision; the endpoint must refuse to
+    # pick one instead of approving the wrong phone.
+    conn = client.app.state.db_conn
+    conn.execute("UPDATE pairings SET scan_code_hash = ? WHERE id = ?",
+                 (db.token_hash("COLLID"), second["pairing_id"]))
+    conn.execute("UPDATE pairings SET scan_code_hash = ? WHERE id = ?",
+                 (db.token_hash("COLLID"), first["pairing_id"]))
+    response = client.post("/app/api/pair/lookup",
+                           json={"scan_code": "collid"},
+                           headers=admin_headers())
+    assert response.status_code == 409
+    assert response.json()["detail"] == "ambiguous code"
+
+
+def test_pair_lookup_needs_the_admin(client):
+    pairing = _start(client, device_id="new-phone")
+    response = client.post("/app/api/pair/lookup",
+                           json={"scan_code": pairing["scan_code"]})
+    assert response.status_code == 401
+
+
+def test_pair_lookup_is_rate_limited(client):
+    pairing = _start(client, device_id="new-phone")
+    body = {"scan_code": pairing["scan_code"]}
+    for _ in range(20):
+        response = client.post("/app/api/pair/lookup", json=body,
+                               headers=admin_headers())
+        assert response.status_code == 200, response.text
+    assert client.post("/app/api/pair/lookup", json=body,
+                       headers=admin_headers()).status_code == 429
+
+
 def test_pair_approve_creates_the_device_without_a_token(client):
     pairing = _start(client, device_id="new-phone", name="New Phone")
     response = client.post("/app/api/pair/approve",

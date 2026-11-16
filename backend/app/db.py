@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import sqlite3
 import threading
 import time
@@ -2124,6 +2125,33 @@ def pairing_by_id(conn: sqlite3.Connection,
             "SELECT * FROM pairings WHERE id = ? LIMIT 1", (pairing_id,)
         ).fetchone()
     return _asdict(row) if row is not None else None
+
+
+def pairing_by_scan_code(conn: sqlite3.Connection, scan_code: str,
+                         now: int) -> list[dict]:
+    """Live pairings whose scan code matches ``scan_code``.
+
+    The digest is computed once and compared with ``hmac.compare_digest``
+    against every open pairing. Only pending and approved pairings that
+    have not expired are candidates: a cancelled, expired or claimed code
+    must not be resolved through this path. A short code can collide with
+    another live pairing, so the caller gets the whole list and decides.
+    """
+    digest = token_hash(scan_code)
+    if not digest:
+        return []
+    with _WRITE_LOCK:
+        rows = conn.execute(
+            "SELECT * FROM pairings"
+            " WHERE status IN ('pending', 'approved') AND expires_at > ?",
+            (int(now),)
+        ).fetchall()
+    matches = []
+    for row in rows:
+        stored = row["scan_code_hash"]
+        if stored and hmac.compare_digest(digest, stored):
+            matches.append(_asdict(row))
+    return matches
 
 
 def pairing_pending_count(conn: sqlite3.Connection, now: int) -> int:

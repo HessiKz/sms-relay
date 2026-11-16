@@ -276,6 +276,7 @@ Mini App pairing and devices (admin only):
 | Route | Purpose |
 |---|---|
 | `POST /app/api/pair/preview` | look up a pairing by id + scan code, before approving |
+| `POST /app/api/pair/lookup` | resolve a bare six-character code to its live pairing (`404` unknown, `409` ambiguous) |
 | `POST /app/api/pair/approve` | approve it; creates or reactivates the device, still without a token |
 | `POST /app/api/pair/cancel` | cancel a pending pairing |
 | `GET /app/api/devices` | the device list with online state, SIMs, unread and preview |
@@ -380,7 +381,13 @@ client (`telegram.js`). The Mini App must never ask for the camera itself:
 the shell sends `Permissions-Policy: camera=()` and a
 `Content-Security-Policy` with `default-src 'self'` and no `camera-src`, and
 only Telegram can scan a code inside its own UI. A client without
-`showScanQrPopup` falls back to the scan code typed by hand. The pairing
+`showScanQrPopup` falls back to the scan code typed by hand: the admin may
+type the six-character code alone (`tg.bareScanCode()`), and
+`store.pairLookup()` resolves it through `POST /app/api/pair/lookup` because
+the Mini App has no pairing id to send. The full payload and its t.me link
+keep the direct path through `tg.pairToken()` and `POST
+/app/api/pair/preview`, and a code that two live pairings share is refused
+with `409` instead of being guessed. The pairing
 sheet previews the pairing, approves it or cancels it; the device menu
 renames a device, sets it as the default and revokes it.
 

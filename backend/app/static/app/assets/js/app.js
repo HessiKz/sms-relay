@@ -7,7 +7,7 @@
 //   #/d/<device_id>                 the conversations of that device
 //   #/d/<device_id>/t/<thread_key>  a thread of that device
 
-import * as tg from "./telegram.js?v=20261116-scan";
+import * as tg from "./telegram.js?v=20261116-pair";
 import * as store from "./store.js";
 import * as ui from "./ui.js";
 import { AuthError, NetworkError } from "./api.js";
@@ -695,8 +695,8 @@ function pairErrorMessage(err) {
     return "Connection problem. Try again when you are back online.";
   }
   if (err && err.status === 404) {
-    return "This pairing code is not known. Scan the code of the phone "
-      + "again.";
+    return "This pairing code is not known. Check the six-character code "
+      + "shown on the phone and try again.";
   }
   if (err && err.status === 410) {
     return "This pairing code has expired. Start the pairing on the "
@@ -706,6 +706,10 @@ function pairErrorMessage(err) {
     if (/claimed/i.test(text)) {
       return "This pairing code was already used. Start the pairing on "
         + "the phone again.";
+    }
+    if (/ambiguous/i.test(text)) {
+      return "More than one phone shows this code. Paste the whole "
+        + "pairing code (pair_…) or scan the QR code instead.";
     }
     if (/already paired/i.test(text)) {
       return "This device is already paired. Revoke it first.";
@@ -721,28 +725,38 @@ function pairErrorMessage(err) {
 }
 
 async function previewPairing(payload) {
+  // The input may be the whole payload (or a link that carries it), or
+  // only the six-character code the phone prints under its QR code. The
+  // full form names the pairing directly; the bare code is resolved by
+  // the backend, which is the only side that can hash it.
   const token = tg.pairToken(payload);
-  if (!token) {
+  const bareCode = token ? null : tg.bareScanCode(payload);
+  if (!token && !bareCode) {
     pairDraft = null;
     ui.hidePairPreview();
-    ui.setPairError("That is not a pairing code. Scan the QR code of the "
-      + "phone, or paste the whole code (pair_…).");
+    ui.setPairError("That is not a pairing code. Type the six-character "
+      + "code shown on the phone, or paste the whole code (pair_…).");
     return;
   }
   ui.setPairError("");
   ui.setPairBusy(true);
   try {
-    const preview = await store.pairPreview(token.pairingId, token.scanCode);
+    const preview = token
+      ? await store.pairPreview(token.pairingId, token.scanCode)
+      : await store.pairLookup(bareCode);
+    const pairingId = token ? token.pairingId : preview.pairing_id;
+    const scanCode = token ? token.scanCode : bareCode;
+    if (!pairingId) throw new Error("pairing id missing");
     pairDraft = {
-      pairingId: token.pairingId,
-      scanCode: token.scanCode,
+      pairingId: pairingId,
+      scanCode: scanCode,
     };
     ui.renderPairPreview({
       name: preview.name,
       platform: preview.platform,
       app_version: preview.app_version,
       expires_at: preview.expires_at,
-      scan_code: token.scanCode,
+      scan_code: scanCode,
     });
   } catch (err) {
     pairDraft = null;
@@ -764,8 +778,8 @@ function openPairSheet(payload) {
 
 async function scanPairing() {
   if (!tg.scanQrAvailable()) {
-    ui.setPairError("This Telegram client cannot scan a code. Paste the "
-      + "pairing code instead.");
+    ui.setPairError("This Telegram client cannot scan a code. Type the "
+      + "six-character code shown on the phone instead.");
     return;
   }
   const text = await tg.showScanQr();

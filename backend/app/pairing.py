@@ -19,6 +19,7 @@ of open pairings is capped, so nobody can fill the database with them.
 
 import hmac
 import json
+import re
 import secrets
 import time
 import uuid
@@ -61,6 +62,10 @@ MIN_CLAIM_SECRET_LEN = 32
 MAX_CLAIM_SECRET_LEN = 128
 MAX_SCAN_CODE_LEN = 12
 TOKEN_PREFIX_LEN = 11
+# The admin types the short code by hand, so a lookup is cheap but should
+# not become an oracle for guessing codes: a handful per minute is plenty.
+MAX_LOOKUPS_PER_ADMIN = 20
+LOOKUP_WINDOW_S = 60.0
 # The scan code is read aloud and typed by hand, so it avoids the
 # characters that are easy to confuse.
 _SCAN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -91,6 +96,10 @@ class PairPreviewBody(BaseModel):
 
 class PairApproveBody(PairPreviewBody):
     name: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LEN)
+
+
+class PairLookupBody(BaseModel):
+    scan_code: str = Field(min_length=1, max_length=32)
 
 
 class RenameBody(BaseModel):
@@ -170,6 +179,12 @@ def _sims(sims_json) -> list:
     except (TypeError, ValueError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _normalize_scan_code(value: str | None) -> str:
+    """The code as the admin may type it: case, spaces and hyphens ignored."""
+    text = re.sub(r"[\s\-]+", "", str(value or ""))
+    return text.upper()
 
 
 def _unknown_pairing() -> HTTPException:
@@ -300,6 +315,46 @@ def build_miniapp_router(settings) -> APIRouter:
     """The pairing and device endpoints of the Mini App (admin only)."""
     guard = require_miniapp(settings)
     router = APIRouter(dependencies=[Depends(guard)])
+    # The admin already holds a Mini App credential; this only bounds a
+    # runaway client and makes guessing the short code pointless.
+    lookups = RateLimiter(max_events=MAX_LOOKUPS_PER_ADMIN,
+                          window_s=LOOKUP_WINDOW_S)
+
+    @router.post("/app/api/pair/lookup")
+    async def pair_lookup(request: Request, payload: PairLookupBody):
+        """Resolve the short code the phone shows to the pairing behind it.
+
+        The phone draws a QR code and a six-character code. The admin may
+        type only the code, so this endpoint finds the one live pairing
+        that the code belongs to. The answer never says whether a code
+        exists: a miss is the same generic 404 as a wrong code.
+        """
+        admin = getattr(request.state, "tg_user", {}) or {}
+        if not lookups.allow("lookup:" + str(admin.get("id") or "unknown")):
+            raise HTTPException(429, "rate limited")
+        code = _normalize_scan_code(payload.scan_code)
+        if not 1 <= len(code) <= MAX_SCAN_CODE_LEN:
+            raise _unknown_pairing()
+        conn = request.app.state.db_conn
+        now = int(time.time())
+        matches = db.pairing_by_scan_code(conn, code, now)
+        if not matches:
+            raise _unknown_pairing()
+        if len(matches) > 1:
+            # A six-character code can collide. Guessing would approve
+            # the wrong phone, so the admin has to hand over the whole
+            # payload instead.
+            raise HTTPException(409, "ambiguous code")
+        pairing = matches[0]
+        return {
+            "pairing_id": pairing["id"],
+            "device_id": pairing["device_id"],
+            "name": pairing["device_name"],
+            "platform": pairing["platform"],
+            "app_version": pairing.get("app_version"),
+            "expires_at": pairing["expires_at"],
+            "status": pairing["status"],
+        }
 
     @router.post("/app/api/pair/preview")
     async def pair_preview(request: Request, payload: PairPreviewBody):
