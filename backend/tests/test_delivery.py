@@ -32,9 +32,11 @@ class FakeTelegram:
 
 
 def _seed(conn, *, msg_id="aabbccdd11223344", sender="+15550001111", body="hi",
-          received_at=FIXED_TS, parts=1, part_index=0, attempts=None, next_at=None):
+          received_at=FIXED_TS, parts=1, part_index=0, attempts=None, next_at=None,
+          device_id=None):
     msg = {"id": msg_id, "sender": sender, "body": body, "parts": parts,
-           "part_index": part_index, "received_at": received_at, "group_id": "g1"}
+           "part_index": part_index, "received_at": received_at, "group_id": "g1",
+           "device_id": device_id}
     assert db.record_message(conn, msg) is True
     if attempts is not None or next_at is not None:
         db.update_state(conn, msg_id, "pending", attempts or 0,
@@ -271,6 +273,49 @@ def test_last_chunk_offers_details_and_the_thread_deep_link(conn, settings):
     assert parse_qs(urlsplit(url).query)["thread"] == [thread_key]
 
 
+def test_deep_link_carries_the_device_id(conn, settings):
+    """The device-first Mini App link names both thread and device."""
+    configured = replace(settings, miniapp_url="https://ai-barrow.ir/relay/app/")
+    db.activate_device(conn, "dev-pixel-0003", "Pixel 8", "android", "1.0",
+                       int(time.time()))
+    telegram = FakeTelegram()
+    worker = _worker(conn, configured, telegram)
+    msg_id = _seed(conn, msg_id="devlink0-aaaa", body="hello",
+                   device_id="dev-pixel-0003")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    url = telegram.keyboards[-1]["inline_keyboard"][0][1]["web_app"]["url"]
+    query = parse_qs(urlsplit(url).query)
+    assert query["thread"] == [_message(conn, msg_id)["thread_key"]]
+    assert query["device"] == ["dev-pixel-0003"]
+
+
+def test_deep_link_omits_the_device_parameter_without_a_device(conn, settings):
+    configured = replace(settings, miniapp_url="https://ai-barrow.ir/relay/app/")
+    telegram = FakeTelegram()
+    worker = _worker(conn, configured, telegram)
+    _seed(conn, msg_id="nodevlk0-aaa", body="hello")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    url = telegram.keyboards[-1]["inline_keyboard"][0][1]["web_app"]["url"]
+    assert "device=" not in url
+    assert "thread=" in url
+
+
+def test_thread_url_percent_encodes_and_keeps_an_existing_query(conn, settings):
+    assert delivery.thread_url("https://x/relay/app", "+15550001111",
+                               "dev id 1") == \
+        "https://x/relay/app?thread=%2B15550001111&device=dev%20id%201"
+    assert delivery.thread_url("https://x/relay/app?src=btn", "+15550001111") == \
+        "https://x/relay/app?src=btn&thread=%2B15550001111"
+    assert delivery.thread_url("https://x/relay/app", "+15550001111") == \
+        "https://x/relay/app?thread=%2B15550001111"
+    assert delivery.thread_url("https://x/relay/app", None, "dev") is None
+    assert delivery.thread_url(None, "+1555", "dev") is None
+
+
 def test_open_chat_button_is_absent_without_a_miniapp_url(conn, settings):
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
@@ -307,6 +352,61 @@ def test_header_format_single_part(conn, settings):
     assert text.startswith("<b>")
     assert "<i>" in text
     assert "hello" in text
+
+
+def test_device_label_shows_the_device_name(conn, settings):
+    """An SMS from a known device carries a compact `📱 <b>name</b>` line.
+
+    The device name is user-controlled, so it is HTML-escaped like the
+    rest of the header.
+    """
+    db.activate_device(conn, "dev-pixel-0001", "Pixel <8>", "android", "1.0",
+                       int(time.time()))
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="label000-aaaa", body="captured",
+          device_id="dev-pixel-0001")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "📱 <b>Pixel &lt;8&gt;</b>" in text
+    assert _message(conn, "label000-aaaa")["state"] == "delivered"
+
+
+def test_device_label_omitted_when_device_row_is_missing(conn, settings):
+    """A device_id without a devices row must not break delivery.
+
+    The label is simply left out; the header stays the plain
+    sender/timestamp format.
+    """
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="missing0-aaaa", body="orphan device",
+          device_id="dev-gone-00000")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "📱" not in text
+    assert text.startswith("<b>+15550001111</b>\n<i>")
+    assert _message(conn, "missing0-aaaa")["state"] == "delivered"
+
+
+def test_device_label_appears_on_every_chunk(conn, settings):
+    db.activate_device(conn, "dev-pixel-0002", "Pixel 8", "android", "1.0",
+                       int(time.time()))
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="chunklbl-aaaa", body="x" * 9000,
+          device_id="dev-pixel-0002")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    chunks = [text for _, text in telegram.sent]
+    assert len(chunks) == 3
+    assert all("📱 <b>Pixel 8</b>" in text for text in chunks)
+    assert all(len(text) <= delivery.MAX_CHUNK_LEN for text in chunks)
 
 
 def test_run_once_with_no_work_returns_zero(conn, settings):

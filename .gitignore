@@ -15,4 +15,5 @@ android-app/app/build/
 dist/
 
 .superpowers/
+.serena/
 dist/

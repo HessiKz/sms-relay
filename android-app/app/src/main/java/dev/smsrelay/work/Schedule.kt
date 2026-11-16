@@ -116,6 +116,28 @@ object Schedule {
     }
 
     /**
+     * Starts the command poll chain from the beginning.
+     *
+     * The chain is stopped while the phone is not paired (the worker
+     * does not talk to the server without a token), so it has to be
+     * armed again after the pairing.
+     */
+    fun restartCommandChain(context: Context) {
+        val request = OneTimeWorkRequestBuilder<CommandWorker>()
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            UNIQUE_COMMANDS_NEXT,
+            ExistingWorkPolicy.REPLACE,
+            request
+        )
+    }
+
+    /**
      * The next poll of the chain, five seconds from now.
      *
      * WorkManager does not allow a periodic work below 15 minutes, so the

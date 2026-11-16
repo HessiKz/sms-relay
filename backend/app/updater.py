@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import re
 import datetime
@@ -64,6 +65,24 @@ def _strip_at(pattern: str) -> str:
     return pattern[1:] if pattern.startswith("@") else pattern
 
 
+def _change_callback(on_change):
+    """Adapt a change callback so it may take a device and a thread key.
+
+    A callback without arguments still works: it only loses the hint about
+    which device and conversation changed.
+    """
+    if not callable(on_change):
+        return None
+    try:
+        params = inspect.signature(on_change).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        params = {}
+    if not params:
+        return lambda device_id=None, thread_key=None: on_change()
+    return lambda device_id=None, thread_key=None: on_change(device_id,
+                                                              thread_key)
+
+
 class Updater:
     """Telegram long-poll loop that turns admin DM messages into commands."""
 
@@ -75,7 +94,7 @@ class Updater:
         self.poll_timeout = poll_timeout
         self.poke_event = poke_event
         self.on_change = on_change
-        self._on_change = on_change
+        self._on_change = _change_callback(on_change)
         self.admin_ids = _admin_ids(settings)
         self.last_update_id = None
         self.flow = Flow(db_conn, settings.miniapp_url)
@@ -213,7 +232,7 @@ class Updater:
             return True
 
         if session.mode == MODE_SEARCH:
-            contacts = db.search_contacts(self.db_conn, text, limit=8)
+            contacts = self.flow.search_contacts(text, limit=8)
             if not contacts:
                 await self._reply(
                     chat_id,
@@ -353,6 +372,7 @@ class Updater:
                 db.settings_set(self.db_conn, "paused", "0")
                 moved = db.resume_received(self.db_conn)
                 self._poke()
+                self._notify_change()
                 await self._reply(
                     chat_id,
                     f"\u2705 Forwarding resumed. {moved} queued message(s) sent.",
@@ -360,6 +380,7 @@ class Updater:
             else:
                 db.settings_set(self.db_conn, "paused", "1")
                 self._poke()
+                self._notify_change()
                 await self._reply(
                     chat_id,
                     "\u23F8 Forwarding paused. New messages are held until you resume.",
@@ -400,24 +421,50 @@ class Updater:
                 keyboard=keyboard([button("⬅️ Cancel", "cancel")]))
             return
 
-    def _notify_change(self) -> None:
-        """Tell the Mini App that outbound history changed."""
+    def _notify_change(self, device_id: str | None = None,
+                       thread_key: str | None = None) -> None:
+        """Tell the Mini App that outbound history changed.
+
+        The scope names the device and the conversation; ``None`` for the
+        device means every conversation of that device, and no device at
+        all means the change is global.
+        """
         if callable(self._on_change):
-            self._on_change()
+            self._on_change(device_id, thread_key)
 
     async def _queue_sms(self, target, body, chat_id) -> None:
         """Hand an SMS to the phone."""
+        device_id = db.resolve_command_device(self.db_conn)
+        if device_id is None:
+            await self._reply(
+                chat_id,
+                self._no_device_text(),
+                keyboard=self.flow.main_menu())
+            return
         command_id = uuid.uuid4().hex
-        db.create_command(self.db_conn, command_id, target, body, "telegram_sms")
-        self._notify_change()
+        thread_key = db.create_command(self.db_conn, command_id, target, body,
+                                       "telegram_sms", device_id=device_id)
+        self._notify_change(device_id, thread_key)
         await self._reply(
             chat_id,
             f"\U0001F4E8 Sent to the phone: it will text {mask_number(target)}.\n\n"
             "Message:\n" + body[:200],
             keyboard=self.flow.main_menu())
 
+    def _no_device_text(self) -> str:
+        """Why no SMS was queued, in plain words.
+
+        A command is never broadcast, so there has to be exactly one
+        device that can take it.
+        """
+        if not db.active_devices(self.db_conn):
+            return ("No device is paired, so I cannot send an SMS.\n\n"
+                    "Pair a phone in the Mini App and try again.")
+        return ("Several devices are paired, so I do not know which one "
+                "should send this.\n\nPick a default device in the Mini App.")
+
     def _contacts_overview(self) -> str:
-        total = db.contact_count(self.db_conn)
+        total = self.flow.contact_count()
         if total == 0:
             return ("Your phone has not sent its contact list yet.\n\n"
                     "Open the app and press \"Sync contacts\", then try again.")
@@ -438,11 +485,13 @@ class Updater:
         elif cmd == "pause":
             db.settings_set(self.db_conn, "paused", "1")
             self._poke()
+            self._notify_change()
             await self._reply(chat_id, "Forwarding paused.")
         elif cmd == "resume":
             db.settings_set(self.db_conn, "paused", "0")
             moved = db.resume_received(self.db_conn)
             self._poke()
+            self._notify_change()
             await self._reply(
                 chat_id, f"Forwarding resumed. Resumed {moved} messages.")
         elif cmd == "filters":
@@ -507,23 +556,41 @@ class Updater:
                             chat_id) -> bool:
         """Turn a reply to a relayed SMS into an SMS command.
 
+        The reply goes to the device that received the original message.
+        A device that was revoked (or the archived old one) cannot send,
+        so the admin is told instead of a command that nobody would run.
+
         Returns True when the reply was consumed.
         """
         original = db.find_by_telegram_id(self.db_conn, replied_id)
         if original is None:
             return False
+        device_id = original.get("device_id")
+        if not device_id or not db.device_is_active(self.db_conn, device_id):
+            await self._reply(
+                chat_id,
+                "That message came from a device that is not paired any more, "
+                "so I cannot send a reply to it.",
+                keyboard=self.flow.main_menu())
+            return True
         # The sender may be stored as a contact NAME; the phone needs a
-        # number, so resolve it through the uploaded contact list.
+        # number, so resolve it through the contact list of that device.
         target = original["sender"]
         name = original.get("sender_name") or ""
-        resolved, resolved_name = self.flow.resolve_target(target)
-        if resolved:
-            target = resolved
-            name = resolved_name
+        contact = db.resolve_device_contact(self.db_conn, device_id, target)
+        if contact is not None:
+            target = contact["number"]
+            name = contact["name"]
+        else:
+            resolved, resolved_name = self.flow.resolve_target(target)
+            if resolved:
+                target = resolved
+                name = resolved_name
         command_id = uuid.uuid4().hex
-        db.create_command(self.db_conn, command_id, target, text,
-                          "telegram_reply", replied_id)
-        self._notify_change()
+        thread_key = db.create_command(self.db_conn, command_id, target, text,
+                                       "telegram_reply", replied_id,
+                                       device_id=device_id)
+        self._notify_change(device_id, thread_key)
         await self._reply(
             chat_id,
             f"\U0001F4E8 Your reply goes out as an SMS to "
@@ -548,7 +615,7 @@ class Updater:
         # /sms <number> <text> -> send it right away
         number, name = self.flow.resolve_target(args[0])
         if number is None:
-            contacts = db.search_contacts(self.db_conn, args[0], limit=8)
+            contacts = self.flow.search_contacts(args[0], limit=8)
             if contacts:
                 await self._reply(
                     chat_id,

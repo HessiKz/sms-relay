@@ -7,7 +7,6 @@ class Settings:
     telegram_bot_token: str
     telegram_chat_id: str
     admin_telegram_user_id: int
-    phone_a_token: str
     admin_token: str
     database_path: str
     uvicorn_host: str = "127.0.0.1"
@@ -82,7 +81,6 @@ def load_settings(env: dict | None = None, env_file: str | None = None) -> Setti
         telegram_bot_token=_require(env, "TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_require(env, "TELEGRAM_CHAT_ID"),
         admin_telegram_user_id=_coerce_int(env, "ADMIN_TELEGRAM_USER_ID"),
-        phone_a_token=_require(env, "PHONE_A_TOKEN"),
         admin_token=_require(env, "ADMIN_TOKEN"),
         database_path=_require(env, "DATABASE_PATH"),
         uvicorn_host=env.get("UVICORN_HOST", "127.0.0.1").strip() or "127.0.0.1",

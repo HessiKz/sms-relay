@@ -89,6 +89,10 @@ def _item_id(item: ImportItem) -> str:
 @router.post("/import")
 async def import_sms(request: Request, payload: ImportBatch):
     conn = request.app.state.db_conn
+    # The device comes from the bearer token, never from the body: the
+    # imported history belongs to the authenticated device only.
+    device = request.state.device
+    device_id = device["id"] if device is not None else None
     imported = 0
     duplicates = 0
     skipped = 0
@@ -98,7 +102,8 @@ async def import_sms(request: Request, payload: ImportBatch):
         if key is None:
             skipped += 1
             continue
-        if db.find_import_duplicate(conn, key, item.body, item.received_at):
+        if db.find_import_duplicate(conn, key, item.body, item.received_at,
+                                   device_id=device_id):
             duplicates += 1
             continue
         inserted = db.record_message(conn, {
@@ -109,6 +114,7 @@ async def import_sms(request: Request, payload: ImportBatch):
             "source": "import",
             "sub_id": item.sub_id,
             "state": "received",
+            "device_id": device_id,
         })
         if inserted:
             imported += 1
@@ -116,7 +122,9 @@ async def import_sms(request: Request, payload: ImportBatch):
             duplicates += 1
 
     if imported:
-        rev.bump_rev(request.app)
+        # An import touches many conversations of one device, so the scope
+        # is the device without a thread.
+        rev.bump_rev(request.app, device_id, None)
 
     return {
         "accepted": True,

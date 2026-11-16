@@ -58,13 +58,17 @@ def _is_blocked(conn, sender: str, body: str) -> bool:
 @router.post("/sms")
 async def ingest_sms(request: Request, payload: SmsIn):
     conn = request.app.state.db_conn
+    # The device comes from the bearer token, never from the body: a
+    # phone may only write into its own history.
+    device = request.state.device
+    device_id = device["id"] if device is not None else None
 
     if _is_blocked(conn, payload.sender, payload.body):
         return {"accepted": False, "reason": "blocked"}
 
     msg = {"id": payload.id, "sender": payload.sender, "body": payload.body,
            "received_at": payload.received_at, "source": payload.source,
-           "sub_id": payload.sub_id,
+           "sub_id": payload.sub_id, "device_id": device_id,
            "parts": payload.parts if payload.parts is not None else 1,
            "part_index": payload.part_index if payload.part_index is not None else 0}
     if payload.thread_id is not None:
@@ -81,7 +85,8 @@ async def ingest_sms(request: Request, payload: SmsIn):
     # are separate messages and both are delivered.
     twin = db.find_recent_duplicate(conn, payload.sender, payload.body,
                                     payload.received_at,
-                                    source=payload.source)
+                                    source=payload.source,
+                                    device_id=device_id)
     if twin is not None:
         return {"accepted": True, "duplicate": True,
                 "state": twin.get("state", "pending")}
@@ -102,7 +107,11 @@ async def ingest_sms(request: Request, payload: SmsIn):
     if inserted:
         # A genuine new message is inbox-visible even while forwarding is
         # paused. Duplicates and blocked messages never get this far.
-        rev.bump_rev(request.app)
+        # The scope tells the Mini App which conversation changed, so an
+        # open thread elsewhere does not have to be reloaded. The scope
+        # names the device as well: a thread belongs to a device.
+        rev.bump_rev(request.app, device_id,
+                     db.message_thread_key(payload.sender))
 
     response = {"accepted": True, "duplicate": not inserted, "state": state}
     if paused:

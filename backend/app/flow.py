@@ -99,9 +99,9 @@ class Flow:
         """
         session = self.session(chat_id)
         if query:
-            contacts = db.search_contacts(self.db_conn, query, limit=MAX_RESULTS)
+            contacts = self._search_contacts(query, limit=MAX_RESULTS)
         else:
-            contacts = db.list_contacts(self.db_conn, limit=MAX_CONTACTS_LOADED)
+            contacts = self._contacts(limit=MAX_CONTACTS_LOADED)
         session.results = contacts
         session.query = query
 
@@ -129,6 +129,39 @@ class Flow:
         return keyboard(*rows)
 
     # --- the actions ----------------------------------------------------
+    def _device_id(self) -> str | None:
+        """The device whose contacts the bot may use, if there is one.
+
+        A phone uploads its own contact list, so the bot reads the list
+        of the device that would send the SMS. Without a paired device
+        the old global list is used.
+        """
+        try:
+            return db.resolve_command_device(self.db_conn)
+        except Exception:
+            return None
+
+    def _contacts(self, limit: int = MAX_CONTACTS_LOADED) -> list[dict]:
+        device_id = self._device_id()
+        if device_id:
+            return db.list_contacts_for_device(self.db_conn, device_id, limit=limit)
+        return db.list_contacts(self.db_conn, limit=limit)
+
+    def _search_contacts(self, query: str, limit: int = MAX_RESULTS) -> list[dict]:
+        device_id = self._device_id()
+        if device_id:
+            return db.search_contacts_for_device(self.db_conn, device_id, query,
+                                                 limit=limit)
+        return db.search_contacts(self.db_conn, query, limit=limit)
+
+    def search_contacts(self, query: str, limit: int = MAX_RESULTS) -> list[dict]:
+        """Contacts that match a name or a number."""
+        return self._search_contacts(query, limit=limit)
+
+    def contact_count(self) -> int:
+        """How many contacts the bot can offer."""
+        return db.contact_count_for_device(self.db_conn, self._device_id())
+
     def resolve_target(self, raw: str):
         """Turn what the user gave us into (number, name).
 
@@ -140,19 +173,25 @@ class Flow:
         if not text:
             return None, None
 
+        contacts = self._contacts()
         number = normalize_number(text)
         if number:
-            for contact in db.list_contacts(self.db_conn):
+            for contact in contacts:
                 if contact["number"] == number:
                     return number, contact["name"]
             return number, ""
 
-        for contact in db.list_contacts(self.db_conn):
+        for contact in contacts:
             if contact["name"].lower() == text.lower():
                 return contact["number"], contact["name"]
+        device_id = self._device_id()
+        if device_id:
+            resolved = db.resolve_device_contact(self.db_conn, device_id, text)
+            if resolved:
+                return resolved["number"], resolved["name"]
         resolved = db.resolve_contact(self.db_conn, text)
         if resolved:
-            for contact in db.list_contacts(self.db_conn):
+            for contact in contacts:
                 if contact["number"] == resolved:
                     return resolved, contact["name"]
         return None, None

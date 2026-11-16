@@ -16,6 +16,7 @@
   --out-bg: var(--tg-theme-button-color, #2a7fd4);
   --out-text: var(--tg-theme-button-text-color, #ffffff);
   --danger: #d1474c;
+  --ok: #2fbf5f;
   --radius: 14px;
 }
 
@@ -32,6 +33,7 @@
   --out-bg: var(--tg-theme-button-color, #2f8fd8);
   --out-text: var(--tg-theme-button-text-color, #ffffff);
   --danger: #ff8a8a;
+  --ok: #3ddc84;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -48,6 +50,7 @@
     --out-bg: var(--tg-theme-button-color, #2f8fd8);
     --out-text: var(--tg-theme-button-text-color, #ffffff);
     --danger: #ff8a8a;
+    --ok: #3ddc84;
   }
 }
 
@@ -120,10 +123,25 @@ select:focus-visible {
 }
 
 .pane {
-  display: flex;
+  display: none;
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+}
+
+/* The route of the shell decides which pane is visible. On a small
+   screen only one pane is shown; on a wide screen the device column
+   stays next to the conversation. */
+.app[data-route="devices"] .devices-pane {
+  display: flex;
+}
+
+.app[data-route="chats"] .chats-pane {
+  display: flex;
+}
+
+.app[data-route="thread"] .thread-pane {
+  display: flex;
 }
 
 .pane-header {
@@ -308,6 +326,137 @@ select:focus-visible {
   font-weight: 700;
 }
 
+/* The device list: one card per paired phone. */
+.device-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0 0 12px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  list-style: none;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.device-row {
+  display: flex;
+  align-items: stretch;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.device-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 12px 4px 12px 14px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+}
+
+.device-item:hover {
+  background: var(--panel);
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--hint);
+  opacity: 0.7;
+}
+
+.status-dot.online {
+  background: var(--ok);
+  opacity: 1;
+}
+
+.device-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 2px;
+}
+
+.device-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.98rem;
+  font-weight: 600;
+}
+
+.device-item.has-unread .device-title {
+  font-weight: 700;
+}
+
+.device-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--hint);
+  font-size: 0.66rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chip-default {
+  background: var(--button);
+  color: var(--button-text);
+}
+
+.chip-revoked,
+.chip-off {
+  background: var(--panel);
+  color: var(--danger);
+}
+
+.device-meta,
+.device-preview {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--hint);
+  font-size: 0.78rem;
+}
+
+.device-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.device-time {
+  color: var(--hint);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.device-menu-button {
+  flex: 0 0 auto;
+  width: 42px;
+  border: 0;
+  background: transparent;
+  color: var(--hint);
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
 .thread-header {
   display: flex;
   align-items: center;
@@ -331,6 +480,12 @@ select:focus-visible {
 
 .thread-heading {
   min-width: 0;
+}
+
+.thread-heading .title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .thread-name {
@@ -453,6 +608,57 @@ select:focus-visible {
   font-size: 0.88rem;
   text-align: center;
   list-style: none;
+}
+
+.empty-title {
+  margin: 0 0 4px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+/* The contacts of the device: a shortcut for a known number. */
+.suggestion-list {
+  max-height: 170px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+}
+
+.suggestion-row {
+  margin: 0;
+}
+
+.suggestion-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.suggestion-item:hover {
+  background: var(--panel);
+}
+
+.suggestion-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.88rem;
+}
+
+.suggestion-number {
+  flex: 0 0 auto;
+  color: var(--hint);
+  font-size: 0.76rem;
 }
 
 .composer {
@@ -619,6 +825,47 @@ select:focus-visible {
   margin-top: 10px;
 }
 
+.danger-button {
+  padding: 9px 14px;
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.danger-button:disabled,
+.secondary-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* The buttons of a form inside a dialog fill the whole width. */
+.dialog-form > button {
+  width: 100%;
+  text-align: center;
+}
+
+/* The pairing sheet: the device that waits for the approval. */
+.pair-preview {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.pair-preview-name {
+  margin: 0 0 4px;
+  font-size: 0.98rem;
+  font-weight: 600;
+}
+
+.pair-preview .muted {
+  margin: 0 0 2px;
+}
+
 .secondary-button {
   padding: 9px 14px;
   border: 1px solid var(--border);
@@ -656,24 +903,38 @@ select:focus-visible {
   font-size: 0.88rem;
 }
 
-@media (max-width: 719px) {
-  .app.thread-open .list-pane {
-    display: none;
-  }
-}
-
 @media (min-width: 720px) {
   .app {
     flex-direction: row;
   }
 
-  .list-pane {
-    flex: 0 0 340px;
-    width: 340px;
+  .app[data-route="devices"] .devices-pane {
+    display: flex;
+    flex: 1 1 auto;
+  }
+
+  .app[data-route="chats"] .devices-pane {
+    display: flex;
+    flex: 0 0 320px;
+    width: 320px;
     border-right: 1px solid var(--border);
   }
 
-  .thread-pane {
+  .app[data-route="chats"] .chats-pane {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .app[data-route="thread"] .devices-pane {
+    display: flex;
+    flex: 0 0 300px;
+    width: 300px;
+    border-right: 1px solid var(--border);
+  }
+
+  .app[data-route="thread"] .thread-pane {
+    display: flex;
     flex: 1 1 auto;
     min-width: 0;
   }

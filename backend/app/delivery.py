@@ -59,16 +59,22 @@ ERROR_COOLDOWN = 5.0
 _AMBIGUOUS_KINDS = frozenset({"timeout", "network", "unavailable"})
 
 
-def thread_url(base: str | None, thread_key: str | None) -> str | None:
+def thread_url(base: str | None, thread_key: str | None,
+               device_id: str | None = None) -> str | None:
     """The Mini App link of one conversation, or None when unavailable.
 
-    The key is percent-encoded: a thread key starts with "+", which a
-    query parser would otherwise read as a space.
+    The keys are percent-encoded: a thread key starts with "+", which a
+    query parser would otherwise read as a space. The device id is
+    appended when known so the device-first Mini App opens the right
+    phone's conversation.
     """
     if not base or not thread_key:
         return None
     separator = "&" if "?" in base else "?"
-    return f"{base}{separator}thread={quote(str(thread_key), safe='')}"
+    url = f"{base}{separator}thread={quote(str(thread_key), safe='')}"
+    if device_id:
+        url += f"&device={quote(str(device_id), safe='')}"
+    return url
 
 
 class DeliveryWorker:
@@ -184,7 +190,10 @@ class DeliveryWorker:
                                 "callback_data": f"details:{row['id']}"}]
                     thread_key = (row["thread_key"]
                                   if "thread_key" in row.keys() else None)
-                    url = thread_url(self.settings.miniapp_url, thread_key)
+                    device_id = (row["device_id"]
+                                 if "device_id" in row.keys() else None)
+                    url = thread_url(self.settings.miniapp_url, thread_key,
+                                     device_id)
                     if url:
                         buttons.append({"text": "Open chat",
                                         "web_app": {"url": url}})
@@ -249,6 +258,31 @@ class DeliveryWorker:
         slice_len = max(1, MAX_CHUNK_LEN - len(header))
         return [header + piece for piece in _split_html(body, slice_len)]
 
+    def _device_label(self, row):
+        """The `📱 <b>name</b>` line for the device that captured the SMS.
+
+        Every forwarded inbound SMS lands in one shared chat, so the
+        label is what tells the admin which phone it came from. A
+        message with no device, or one whose device row has vanished,
+        simply gets no label: a failed lookup must never block
+        delivery.
+        """
+        try:
+            if "device_id" not in row.keys():
+                return ""
+            device_id = row["device_id"]
+            if not device_id:
+                return ""
+            device = db.device_by_id(self.db_conn, device_id)
+            name = device.get("name") if device else None
+            if not name:
+                return ""
+            return f"📱 <b>{_html_escape(str(name))}</b>\n"
+        except Exception:
+            log.warning("sms-relay delivery device label lookup failed",
+                        exc_info=True)
+            return ""
+
     def _header(self, row):
         id8 = str(row["id"])[:8]
         seq = int(row["part_index"]) + 1
@@ -262,6 +296,7 @@ class DeliveryWorker:
             suffix = f"  <code>{raw_sender}</code>"
         return (f"<b>{sender}</b>{suffix}\n"
                 f"<i>{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC</i>\n"
+                f"{self._device_label(row)}"
                 f"\n")
 
     def _idle_delay(self):

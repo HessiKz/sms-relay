@@ -1,8 +1,9 @@
 import time
 
 import app.db as db
+from tests.device_support import device_headers
 
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 NOW = int(time.time())
 
 
@@ -75,6 +76,30 @@ def test_same_text_repeated_on_the_same_path_is_kept(client):
     assert r.json() == {"accepted": True, "duplicate": False, "state": "pending"}
     conn = client.app.state.db_conn
     assert db.counts_by_state(conn) == {"pending": 2}
+
+
+def test_imported_history_is_not_another_capture_path(client):
+    """A live SMS must not be swallowed by the imported history.
+
+    An import is a replay of the phone's inbox, not a second capture of
+    the same message, so the live message is stored and forwarded.
+    """
+    sender = "+15550777"
+    body = "imported and then live"
+    client.post("/import", json={"items": [
+        {"sender": sender, "body": body,
+         "received_at": NOW, "provider_id": "p-1"}]},
+        headers=DEVICE_HEADERS)
+    conn = client.app.state.db_conn
+    assert db.counts_by_state(conn) == {"received": 1}
+
+    response = post_sms(client, valid_payload(id="evt-after-import",
+                                               sender=sender, body=body))
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "duplicate": False, "state": "pending"}
+    assert db.counts_by_state(conn) == {"received": 1, "pending": 1}
+    assert len(db.next_jobs(conn, int(time.time()) + 10, limit=10)) == 1
+
 
 
 def test_future_timestamp_beyond_1_day_422(client):

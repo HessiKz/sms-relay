@@ -57,4 +57,8 @@ dependencies {
 
     implementation("androidx.work:work-runtime-ktx:2.9.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // The QR code of the pairing is drawn on the phone, without a
+    // network round trip.
+    implementation("com.google.zxing:core:3.5.3")
 }

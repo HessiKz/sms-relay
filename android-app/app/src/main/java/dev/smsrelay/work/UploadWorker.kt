@@ -36,13 +36,16 @@ class UploadWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val settings = SettingsStore(applicationContext)
-        if (settings.token.isBlank() || settings.baseUri.isBlank()) {
+        val token = settings.token
+        if (token.isBlank() || settings.baseUri.isBlank()) {
+            // The phone is not paired: nothing is sent, the queue of the
+            // phone stays exactly as it is.
             return@withContext Result.success()
         }
         val database = AppDatabase.get(applicationContext)
         val dao = database.messageDao()
         val fallbackDao = database.fallbackLogDao()
-        val client = RelayClient(settings.baseUri, settings.token)
+        val client = RelayClient(settings.baseUri, token) { settings.handleUnauthorized() }
         val policy = FallbackPolicy(settings, dao, fallbackDao)
         val sender = FallbackSender(applicationContext, settings, fallbackDao)
 
@@ -80,7 +83,11 @@ class UploadWorker(
                         error = "unauthorized",
                         backendState = record.backendState
                     )
+                    // The device was removed on the server: the token is
+                    // dropped and the rest of the queue waits for the
+                    // next pairing. Nothing is deleted.
                     retryNeeded = true
+                    break
                 }
 
                 is ApiResult.Rejected -> {

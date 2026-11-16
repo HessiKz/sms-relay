@@ -109,3 +109,7 @@ export function apiGet(path, params) {
 export function apiPost(path, body) {
   return request("POST", path, { body });
 }
+
+export function apiPatch(path, body) {
+  return request("PATCH", path, { body });
+}

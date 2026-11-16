@@ -1,9 +1,11 @@
 import app.db as db
+from tests.device_support import device_headers
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 SETTING_KEYS = {"paused", "fallback_enabled", "phone_b",
-                "fallback_min_gap_s", "fallback_max_per_hour"}
+                "fallback_min_gap_s", "fallback_max_per_hour",
+                "default_device_id"}
 
 
 def test_admin_settings_endpoints_require_admin(client):
@@ -37,6 +39,7 @@ def test_get_settings_defaults(client):
         "phone_b": None,
         "fallback_min_gap_s": 30,
         "fallback_max_per_hour": 10,
+        "default_device_id": None,
     }
     assert set(r.json()) == SETTING_KEYS
 
@@ -51,9 +54,9 @@ def test_put_settings_updates_all_fields_and_persists(client):
     }
     r = client.put("/admin/settings", json=body, headers=ADMIN_HEADERS)
     assert r.status_code == 200
-    assert r.json() == body
+    assert {k: v for k, v in r.json().items() if k in body} == body
     data = client.get("/admin/settings", headers=ADMIN_HEADERS).json()
-    assert data == body
+    assert {k: v for k, v in data.items() if k in body} == body
     conn = client.app.state.db_conn
     assert db.settings_get(conn, "paused") == "1"
     assert db.settings_get(conn, "fallback_enabled") == "1"
@@ -74,6 +77,7 @@ def test_put_settings_partial_update_preserves_other_keys(client):
         "phone_b": None,
         "fallback_min_gap_s": 60,
         "fallback_max_per_hour": 10,
+        "default_device_id": None,
     }
 
 

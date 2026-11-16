@@ -9,7 +9,7 @@
 # Usage:
 #   sudo deploy/install.sh [--yes] [--start]
 #
-# Run the resource inspection first (see docs/vps-setup.md):
+# Run the resource inspection first (see README.md#deployment):
 #   free -h; df -h; ps aux --sort=-%mem; ss -tlpn; systemctl list-units --type=service --state=running
 set -euo pipefail
 
@@ -102,7 +102,7 @@ if [ ! -f "$ENV_FILE" ]; then
 
 The real file was NOT overwritten. Edit /etc/sms-relay/env and set:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_TELEGRAM_USER_ID,
-  PHONE_A_TOKEN, ADMIN_TOKEN
+  ADMIN_TOKEN
 then re-run with --start (or start the unit manually).
 
 The unit is NOT enabled while this file is incomplete, so the box cannot
@@ -188,7 +188,7 @@ PY
     fi
   fi
 else
-  log "WARNING: $CADDYFILE not found -- add the snippet manually (see deploy/README.md)"
+  log "WARNING: $CADDYFILE not found -- add the snippet manually (see README.md#deployment)"
 fi
 
 log "done"

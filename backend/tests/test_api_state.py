@@ -2,9 +2,10 @@ import json
 import time
 
 import app.db as db
+from tests.device_support import device_headers
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 NOW = int(time.time())
 BASE_TS = 1_700_000_000
 MSG_KEYS = {"id", "sender", "body", "parts", "part_index", "group_id",
@@ -219,9 +220,12 @@ def _poll(client, info=None, raw=None):
 def test_status_phone_shape_without_heartbeat(client):
     data = client.get("/status", headers=DEVICE_HEADERS).json()
     assert {"paused", "counts_by_state", "queue", "version"} <= set(data)
-    assert data["phone"] == {"last_seen": None, "online": False,
+    # An authenticated request is a heartbeat: the device has been seen.
+    assert data["phone"] == {"last_seen": data["phone"]["last_seen"],
+                             "online": True,
                              "app_version": None, "sending": None,
                              "sims": []}
+    assert data["phone"]["last_seen"] is not None
     assert set(data["phone"]) == PHONE_KEYS
 
 
@@ -251,10 +255,10 @@ def test_malformed_device_info_never_rejects_poll(client):
     # the numeric version and the non-bool sending were ignored
     assert phone["app_version"] is None
     assert phone["sending"] is None
-    # a missing id falls back to phone-a; a valid id is kept
+    # the id of the header is ignored: the token decides the device
     rows = client.app.state.db_conn.execute(
-        "SELECT device_id FROM device_status").fetchall()
-    assert sorted(row["device_id"] for row in rows) == ["dev", "phone-a"]
+        "SELECT id FROM devices").fetchall()
+    assert sorted(row["id"] for row in rows) == ["device-a"]
 
 
 def test_device_info_keeps_only_valid_fields_and_sims(client):
@@ -281,7 +285,7 @@ def test_oversized_device_info_is_ignored_but_last_seen_updates(client):
     info = {"id": "phone-a", "version": "1.2.0", "sending": True, "sims": []}
     assert _poll(client, info).status_code == 200
     conn = client.app.state.db_conn
-    conn.execute("UPDATE device_status SET last_seen_at = 1")
+    conn.execute("UPDATE devices SET last_seen_at = 1")
 
     oversized = json.dumps({"id": "phone-a", "version": "9.9.9",
                             "pad": "y" * 3000})

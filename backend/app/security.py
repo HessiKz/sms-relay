@@ -5,6 +5,8 @@ from collections import deque
 
 from fastapi import HTTPException, Request
 
+import app.db as db
+
 UNAUTHORIZED = HTTPException(401, "unauthorized", headers={"WWW-Authenticate": "Bearer"})
 RATE_LIMITED = HTTPException(429, "rate limited")
 DEFAULT_MAX_EVENTS = 10
@@ -77,12 +79,28 @@ def _bearer_token(request):
     return credential or None
 
 
+def _db_conn(request):
+    """The database of the running app, or None outside a request."""
+    app = getattr(request, "app", None)
+    state = getattr(app, "state", None)
+    return getattr(state, "db_conn", None)
+
+
 def _match(presented, expected_tokens, limiter):
     if presented is None or not any(token_equal(presented, token) for token in expected_tokens):
-        key = "fail:" + (_digest(presented) or "?")
-        if not limiter.allow(key):
-            raise RATE_LIMITED
-        raise UNAUTHORIZED
+        _reject(presented, limiter)
+
+
+def _reject(presented, limiter):
+    """Count a failed attempt and reject it.
+
+    The limiter is keyed by the digest of the presented credential, so an
+    attacker cannot lock out a real device by guessing other tokens.
+    """
+    key = "fail:" + (_digest(presented) or "?")
+    if not limiter.allow(key):
+        raise RATE_LIMITED
+    raise UNAUTHORIZED
 
 
 def _dependency(expected_tokens):
@@ -94,8 +112,46 @@ def _dependency(expected_tokens):
     return dep
 
 
+def _device_for_token(request, token):
+    """The active device that owns a bearer token, or None."""
+    conn = _db_conn(request)
+    if conn is None or token is None:
+        return None
+    try:
+        return db.device_by_token(conn, token)
+    except Exception:
+        return None
+
+
+def _touch(conn, device_id: str) -> None:
+    """Refresh the heartbeat of a device; a hiccup must not fail a request."""
+    if conn is None:
+        return
+    try:
+        db.touch_device(conn, device_id, int(time.time()))
+    except Exception:
+        pass
+
+
 def require_device(settings):
-    return _dependency((settings.phone_a_token,))
+    """FastAPI dependency for the phone routes.
+
+    Only a per-device token is accepted: the shared phone token is gone,
+    so a phone has to pair before it can talk to the backend. The device
+    row is attached to ``request.state.device`` and its heartbeat is
+    refreshed at most every 30 seconds.
+    """
+    limiter = RateLimiter()
+
+    async def dep(request: Request):
+        presented = _bearer_token(request)
+        device = _device_for_token(request, presented)
+        if device is None:
+            _reject(presented, limiter)
+        request.state.device = device
+        _touch(_db_conn(request), device["id"])
+
+    return dep
 
 
 def require_admin(settings):
@@ -103,4 +159,24 @@ def require_admin(settings):
 
 
 def require_any(settings):
-    return _dependency((settings.phone_a_token, settings.admin_token))
+    """Accept the admin token or a device token.
+
+    A device token is scoped to that device; the admin token may see
+    everything.
+    """
+    limiter = RateLimiter()
+
+    async def dep(request: Request):
+        presented = _bearer_token(request)
+        if presented is not None and token_equal(presented, settings.admin_token):
+            request.state.device = None
+            request.state.is_admin = True
+            return
+        device = _device_for_token(request, presented)
+        if device is None:
+            _reject(presented, limiter)
+        request.state.device = device
+        request.state.is_admin = False
+        _touch(_db_conn(request), device["id"])
+
+    return dep

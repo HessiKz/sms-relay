@@ -34,6 +34,11 @@ class ImportWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val settings = SettingsStore(applicationContext)
         if (settings.baseUri.isBlank()) return@withContext failure(ERROR_SERVER)
+        val token = settings.token
+        if (token.isBlank()) {
+            // The phone is not paired: the inbox stays where it is.
+            return@withContext failure(ERROR_NOT_PAIRED)
+        }
         if (!RoleState.isDefaultSmsApp(applicationContext)) {
             return@withContext failure(ERROR_NO_ROLE)
         }
@@ -44,7 +49,7 @@ class ImportWorker(
             return@withContext failure(ERROR_NO_PERMISSION)
         }
 
-        val client = RelayClient(settings.baseUri, settings.token)
+        val client = RelayClient(settings.baseUri, token) { settings.handleUnauthorized() }
         var cursor = settings.importCursor
         var processed = 0
         var imported = 0
@@ -204,6 +209,7 @@ class ImportWorker(
         const val ERROR_NO_ROLE = "no_role"
         const val ERROR_NO_PERMISSION = "no_permission"
         const val ERROR_AUTH = "auth"
+        const val ERROR_NOT_PAIRED = "not_paired"
         const val ERROR_REJECTED = "rejected"
         const val ERROR_READ = "read"
     }

@@ -96,6 +96,13 @@ object ContactsSync {
         val settings = SettingsStore(context)
         settings.lastContactsAttemptAt = System.currentTimeMillis()
 
+        val token = settings.token
+        if (token.isBlank()) {
+            // The phone is not paired: the server would not accept the
+            // list anyway, and the list on the server is left alone.
+            return Outcome.NothingToDo
+        }
+
         val contacts = ContactsRepository.readContacts(context)
             ?: return Outcome.Failed
         if (contacts.isEmpty()) {
@@ -104,7 +111,7 @@ object ContactsSync {
             return Outcome.NothingToDo
         }
 
-        val client = RelayClient(settings.baseUri, settings.token)
+        val client = RelayClient(settings.baseUri, token) { settings.handleUnauthorized() }
         if (!client.uploadContacts(contacts)) return Outcome.Failed
 
         settings.lastContactsSyncAt = System.currentTimeMillis()

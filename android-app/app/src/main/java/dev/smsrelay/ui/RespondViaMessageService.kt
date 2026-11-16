@@ -15,4 +15,14 @@ class RespondViaMessageService : Service() {
         stopSelf()
         return null
     }
+
+    /**
+     * The phone starts this component when a call is answered with a
+     * message. The relay does not write messages, so the service stops
+     * right away instead of staying in the background.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        stopSelf(startId)
+        return START_NOT_STICKY
+    }
 }

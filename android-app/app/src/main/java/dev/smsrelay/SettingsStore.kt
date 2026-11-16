@@ -2,25 +2,171 @@ package dev.smsrelay
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 
 /**
  * Small SharedPreferences-backed settings store. Deliberately not a
  * DataStore dependency: the app is tiny and the write volume is nil.
+ *
+ * The two secrets of the app (the device token and the claim secret of a
+ * running pairing) are NOT here: they live in [TokenStore], which keeps
+ * them sealed under a Keystore key. This class is the only place the rest
+ * of the app reads the token from.
  */
 class SettingsStore(context: Context) {
 
-    private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences("sms_relay", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
 
+    private val prefs: SharedPreferences =
+        appContext.getSharedPreferences("sms_relay", Context.MODE_PRIVATE)
+
+    /** The secrets of the app, sealed under a Keystore key. */
+    private val secrets = TokenStore(appContext)
+
+    init {
+        // The token used to live in the plain preferences. It is not
+        // copied over into the sealed store: the server issues a new
+        // token during the pairing, and the old one is worthless.
+        if (prefs.contains(KEY_TOKEN)) {
+            prefs.edit().remove(KEY_TOKEN).apply()
+        }
+    }
+
+    /**
+     * The URL of the relay backend.
+     *
+     * The device token belongs to one server only. A different URL means
+     * a different server, so the token is dropped and the device has to
+     * pair again.
+     */
     var baseUri: String
         get() = prefs.getString(KEY_BASE_URI, DEFAULT_BASE_URI) ?: DEFAULT_BASE_URI
-        set(value) = prefs.edit().putString(KEY_BASE_URI, value.trim()).apply()
+        set(value) {
+            val trimmed = value.trim()
+            val changed = trimmed.isNotEmpty() && trimmed != baseUri
+            prefs.edit().putString(KEY_BASE_URI, trimmed).apply()
+            if (changed) invalidateForNewServer()
+        }
 
+    /**
+     * The device token of this phone. It is a bearer credential and lives
+     * in the encrypted store, never in the plain preferences.
+     */
     var token: String
-        get() = prefs.getString(KEY_TOKEN, DEFAULT_TOKEN)
-            ?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_TOKEN
-        set(value) = prefs.edit().putString(KEY_TOKEN, value.trim()).apply()
+        get() = secrets.token
+        set(value) {
+            secrets.token = value.trim()
+        }
+
+    /** True when the phone holds a token the server may accept. */
+    fun hasToken(): Boolean = token.isNotBlank()
+
+    /** Drops the token: the device has to pair again. */
+    fun clearToken() {
+        secrets.clearToken()
+    }
+
+    /**
+     * The secret of a running pairing. It is short lived and never part
+     * of the QR code: only this phone can collect the token.
+     */
+    var claimSecret: String
+        get() = secrets.claimSecret
+        set(value) {
+            secrets.claimSecret = value.trim()
+        }
+
+    /**
+     * The name of this phone, as the admin sees it. Not a secret.
+     */
+    var deviceName: String
+        get() = prefs.getString(KEY_DEVICE_NAME, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_DEVICE_NAME, value.trim()).apply()
+
+    /** The name the device was paired with. */
+    var pairedDeviceName: String
+        get() = prefs.getString(KEY_PAIRED_NAME, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_PAIRED_NAME, value.trim()).apply()
+
+    /**
+     * The server URL the current token was issued for. A different URL
+     * invalidates the token.
+     */
+    var pairedBaseUri: String
+        get() = prefs.getString(KEY_PAIRED_BASE_URI, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_PAIRED_BASE_URI, value.trim()).apply()
+
+    /**
+     * Where the pairing stands: unpaired, pairing, paired, removed or
+     * server_changed. The screen shows what it means.
+     */
+    var pairingState: String
+        get() = prefs.getString(KEY_PAIRING_STATE, STATE_UNPAIRED) ?: STATE_UNPAIRED
+        set(value) = prefs.edit().putString(KEY_PAIRING_STATE, value).apply()
+
+    /** The id of the running pairing, empty when there is none. */
+    var pairingId: String
+        get() = prefs.getString(KEY_PAIRING_ID, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_PAIRING_ID, value.trim()).apply()
+
+    /** The short code the admin reads out loud, empty when there is none. */
+    var pairingScanCode: String
+        get() = prefs.getString(KEY_PAIRING_SCAN_CODE, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_PAIRING_SCAN_CODE, value.trim()).apply()
+
+    /** The payload of the QR code, empty when there is none. */
+    var pairingQrPayload: String
+        get() = prefs.getString(KEY_PAIRING_QR, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_PAIRING_QR, value.trim()).apply()
+
+    /** When the running pairing runs out (epoch seconds). */
+    var pairingExpiresAt: Long
+        get() = prefs.getLong(KEY_PAIRING_EXPIRES, 0L)
+        set(value) = prefs.edit().putLong(KEY_PAIRING_EXPIRES, value).apply()
+
+    /**
+     * Forgets a running pairing: the code, the payload and the claim
+     * secret. The token is not touched.
+     */
+    fun clearPairing() {
+        prefs.edit()
+            .remove(KEY_PAIRING_ID)
+            .remove(KEY_PAIRING_SCAN_CODE)
+            .remove(KEY_PAIRING_QR)
+            .remove(KEY_PAIRING_EXPIRES)
+            .apply()
+        secrets.clearClaimSecret()
+    }
+
+    /**
+     * The server refused the token of this device: it was removed in the
+     * admin app, or the server was reset. The token is dropped, the
+     * queue of the phone stays untouched and the user has to pair again.
+     *
+     * The device id is NOT changed, so the server can wake the very same
+     * row up again.
+     */
+    fun handleUnauthorized() {
+        // Without a token there is nothing to drop: the device was
+        // already unpaired, and the screen knows the reason already.
+        if (!hasToken()) return
+        clearToken()
+        pairingState = STATE_REMOVED
+        clearPairing()
+        // The screen shows the state at once, without waiting for the
+        // next time the app is opened.
+        val callback = onDeviceRemoved
+        if (callback != null) mainHandler.post { callback() }
+    }
+
+    /** The token belongs to one server only. */
+    private fun invalidateForNewServer() {
+        if (!hasToken()) return
+        clearToken()
+        pairingState = STATE_SERVER_CHANGED
+        clearPairing()
+    }
 
     /**
      * Master switch for every outgoing SMS of this app.
@@ -114,8 +260,9 @@ class SettingsStore(context: Context) {
 
     /**
      * Random id of this installation, used only to recognise the phone in
-     * the heartbeat of the server. It is not a credential: the device
-     * token is still the only thing that authorises a request.
+     * the heartbeat of the server and to pair it again. It is not a
+     * credential: the device token is still the only thing that
+     * authorises a request.
      */
     val deviceId: String
         get() {
@@ -128,6 +275,19 @@ class SettingsStore(context: Context) {
         }
 
     companion object {
+        /**
+         * Called when the device was removed on the server. The screen
+         * shows "pair again" at once instead of waiting for the next
+         * time the app is opened.
+         *
+         * The screen sets it while it is alive and clears it again when
+         * it goes away, so no screen is kept alive by it.
+         */
+        @Volatile
+        var onDeviceRemoved: (() -> Unit)? = null
+
+        private val mainHandler = Handler(Looper.getMainLooper())
+
         const val KEY_BASE_URI = "base_uri"
         const val KEY_TOKEN = "token"
         const val KEY_PHONE_B = "phone_b"
@@ -146,6 +306,14 @@ class SettingsStore(context: Context) {
         const val KEY_CONTACTS_COUNT = "contacts_count"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_IMPORT_CURSOR = "import_cursor"
+        const val KEY_DEVICE_NAME = "device_name"
+        const val KEY_PAIRED_NAME = "paired_device_name"
+        const val KEY_PAIRED_BASE_URI = "paired_base_uri"
+        const val KEY_PAIRING_STATE = "pairing_state"
+        const val KEY_PAIRING_ID = "pairing_id"
+        const val KEY_PAIRING_SCAN_CODE = "pairing_scan_code"
+        const val KEY_PAIRING_QR = "pairing_qr_payload"
+        const val KEY_PAIRING_EXPIRES = "pairing_expires_at"
 
         const val DEFAULT_BASE_URI = "https://ai-barrow.ir/relay"
         const val DEFAULT_FALLBACK_GAP_SECONDS = 30
@@ -158,11 +326,19 @@ class SettingsStore(context: Context) {
          */
         const val DEFAULT_PHONE_B = ""
 
-        /**
-         * Device token of this phone. Intentionally empty: enter it in the
-         * settings (or override this constant in a private local build that
-         * is never published).
-         */
-        const val DEFAULT_TOKEN = ""
+        /** The device was never paired. */
+        const val STATE_UNPAIRED = "unpaired"
+
+        /** A pairing is running: the app waits for the admin. */
+        const val STATE_PAIRING = "pairing"
+
+        /** The device holds a token. */
+        const val STATE_PAIRED = "paired"
+
+        /** The device was removed on the server: it has to pair again. */
+        const val STATE_REMOVED = "removed"
+
+        /** The server URL changed: the token is worthless now. */
+        const val STATE_SERVER_CHANGED = "server_changed"
     }
 }

@@ -1,6 +1,6 @@
 [Unit]
 Description=SMS Relay API (FastAPI, single worker)
-Documentation=file:/root/sms-relay/docs/vps-setup.md
+Documentation=https://github.com/HessiKz/sms-relay#readme
 After=network-online.target
 Wants=network-online.target
 # If the environment file is incomplete the service must fail fast and

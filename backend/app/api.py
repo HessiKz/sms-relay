@@ -17,11 +17,9 @@ MAX_PER_HOUR_RANGE = (1, 50)
 FILTER_MAX_PATTERNS = 100
 FILTER_MAX_PATTERN_LEN = 64
 MAX_DEVICE_INFO_BYTES = 2048
-MAX_DEVICE_ID_LEN = 64
 MAX_VERSION_LEN = 32
 MAX_SIMS = 4
 MAX_SIM_LABEL_LEN = 32
-FALLBACK_DEVICE_ID = "phone-a"
 ONLINE_WINDOW_S = 180
 _PHONE_PATTERN = re.compile(r"^\+?[0-9]{5,20}$")
 
@@ -55,6 +53,9 @@ def _parse_device_info(raw: str | None) -> dict:
 
     A malformed header must never break a command poll, so every field
     is validated independently and invalid fields are simply dropped.
+
+    The ``id`` of the header is ignored on purpose: the bearer token is
+    the only thing that decides which device a request belongs to.
     """
     if not raw:
         return {}
@@ -71,9 +72,6 @@ def _parse_device_info(raw: str | None) -> dict:
         return {}
 
     info: dict = {}
-    device_id = data.get("id")
-    if isinstance(device_id, str) and 0 < len(device_id) <= MAX_DEVICE_ID_LEN:
-        info["id"] = device_id
     version = data.get("version")
     if isinstance(version, str) and 0 < len(version) <= MAX_VERSION_LEN:
         info["version"] = version
@@ -87,28 +85,65 @@ def _parse_device_info(raw: str | None) -> dict:
     return info
 
 
-def _phone_shape(conn) -> dict:
-    now = int(time.time())
-    row = db.device_status(conn)
+def _device_shape(row: dict | None) -> dict:
+    """The state of one device: heartbeat, version, sending and SIMs."""
     if row is None:
         return {"last_seen": None, "online": False, "app_version": None,
                 "sending": None, "sims": []}
+    now = int(time.time())
     sims = []
-    if row["sims_json"]:
+    if row.get("sims_json"):
         try:
             parsed = json.loads(row["sims_json"])
         except (TypeError, ValueError):
             parsed = []
         if isinstance(parsed, list):
             sims = parsed
+    last_seen = row.get("last_seen_at")
+    sending = row.get("sending_enabled")
     return {
-        "last_seen": row["last_seen_at"],
-        "online": row["last_seen_at"] > now - ONLINE_WINDOW_S,
-        "app_version": row["app_version"],
-        "sending": (None if row["sending_enabled"] is None
-                    else bool(row["sending_enabled"])),
+        "last_seen": last_seen,
+        "online": bool(last_seen and last_seen > now - ONLINE_WINDOW_S),
+        "app_version": row.get("app_version"),
+        "sending": (None if sending is None else bool(sending)),
         "sims": sims,
     }
+
+
+def _phone_shape(conn, device_id: str | None = None) -> dict:
+    """The device shape of one device, or of the newest one."""
+    if device_id is not None:
+        return _device_shape(db.device_by_id(conn, device_id))
+    return _device_shape(db.latest_device(conn))
+
+
+def _device_summaries(conn, device_id: str | None = None) -> list[dict]:
+    """Every device with the state the admin needs.
+
+    A device token only ever gets its own device in this list.
+    """
+    now = int(time.time())
+    rows = db.list_devices(conn)
+    if device_id is not None:
+        rows = [row for row in rows if row.get("id") == device_id]
+    summaries = []
+    for row in rows:
+        last_seen = row.get("last_seen_at")
+        summaries.append({
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "platform": row.get("platform"),
+            "app_version": row.get("app_version"),
+            "archived": bool(row.get("archived")),
+            "revoked": row.get("revoked_at") is not None,
+            "online": bool(last_seen and last_seen > now - ONLINE_WINDOW_S),
+            "last_seen": last_seen,
+            "sending": (None if row.get("sending_enabled") is None
+                        else bool(row.get("sending_enabled"))),
+            "sims": _device_shape(row)["sims"],
+            "paired_at": row.get("paired_at"),
+        })
+    return summaries
 
 
 def _check_bool_setting(key: str, value) -> bool:
@@ -150,8 +185,23 @@ _SETTING_CHECKS = {
 }
 
 
-def _validate_settings(body: dict) -> None:
+def _check_default_device(conn, value) -> str | None:
+    """The default device must be a device that can actually send."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        _reject("default_device_id must be a device id or null")
+    device_id = value.strip()
+    if not db.device_is_active(conn, device_id):
+        _reject("default_device_id must be an active device")
+    return device_id
+
+
+def _validate_settings(body: dict, conn) -> None:
     for key, value in body.items():
+        if key == "default_device_id":
+            _check_default_device(conn, value)
+            continue
         check = _SETTING_CHECKS.get(key)
         if check is None:
             _reject(f"unknown key: {key}")
@@ -185,6 +235,7 @@ def _settings_shape(conn) -> dict:
         "phone_b": db.settings_get(conn, "phone_b") or None,
         "fallback_min_gap_s": int_or_default("fallback_min_gap_s", 30),
         "fallback_max_per_hour": int_or_default("fallback_max_per_hour", 10),
+        "default_device_id": db.settings_get(conn, "default_device_id") or None,
     }
 
 
@@ -214,11 +265,12 @@ def build_router(settings) -> APIRouter:
         limit: int = Query(default=50, gt=0, le=200),
         offset: int = Query(default=0, ge=0),
         state: str | None = Query(default=None),
+        device_id: str | None = Query(default=None),
     ):
         conn = request.app.state.db_conn
         if state is not None and state not in db.STATES:
             raise HTTPException(422, "invalid state")
-        items = db.page_messages(conn, limit, offset, state)
+        items = db.page_messages(conn, limit, offset, state, device_id)
         next_offset = offset + len(items) if len(items) == limit else None
         return {"items": items, "next_offset": next_offset}
 
@@ -230,6 +282,9 @@ def build_router(settings) -> APIRouter:
         failure for a specific message, which is the only condition that
         authorises a direct-SIM fallback SMS. A timeout is never
         reported here as a failure.
+
+        A device only learns the states of its own messages; the admin
+        token sees every state.
         """
         wanted = [part.strip() for part in ids.split(",") if part.strip()]
         if not wanted:
@@ -239,7 +294,9 @@ def build_router(settings) -> APIRouter:
         if any(len(part) > 64 for part in wanted):
             raise HTTPException(422, "id too long")
         conn = request.app.state.db_conn
-        return {"states": db.states_for_ids(conn, wanted)}
+        device = getattr(request.state, "device", None)
+        scope = device["id"] if device is not None else None
+        return {"states": db.states_for_ids(conn, wanted, scope)}
 
     @router.get("/commands", dependencies=[Depends(device_required)])
     async def list_commands(request: Request):
@@ -248,20 +305,24 @@ def build_router(settings) -> APIRouter:
         Device token only: the app polls this and sends the SMS. The
         optional X-Device-Info header is advisory: a malformed or missing
         header never rejects the poll, it only leaves fields unknown.
+        The header cannot change the identity of the device: only the
+        bearer token can.
         """
         conn = request.app.state.db_conn
+        device = request.state.device
         info = _parse_device_info(request.headers.get("x-device-info"))
         sims_json = (json.dumps(info["sims"], separators=(",", ":"))
                      if "sims" in info else None)
-        db.device_seen(
+        db.device_heartbeat(
             conn,
-            info.get("id") or FALLBACK_DEVICE_ID,
+            device["id"],
             info.get("version"),
             info.get("sending"),
             sims_json,
             int(time.time()),
         )
-        return {"commands": db.pending_commands(conn, limit=MAX_COMMANDS)}
+        return {"commands": db.pending_commands(conn, device["id"],
+                                                limit=MAX_COMMANDS)}
 
     @router.post("/commands/{command_id}/result",
                  dependencies=[Depends(device_required)])
@@ -271,8 +332,12 @@ def build_router(settings) -> APIRouter:
 
         A duplicate or late report is answered with 200 and
         ``accepted: false``: a 4xx would make the phone retry forever.
+
+        A command that belongs to another device is unknown: the answer
+        is 404, so a phone cannot learn that the command exists.
         """
         conn = request.app.state.db_conn
+        device = request.state.device
         status = payload.get("status")
         if status not in ("sent", "delivered", "failed", "rejected"):
             raise HTTPException(
@@ -281,7 +346,7 @@ def build_router(settings) -> APIRouter:
         if detail is not None and not isinstance(detail, str):
             raise HTTPException(422, "detail must be a string")
         existing = db.command(conn, command_id)
-        if existing is None:
+        if existing is None or existing.get("device_id") != device["id"]:
             raise HTTPException(404, "unknown command")
         accepted, current = db.finish_command(
             conn, command_id, status, (detail or "")[:200] or None)
@@ -290,7 +355,8 @@ def build_router(settings) -> APIRouter:
                 raise HTTPException(404, "unknown command")
             return {"accepted": False, "status": current}
         # An accepted transition changes the outbound bubble in the Mini App.
-        rev.bump_rev(request.app)
+        rev.bump_rev(request.app, existing.get("device_id"),
+                     existing.get("thread_key"))
         # Tell the admin in Telegram what happened to their request. Only
         # the first accepted sent/failed/rejected gets a note; a delivered
         # report is silent by design.
@@ -315,7 +381,9 @@ def build_router(settings) -> APIRouter:
         """The phone uploads its contact list so the bot can offer names.
 
         The whole list is replaced on every upload; only name and number
-        are stored, never anything else from the contacts database.
+        are stored, never anything else from the contacts database. The
+        list belongs to the authenticated device: another device's
+        contacts are never touched.
         """
         contacts = payload.get("contacts")
         if not isinstance(contacts, list):
@@ -334,37 +402,54 @@ def build_router(settings) -> APIRouter:
                 continue
             cleaned.append({"number": number, "name": name})
         conn = request.app.state.db_conn
-        stored = db.replace_contacts(conn, cleaned)
+        device = request.state.device
+        stored = db.replace_device_contacts(conn, device["id"], cleaned)
         return {"stored": stored}
 
     @router.get("/contacts", dependencies=[Depends(admin_required)])
-    async def list_contacts(request: Request):
+    async def list_contacts(request: Request,
+                            device_id: str | None = Query(default=None)):
+        """The uploaded contact lists, per device."""
         conn = request.app.state.db_conn
-        return {"count": db.contact_count(conn),
-                "contacts": db.list_contacts(conn, limit=200)}
+        rows = db.list_device_contacts(conn, device_id, limit=200)
+        return {"count": db.device_contact_count(conn, device_id),
+                "contacts": rows}
 
     @router.get("/status", dependencies=[Depends(any_token)])
     async def status(request: Request):
+        """The relay state.
+
+        A device token sees the global counters plus its own device; the
+        admin token sees every device.
+        """
         conn = request.app.state.db_conn
+        device = getattr(request.state, "device", None)
+        scope = device["id"] if device is not None else None
         return {
             "paused": db.settings_get(conn, "paused") == "1",
             "counts_by_state": db.counts_by_state(conn),
             "queue": db.count_jobs(conn),
             "version": VERSION,
-            "phone": _phone_shape(conn),
+            "phone": _phone_shape(conn, scope),
+            "devices": _device_summaries(conn, scope),
         }
 
     @router.post("/admin/pause", dependencies=[Depends(admin_required)])
     async def pause(request: Request):
         conn = request.app.state.db_conn
         db.settings_set(conn, "paused", "1")
+        # The pause is a global change: the Mini App has to reload.
+        rev.bump_rev(request.app)
         return {"paused": True}
 
     @router.post("/admin/resume", dependencies=[Depends(admin_required)])
     async def resume(request: Request):
         conn = request.app.state.db_conn
         db.settings_set(conn, "paused", "0")
+        # Every device resumes its own messages; imported history is
+        # never resumed (it is history, not something to forward).
         resumed = db.resume_received(conn)
+        rev.bump_rev(request.app)
         return {"paused": False, "resumed": resumed}
 
     @router.get("/admin/settings", dependencies=[Depends(admin_required)])
@@ -374,9 +459,10 @@ def build_router(settings) -> APIRouter:
 
     @router.put("/admin/settings", dependencies=[Depends(admin_required)])
     async def put_admin_settings(request: Request, body: dict):
-        _validate_settings(body)
         conn = request.app.state.db_conn
+        _validate_settings(body, conn)
         _persist_settings(conn, body)
+        rev.bump_rev(request.app)
         return _settings_shape(conn)
 
     @router.get("/admin/filters", dependencies=[Depends(admin_required)])
@@ -390,6 +476,7 @@ def build_router(settings) -> APIRouter:
         conn = request.app.state.db_conn
         for kind, patterns in provided.items():
             db.filters_replace(conn, kind, patterns)
+        rev.bump_rev(request.app)
         return _filters_shape(conn)
 
     return router

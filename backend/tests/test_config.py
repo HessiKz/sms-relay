@@ -3,7 +3,7 @@ from app.config import load_settings
 
 REQUIRED = {
     "TELEGRAM_BOT_TOKEN": "t:abc", "TELEGRAM_CHAT_ID": "123",
-    "ADMIN_TELEGRAM_USER_ID": "123", "PHONE_A_TOKEN": "pat", "ADMIN_TOKEN": "adm",
+    "ADMIN_TELEGRAM_USER_ID": "123", "ADMIN_TOKEN": "adm",
     "DATABASE_PATH": "/tmp/x.db",
 }
 
@@ -19,7 +19,7 @@ def test_missing_required_raises(missing):
         load_settings(env=env)
 
 def test_empty_value_raises():
-    env = dict(REQUIRED); env["PHONE_A_TOKEN"] = ""
+    env = dict(REQUIRED); env["ADMIN_TOKEN"] = ""
     with pytest.raises(ValueError):
         load_settings(env=env)
 

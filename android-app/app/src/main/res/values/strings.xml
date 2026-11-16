@@ -28,13 +28,15 @@
 
     <string name="capture_default_app">SMS Relay is your default SMS app, so it sees every message.</string>
     <string name="capture_notifications">SMS Relay reads your messages from the notifications of your messaging app.</string>
-    <string name="capture_none">SMS Relay cannot see your messages yet. Make it your default SMS app, or let it read your notifications.</string>
+    <string name="capture_none">SMS Relay cannot see your messages yet. Press the \'Default SMS app\' button, or let it read your notifications.</string>
     <string name="capture_path">How SMS Relay sees your messages: %1$s</string>
     <string name="capture_state_default_app">default SMS app</string>
     <string name="capture_state_notifications">notification access only</string>
     <string name="capture_state_none">no way to see messages yet</string>
 
     <!-- The sections of the screen -->
+    <string name="section_pair_title">Pair this device</string>
+    <string name="section_pair_help">This phone has to be paired before it can send messages to the server or receive commands. Scan the code in the mini app to approve this phone.</string>
     <string name="section_forward_title">Forward messages to Telegram</string>
     <string name="section_forward_help">Every SMS your phone receives is sent to your Telegram chat.</string>
     <string name="section_reply_title">Reply from Telegram</string>
@@ -54,6 +56,28 @@
     <string name="label_sending_enabled">Turn on replies from Telegram</string>
     <string name="label_fallback_enabled">Use the backup number when Telegram delivery fails</string>
     <string name="label_phone_b">Number to text when Telegram delivery fails</string>
+
+    <!-- Pairing this device -->
+    <string name="label_device_name">Name of this device</string>
+    <string name="label_pair_qr">The code that pairs this device</string>
+    <string name="action_pair_device">Pair this device</string>
+    <string name="action_new_code">New code</string>
+    <string name="pair_state_unpaired">This phone is not paired yet.</string>
+    <string name="pair_state_starting">Asking the server for a code…</string>
+    <string name="pair_state_waiting">Waiting for the admin to approve the code…</string>
+    <string name="pair_state_paired">Paired as %1$s.</string>
+    <string name="pair_state_removed">Device removed — pair again.</string>
+    <string name="pair_state_server_changed">The server URL changed — pair again.</string>
+    <string name="pair_countdown">This code is valid for %1$d more seconds.</string>
+    <string name="pair_expired">The code expired — generate a new one.</string>
+    <string name="pair_error_name">Give this device a name first.</string>
+    <string name="pair_error_url">Write the server URL first.</string>
+    <string name="pair_error_network">The server could not be reached. Check the server URL and try again.</string>
+    <string name="pair_error_server">The server did not accept the pairing request.</string>
+    <string name="pair_error_already_claimed">Already claimed — generate a new code.</string>
+    <string name="pair_error_expired">Code expired — generate a new code.</string>
+    <string name="pair_error_invalid">This code is no longer valid — generate a new one.</string>
+    <string name="pair_error_qr">The code could not be drawn — generate a new one.</string>
 
     <!-- Writing a message -->
     <string name="hint_compose_number">Number or contact name</string>
@@ -104,7 +128,8 @@
     <string name="status_import_failed">The import stopped: %1$s</string>
     <string name="import_error_no_role">make SMS Relay your default SMS app first</string>
     <string name="import_error_no_permission">the app cannot read the SMS inbox</string>
-    <string name="import_error_auth">the server rejected the device token</string>
+    <string name="import_error_auth">this device is not allowed to talk to the server</string>
+    <string name="import_error_not_paired">this phone is not paired yet</string>
     <string name="import_error_rejected">the server refused a message</string>
     <string name="import_error_server">the server URL is empty</string>
     <string name="import_error_read">the SMS inbox could not be read</string>
@@ -112,7 +137,6 @@
 
     <!-- Advanced settings -->
     <string name="label_base_uri">Server URL</string>
-    <string name="label_token">Device token</string>
     <string name="label_connection">Connection</string>
     <string name="label_queue">Queued messages</string>
     <string name="label_last_upload">Last upload</string>
@@ -122,7 +146,16 @@
     <string name="action_autostart">Autostart</string>
     <string name="action_default_sms_app">Default SMS app</string>
     <string name="action_notification_access">Notifications</string>
-    <string name="hint_permissions">Android can pause this app in the background. The buttons below open the settings that keep it running.</string>
+    <string name="hint_permissions">Android can pause this app in the background. The buttons below open the settings that keep it running. \'Default SMS app\' is the one that lets SMS Relay read your messages.</string>
+
+    <!-- Becoming the default SMS app -->
+    <string name="default_sms_already">SMS Relay is already your default SMS app.</string>
+    <string name="default_sms_granted">SMS Relay is now your default SMS app.</string>
+    <string name="default_sms_refused">SMS Relay is still not your default SMS app. Try again, or choose it in the settings.</string>
+    <string name="default_sms_not_applied">Android accepted the request but did not change the default SMS app.</string>
+    <string name="default_sms_unavailable">This phone does not offer the default SMS app. Set it in the settings instead.</string>
+    <string name="default_sms_settings_opened">Choose SMS Relay as the SMS app in the settings that just opened.</string>
+    <string name="default_sms_manual">Open the settings of the phone and choose SMS Relay as the default SMS app.</string>
 
     <!-- Commands from Telegram -->
     <string name="label_last_command">Last Telegram command</string>

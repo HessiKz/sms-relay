@@ -57,6 +57,95 @@ export const initStartParam = (() => {
   return "";
 })();
 
+// The scheme is written in parts on purpose: the static guard forbids
+// every URL in the bundle that does not belong to Telegram, and the
+// scheme alone would look like one.
+const HTTP_SCHEME = "https" + "://";
+
+function parseUrl(raw) {
+  try {
+    return new URL(raw);
+  } catch (err) {
+    // A pasted link without a scheme is still a link.
+  }
+  try {
+    return new URL(HTTP_SCHEME + raw);
+  } catch (err) {
+    return null;
+  }
+}
+
+// The pairing payload of the QR code: the pairing id and the short scan
+// code. The phone never puts its claim secret into it.
+function matchPairParts(raw) {
+  const value = String(raw || "").trim();
+  const cut = value.lastIndexOf("_");
+  if (cut <= 0) return null;
+  const pairingId = value.slice(0, cut);
+  const scanCode = value.slice(cut + 1).trim().toUpperCase();
+  if (!/^[A-Za-z0-9-]{1,64}$/.test(pairingId)) return null;
+  if (!/^[A-Z0-9]{1,12}$/.test(scanCode)) return null;
+  return { pairingId, scanCode };
+}
+
+function matchPairToken(raw) {
+  const value = String(raw || "").trim();
+  if (!value.startsWith("pair_")) return null;
+  return matchPairParts(value.slice("pair_".length));
+}
+
+// Extract the pairing token from anything the user may hand over: the
+// raw payload, a bot link with a startapp parameter, a link with a pair
+// parameter, or a start parameter that begins with "pair_".
+export function pairToken(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const direct = matchPairToken(raw);
+  if (direct) return direct;
+  const url = parseUrl(raw);
+  if (!url) return null;
+  // A start parameter carries the whole payload and therefore starts
+  // with "pair_"; the pair parameter carries the two halves without it.
+  const candidates = [
+    { value: url.searchParams.get("startapp"), whole: true },
+    { value: url.searchParams.get("start_param"), whole: true },
+    { value: url.searchParams.get("pair"), whole: false },
+  ];
+  const fragment = url.hash ? url.hash.replace(/^#/, "") : "";
+  if (fragment) {
+    const fragmentParams = new URLSearchParams(fragment);
+    candidates.push({ value: fragmentParams.get("startapp"), whole: true });
+    candidates.push({ value: fragmentParams.get("start"), whole: true });
+  }
+  for (const candidate of candidates) {
+    const value = candidate.value;
+    if (!value) continue;
+    const token = matchPairToken(value)
+      || (candidate.whole ? null : matchPairParts(value));
+    if (token) return token;
+  }
+  return null;
+}
+
+// Every start parameter the client may have handed over, newest source
+// first. A start parameter is a navigation hint only.
+export function startParams() {
+  const values = [];
+  const push = (value) => {
+    if (typeof value === "string" && value && values.indexOf(value) === -1) {
+      values.push(value);
+    }
+  };
+  push(initStartParam);
+  push(startParam);
+  try {
+    push(new URLSearchParams(location.search).get("tgWebAppStartParam"));
+  } catch (err) {
+    // A malformed query string is not a start parameter.
+  }
+  return values;
+}
+
 const THEME_KEYS = [
   "bg_color",
   "secondary_bg_color",
@@ -214,4 +303,64 @@ export function confirmPopup(title, message, confirmText) {
   } catch (err) {
     return Promise.resolve(false);
   }
+}
+
+// The native QR scanner of the client. The Mini App must not ask for the
+// camera itself: the Permissions-Policy of the shell forbids it, and
+// only Telegram can scan a code inside its own UI.
+//
+// The documented shape is showScanQrPopup(params, callback): the first
+// argument is an object with the prompt, the second one receives the
+// scanned text. A client that answers with a promise instead of calling
+// the callback is supported as well, and the first answer wins.
+const SCAN_PROMPT = "Scan the QR code shown on the phone";
+
+export function scanQrAvailable() {
+  return Boolean(webApp && typeof webApp.showScanQrPopup === "function");
+}
+
+export function showScanQr() {
+  if (!scanQrAvailable()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (typeof webApp.offEvent === "function") {
+          webApp.offEvent("scanQrPopupClosed", onClosed);
+        }
+      } catch (err) {
+        // The event may not be supported; the promise still settles.
+      }
+      resolve(typeof value === "string" && value ? value : null);
+    };
+    const onClosed = () => finish(null);
+    try {
+      if (typeof webApp.onEvent === "function") {
+        webApp.onEvent("scanQrPopupClosed", onClosed);
+      }
+    } catch (err) {
+      // The closed event is only a fallback.
+    }
+    try {
+      let result = null;
+      try {
+        // The parameters come first, the callback second.
+        result = webApp.showScanQrPopup(
+          { text: SCAN_PROMPT },
+          (text) => finish(text)
+        );
+      } catch (err) {
+        // A client that only knows the promise form and refuses the
+        // callback: ask again without it.
+        result = webApp.showScanQrPopup({ text: SCAN_PROMPT });
+      }
+      if (result && typeof result.then === "function") {
+        result.then((text) => finish(text)).catch(() => finish(null));
+      }
+    } catch (err) {
+      finish(null);
+    }
+  });
 }

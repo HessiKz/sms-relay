@@ -11,8 +11,9 @@ import app.main as app_main
 import app.security as security
 from app.main import BodySizeLimitMiddleware, create_app
 from app.tg import TGError
+from tests.device_support import DEVICE_ID, DEVICE_TOKEN, device_headers, seed_device
 
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 NOW = int(time.time())
 LIMIT = 524_288
@@ -23,7 +24,6 @@ def _env(database_path):
         "TELEGRAM_BOT_TOKEN": "test-tg-token",
         "TELEGRAM_CHAT_ID": "test-chat-id",
         "ADMIN_TELEGRAM_USER_ID": "7",
-        "PHONE_A_TOKEN": "device-token",
         "ADMIN_TOKEN": "admin-token",
         "DATABASE_PATH": str(database_path),
     }
@@ -124,6 +124,7 @@ def test_assembly_starts_and_stops_workers(settings, monkeypatch):
     monkeypatch.setattr(app.state, "poll_tg", fake)
 
     with TestClient(app) as test_client:
+        seed_device(test_client.app.state.db_conn, DEVICE_ID, DEVICE_TOKEN)
         assert app.state.workers_enabled is True
         assert len(app.state.worker_tasks) == 2
         assert app.state.delivery_worker.poke_event is app.state.poke_event
@@ -140,6 +141,7 @@ def test_assembly_starts_and_stops_workers(settings, monkeypatch):
 def test_assembly_run_workers_false_disables_workers(settings):
     app = create_app(settings, run_workers=False)
     with TestClient(app) as test_client:
+        seed_device(test_client.app.state.db_conn, DEVICE_ID, DEVICE_TOKEN)
         assert app.state.workers_enabled is False
         assert app.state.worker_tasks == []
         assert app.state.http is not None
@@ -359,6 +361,7 @@ def test_restart_persistence_across_apps(tmp_path, monkeypatch):
 
     first = create_app(settings, run_workers=False)
     with TestClient(first) as client_a:
+        seed_device(client_a.app.state.db_conn, DEVICE_ID, DEVICE_TOKEN)
         r = client_a.post("/sms", json=payload, headers=headers)
         assert r.status_code == 200
         assert r.json() == {"accepted": True, "duplicate": False,
@@ -370,6 +373,8 @@ def test_restart_persistence_across_apps(tmp_path, monkeypatch):
     fake = _FakeTelegram()
     monkeypatch.setattr(second.state, "tg", fake)
     with TestClient(second) as client_b:
+        seed_device(client_b.app.state.db_conn, DEVICE_ID, DEVICE_TOKEN)
+
         def delivered():
             counts = client_b.get("/status", headers=headers).json()["counts_by_state"]
             return counts.get("delivered") == 1
@@ -396,7 +401,6 @@ def test_main_builds_app_from_env_file(tmp_path, monkeypatch):
     assert settings.telegram_bot_token == "fixture-tg-token"
     assert settings.telegram_chat_id == "fixture-chat-id"
     assert settings.admin_telegram_user_id == 7
-    assert settings.phone_a_token == "fixture-device-token"
     assert settings.admin_token == "fixture-admin-token"
     assert settings.database_path == str(tmp_path / "relay.db")
     assert captured.get("host") == "127.0.0.1"

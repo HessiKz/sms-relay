@@ -8,8 +8,12 @@ on:
       - 'android-app/**'
       - '.github/workflows/android-build.yml'
 
+concurrency:
+  group: android-latest
+  cancel-in-progress: true
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -62,3 +66,31 @@ jobs:
           name: sms-relay-debug-apk
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # A public, stable download URL. Actions artifacts need a GitHub login;
+      # the release asset is the link handed to the operator.
+      - name: Publish rolling APK release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="android-latest"
+          asset="sms-relay-debug.apk"
+          apk="android-app/app/build/outputs/apk/debug/app-debug.apk"
+          notes="Rolling debug build from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --title "SMS Relay Android (latest)" \
+              --notes "$notes" \
+              --prerelease
+          else
+            gh release create "$tag" \
+              --title "SMS Relay Android (latest)" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+          gh release upload "$tag" "$apk#$asset" --clobber
+          echo "APK: https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}" \
+            >> "$GITHUB_STEP_SUMMARY"

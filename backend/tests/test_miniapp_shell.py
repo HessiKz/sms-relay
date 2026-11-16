@@ -1,8 +1,9 @@
 import time
 
 from tests.test_miniapp_auth import API, HEADER, signed_init_data
+from tests.device_support import device_headers
 
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 CSP_HEADER = "content-security-policy"
 
 

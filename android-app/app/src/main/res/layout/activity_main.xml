@@ -55,6 +55,115 @@
                 android:paddingTop="8dp" />
         </LinearLayout>
 
+        <!-- ============ Pairing ============ -->
+        <TextView
+            android:id="@+id/textSectionPair"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_pair_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/cardStatus" />
+
+        <TextView
+            android:id="@+id/textSectionPairHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_pair_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionPair" />
+
+        <EditText
+            android:id="@+id/inputBaseUri"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="@string/label_base_uri"
+            android:importantForAutofill="no"
+            android:inputType="textUri"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionPairHelp" />
+
+        <EditText
+            android:id="@+id/inputDeviceName"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="@string/label_device_name"
+            android:importantForAutofill="no"
+            android:inputType="textCapWords"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputBaseUri" />
+
+        <Button
+            android:id="@+id/buttonPair"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_pair_device"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/inputDeviceName" />
+
+        <Button
+            android:id="@+id/buttonNewCode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="@string/action_new_code"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="@id/buttonPair"
+            app:layout_constraintStart_toEndOf="@id/buttonPair"
+            app:layout_constraintTop_toTopOf="@id/buttonPair" />
+
+        <TextView
+            android:id="@+id/textPairState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonPair" />
+
+        <TextView
+            android:id="@+id/textScanCode"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:paddingTop="8dp"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:visibility="gone"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textPairState" />
+
+        <ImageView
+            android:id="@+id/imageQr"
+            android:layout_width="220dp"
+            android:layout_height="220dp"
+            android:layout_marginTop="8dp"
+            android:contentDescription="@string/label_pair_qr"
+            android:scaleType="fitCenter"
+            android:visibility="gone"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textScanCode" />
+
+        <TextView
+            android:id="@+id/textPairCountdown"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            android:visibility="gone"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/imageQr" />
+
         <!-- ============ 1. Forward to Telegram ============ -->
         <TextView
             android:id="@+id/textSectionForward"
@@ -66,7 +175,7 @@
             android:textStyle="bold"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/cardStatus" />
+            app:layout_constraintTop_toBottomOf="@id/textPairCountdown" />
 
         <TextView
             android:id="@+id/textSectionForwardHelp"
@@ -386,35 +495,14 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@id/dividerAdvanced" />
 
-        <EditText
-            android:id="@+id/inputBaseUri"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:hint="@string/label_base_uri"
-            android:importantForAutofill="no"
-            android:inputType="textUri"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/textSectionAdvanced" />
-
-        <EditText
-            android:id="@+id/inputToken"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:hint="@string/label_token"
-            android:importantForAutofill="no"
-            android:inputType="textPassword"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/inputBaseUri" />
-
         <Button
             android:id="@+id/buttonTestConnection"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
             android:text="@string/action_test_connection"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/inputToken" />
+            app:layout_constraintTop_toBottomOf="@id/textSectionAdvanced" />
 
         <TextView
             android:id="@+id/textConnectionState"

@@ -8,6 +8,7 @@ import pytest
 import app.db as db
 import app.updater as updater_module
 from app.updater import SMS_USAGE, Updater
+from tests.device_support import DEVICE_ID, device_headers, seed_device
 
 ADMIN_ID = 7
 CHAT_ID = 555
@@ -47,6 +48,8 @@ def _msg(update_id, text=None, *, user=ADMIN_ID, chat_type="private",
 @pytest.fixture
 def conn(tmp_path):
     connection = db.open_db(str(tmp_path / "commands.db"))
+    # One paired phone: a command always belongs to a device.
+    seed_device(connection, DEVICE_ID)
     yield connection
     connection.close()
 
@@ -66,7 +69,7 @@ async def test_reply_to_relayed_message_creates_sms_command(conn, settings):
     # A message that was delivered to Telegram, with the id the bot used.
     db.record_message(conn, {"id": "orig-1", "sender": "+15551230000",
                              "body": "hello there", "received_at": int(time.time()),
-                             "state": "pending"})
+                             "state": "pending", "device_id": DEVICE_ID})
     db.update_state(conn, "orig-1", "delivered", 1, int(time.time()),
                     telegram_msg_id="4242")
 
@@ -76,7 +79,7 @@ async def test_reply_to_relayed_message_creates_sms_command(conn, settings):
                   reply_to_message={"message_id": 4242})
     await updater._process(update)
 
-    commands = db.pending_commands(conn)
+    commands = db.pending_commands(conn, DEVICE_ID)
     assert len(commands) == 1
     assert commands[0]["target"] == "+15551230000"
     assert commands[0]["body"] == "sure, here is the answer"
@@ -89,7 +92,7 @@ async def test_reply_to_unknown_message_is_not_a_command(conn, settings):
     fake = FakeTelegram()
     updater = _updater(conn, settings, fake)
     await updater._process(_msg(1, "hello", reply_to_message={"message_id": 999}))
-    assert db.pending_commands(conn) == []
+    assert db.pending_commands(conn, DEVICE_ID) == []
 
 
 @pytest.mark.anyio
@@ -97,7 +100,7 @@ async def test_sms_command_queues_any_number(conn, settings):
     fake = FakeTelegram()
     updater = _updater(conn, settings, fake)
     await updater._process(_msg(1, "/sms +15559876543 meet me at 7"))
-    commands = db.pending_commands(conn)
+    commands = db.pending_commands(conn, DEVICE_ID)
     assert len(commands) == 1
     assert commands[0]["target"] == "+15559876543"
     assert commands[0]["body"] == "meet me at 7"
@@ -110,14 +113,14 @@ async def test_sms_command_requires_number_and_text(conn, settings):
     fake = FakeTelegram()
     updater = _updater(conn, settings, fake)
     await updater._process(_msg(1, "/sms"))
-    assert db.pending_commands(conn) == []
+    assert db.pending_commands(conn, DEVICE_ID) == []
     assert fake.sent
     assert "Send an SMS" in fake.sent[0][1]
 
     fake2 = FakeTelegram()
     updater2 = _updater(conn, settings, fake2)
     await updater2._process(_msg(2, "/sms not-a-number hello"))
-    assert db.pending_commands(conn) == []
+    assert db.pending_commands(conn, DEVICE_ID) == []
     assert fake2.sent and "neither a contact nor a phone number" in fake2.sent[0][1]
 
 
@@ -126,24 +129,26 @@ async def test_sms_command_from_stranger_is_ignored(conn, settings):
     fake = FakeTelegram()
     updater = _updater(conn, settings, fake)
     await updater._process(_msg(1, "/sms +15559876543 let me in", user=999))
-    assert db.pending_commands(conn) == []
+    assert db.pending_commands(conn, DEVICE_ID) == []
     assert fake.sent == []
 
 
 def test_command_lifecycle(conn):
-    db.create_command(conn, "cmd-1", "+15551230000", "hi", "telegram_sms")
-    pending = db.pending_commands(conn)
+    db.create_command(conn, "cmd-1", "+15551230000", "hi", "telegram_sms",
+                      device_id=DEVICE_ID)
+    pending = db.pending_commands(conn, DEVICE_ID)
     assert len(pending) == 1 and pending[0]["id"] == "cmd-1"
     db.finish_command(conn, "cmd-1", "sent", "ok")
-    assert db.pending_commands(conn) == []
+    assert db.pending_commands(conn, DEVICE_ID) == []
     stored = db.command(conn, "cmd-1")
     assert stored["status"] == "sent" and stored["result"] == "ok"
 
 
 def test_pending_commands_are_bounded(conn):
     for index in range(30):
-        db.create_command(conn, f"cmd-{index}", "+15551230000", "hi", "telegram_sms")
-    assert len(db.pending_commands(conn, limit=20)) == 20
+        db.create_command(conn, f"cmd-{index}", "+15551230000", "hi",
+                          "telegram_sms", device_id=DEVICE_ID)
+    assert len(db.pending_commands(conn, DEVICE_ID, limit=20)) == 20
 
 
 def test_find_recent_duplicate_detects_the_same_message(conn):
@@ -304,7 +309,7 @@ async def test_button_flow_contact_then_text_queues_the_sms(conn, settings):
     assert "Alice" in fake.sent[-1][1]
 
     await updater._process(_msg(2, "hi there"))
-    commands = db.pending_commands(conn)
+    commands = db.pending_commands(conn, DEVICE_ID)
     assert len(commands) == 1
     assert commands[0]["target"] == "+989120000002"
     assert commands[0]["body"] == "hi there"
@@ -318,7 +323,7 @@ async def test_button_flow_custom_number_normalises_local_format(conn, settings)
     await updater._process(_tap("sms:number"))
     await updater._process(_msg(1, "09120000003"))
     await updater._process(_msg(2, "hello"))
-    commands = db.pending_commands(conn)
+    commands = db.pending_commands(conn, DEVICE_ID)
     assert len(commands) == 1
     assert commands[0]["target"] == "+989120000003"
 
@@ -329,7 +334,7 @@ async def test_number_button_answers_a_nonsense_target(conn, settings):
     updater = _updater(conn, settings, fake)
     await updater._process(_tap("sms:number"))
     await updater._process(_msg(1, "not a number"))
-    assert db.pending_commands(conn) == []
+    assert db.pending_commands(conn, DEVICE_ID) == []
     assert "does not look like a phone number" in fake.sent[-1][1]
 
 
@@ -380,7 +385,7 @@ async def test_next_page_button_queues_the_right_contact(conn, settings):
     await updater._process(_tap("contact:0"))
     # the bot now asks for the text
     await updater._process(_msg(3, "hello"))
-    commands = db.pending_commands(conn)
+    commands = db.pending_commands(conn, DEVICE_ID)
     assert len(commands) == 1
     assert commands[0]["target"] == "+98939000008"
     assert commands[0]["body"] == "hello"
@@ -388,10 +393,11 @@ async def test_next_page_button_queues_the_right_contact(conn, settings):
 
 # --- Phase 1: command results and the device poll ------------------------
 
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 
 
 def _queue(client, command_id="cmd-api", **kwargs):
+    kwargs.setdefault("device_id", DEVICE_ID)
     db.create_command(client.app.state.db_conn, command_id,
                       kwargs.pop("target", "+15551230000"),
                       kwargs.pop("body", "hi"), "miniapp", **kwargs)

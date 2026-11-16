@@ -11,12 +11,12 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app.main import create_app
+from tests.device_support import DEVICE_ID, DEVICE_TOKEN, seed_device
 
 TEST_ENV = {
     "TELEGRAM_BOT_TOKEN": "test-tg-token",
     "TELEGRAM_CHAT_ID": "test-chat-id",
     "ADMIN_TELEGRAM_USER_ID": "7",
-    "PHONE_A_TOKEN": "device-token",
     "ADMIN_TOKEN": "admin-token",
     "UVICORN_HOST": "127.0.0.1",
     "UVICORN_PORT": "8090",
@@ -33,4 +33,7 @@ def settings(tmp_path):
 @pytest.fixture
 def client(settings):
     with TestClient(create_app(settings, run_workers=False)) as test_client:
+        # Every test module expects one paired phone; the pairing flow
+        # itself is covered by tests/test_pairing.py.
+        seed_device(test_client.app.state.db_conn, DEVICE_ID, DEVICE_TOKEN)
         yield test_client

@@ -1,8 +1,9 @@
 import time
 
 import app.db as db
+from tests.device_support import device_headers
 
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 NOW = int(time.time())
 OLD = NOW - 400 * 86400
 
@@ -78,6 +79,20 @@ def test_import_dedupes_against_a_live_capture(client):
     conn = client.app.state.db_conn
     assert db.counts_by_state(conn) == {"pending": 1}
     assert db.count_jobs(conn) == 1
+
+
+def test_the_imported_history_is_never_forwarded(client):
+    """An import is history, not something to deliver to Telegram."""
+    assert post_import(client, [item()]).json()["imported"] == 1
+    conn = client.app.state.db_conn
+    assert db.counts_by_state(conn) == {"received": 1}
+
+    resumed = client.post("/admin/resume",
+                           headers={"Authorization": "Bearer admin-token"})
+    assert resumed.status_code == 200
+    assert resumed.json()["resumed"] == 0
+    assert db.counts_by_state(conn) == {"received": 1}
+    assert db.count_jobs(conn) == 0
 
 
 def test_import_accepts_old_timestamps_outside_the_live_window(client):

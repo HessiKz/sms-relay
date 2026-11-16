@@ -6,6 +6,9 @@ import pytest
 
 import app.db as db
 
+# The device every thread-scoped helper is called with.
+DEVICE = "device-a"
+
 
 def _msg(i, sender="555", body="hi"):
     return {"id": f"id-{i}", "sender": sender, "body": body, "received_at": 1_700_000_000 + i,
@@ -444,17 +447,18 @@ def test_chat_summaries_timeline_and_read_cursor(tmp_path):
     now = 1_700_000_000
     db.record_message(conn, {"id": "m1", "sender": "09121234567",
                              "body": "first", "received_at": now,
-                             "state": "delivered"})
+                             "state": "delivered", "device_id": DEVICE})
     db.record_message(conn, {"id": "m2", "sender": "09121234567",
                              "body": "second", "received_at": now + 10,
-                             "state": "delivered"})
-    db.replace_contacts(conn, [{"number": "+989121234567", "name": "Ali"}])
+                             "state": "delivered", "device_id": DEVICE})
+    db.replace_device_contacts(conn, DEVICE,
+                               [{"number": "+989121234567", "name": "Ali"}])
     db.create_command(conn, "c1", "09121234567", "outbound", "miniapp",
-                      thread_key="989121234567")
+                      thread_key="989121234567", device_id=DEVICE)
     conn.execute("UPDATE sms_commands SET created_at = ? WHERE id = 'c1'",
                  (now + 20,))
 
-    summaries = db.chat_summaries(conn)
+    summaries = db.chat_summaries(conn, DEVICE)
     assert len(summaries) == 1
     row = summaries[0]
     assert row["thread_key"] == "989121234567"
@@ -465,19 +469,20 @@ def test_chat_summaries_timeline_and_read_cursor(tmp_path):
     assert row["last_direction"] == "out"
     assert row["unread"] == 2  # seeded read cursor is 0 for new messages
 
-    assert db.mark_thread_read(conn, "989121234567", now) == now
-    assert db.chat_summaries(conn)[0]["unread"] == 1
+    assert db.mark_thread_read(conn, DEVICE, "989121234567", now) == now
+    assert db.chat_summaries(conn, DEVICE)[0]["unread"] == 1
     # the cursor never moves backwards
-    assert db.mark_thread_read(conn, "989121234567", now - 10) == now
-    assert db.chat_summaries(conn)[0]["unread"] == 1
+    assert db.mark_thread_read(conn, DEVICE, "989121234567", now - 10) == now
+    assert db.chat_summaries(conn, DEVICE)[0]["unread"] == 1
 
-    timeline = db.thread_timeline(conn, "989121234567")
+    timeline = db.thread_timeline(conn, DEVICE, "989121234567")
     assert [event["id"] for event in timeline] == ["cmd:c1", "msg:m2", "msg:m1"]
     assert [event["direction"] for event in timeline] == ["out", "in", "in"]
-    assert db.thread_timeline(conn, "989121234567", before_ts=now + 20) == [
+    assert db.thread_timeline(conn, DEVICE, "989121234567",
+                              before_ts=now + 20) == [
         event for event in timeline[1:]]
 
-    history = db.command_history(conn, "989121234567")
+    history = db.command_history(conn, "989121234567", device_id=DEVICE)
     assert [item["id"] for item in history] == ["c1"]
 
 
@@ -487,24 +492,125 @@ def test_chat_search_matches_name_number_and_body_and_escapes_wildcards(
     base = 1_700_000_000
     db.record_message(conn, {"id": "m1", "sender": "09121234567",
                              "body": "100% sure", "received_at": base,
-                             "state": "delivered"})
+                             "state": "delivered", "device_id": DEVICE})
     db.record_message(conn, {"id": "m2", "sender": "09120000003",
                              "body": "hello", "received_at": base + 1,
-                             "state": "delivered"})
-    db.replace_contacts(conn, [{"number": "09120000003", "name": "Alice"}])
+                             "state": "delivered", "device_id": DEVICE})
+    db.replace_device_contacts(conn, DEVICE,
+                               [{"number": "09120000003", "name": "Alice"}])
 
-    assert [row["thread_key"] for row in db.chat_summaries(conn, "sure")] == \
-        ["989121234567"]
-    assert [row["thread_key"] for row in db.chat_summaries(conn, "delaram")] == \
-        ["989120000003"]
-    assert [row["thread_key"] for row in db.chat_summaries(conn, "0939")] == \
-        ["989120000003"]
-    assert [row["thread_key"] for row in db.chat_summaries(conn, "100%")] == \
-        ["989121234567"]
+    assert [row["thread_key"] for row in
+            db.chat_summaries(conn, DEVICE, "sure")] == ["989121234567"]
+    assert [row["thread_key"] for row in
+            db.chat_summaries(conn, DEVICE, "delaram")] == ["989120000003"]
+    assert [row["thread_key"] for row in
+            db.chat_summaries(conn, DEVICE, "0939")] == ["989120000003"]
+    assert [row["thread_key"] for row in
+            db.chat_summaries(conn, DEVICE, "100%")] == ["989121234567"]
     # a wildcard is a literal, so "%" only matches the body containing it
-    assert [row["thread_key"] for row in db.chat_summaries(conn, "%")] == \
-        ["989121234567"]
-    assert db.chat_summaries(conn, "_") == []
+    assert [row["thread_key"] for row in
+            db.chat_summaries(conn, DEVICE, "%")] == ["989121234567"]
+    assert db.chat_summaries(conn, DEVICE, "_") == []
+
+
+def test_thread_timeline_cursor_never_skips_the_same_second(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    for index in range(5):
+        db.record_message(conn, {"id": f"m{index}", "sender": "09121234567",
+                                 "body": f"body {index}", "received_at": now,
+                                 "state": "delivered", "device_id": DEVICE})
+
+    page = db.thread_timeline(conn, DEVICE, "989121234567", limit=2)
+    assert [event["id"] for event in page] == ["msg:m4", "msg:m3"]
+    older = db.thread_timeline(conn, DEVICE, "989121234567", before_ts=now,
+                               before_id=page[-1]["id"], limit=2)
+    assert [event["id"] for event in older] == ["msg:m2", "msg:m1"]
+    oldest = db.thread_timeline(conn, DEVICE, "989121234567", before_ts=now,
+                                before_id=older[-1]["id"], limit=2)
+    assert [event["id"] for event in oldest] == ["msg:m0"]
+    # The timestamp-only cursor keeps the old behaviour for old clients.
+    assert db.thread_timeline(conn, DEVICE, "989121234567",
+                              before_ts=now) == []
+
+
+def test_thread_timeline_returns_more_than_one_public_page(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    for index in range(205):
+        db.record_message(conn, {"id": f"m{index}", "sender": "09121234567",
+                                 "body": "x", "received_at": now + index,
+                                 "state": "delivered", "device_id": DEVICE})
+    # A handler asks for one row more than it returns, so the helper must
+    # not cap the page at the public page size.
+    assert len(db.thread_timeline(conn, DEVICE, "989121234567",
+                                  limit=201)) == 201
+
+
+def test_chat_summaries_cursor_walks_the_whole_list(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    for index in range(5):
+        db.record_message(conn, {"id": f"m{index}",
+                                 "sender": f"0912123456{index}",
+                                 "body": "x", "received_at": now + index,
+                                 "state": "delivered", "device_id": DEVICE})
+
+    first = db.chat_summaries(conn, DEVICE, limit=2)
+    assert [row["thread_key"] for row in first] == ["989121234564",
+                                                    "989121234563"]
+    cursor = first[-1]
+    second = db.chat_summaries(conn, DEVICE, limit=2,
+                               before_ts=cursor["last_ts"],
+                               before_key=cursor["thread_key"])
+    assert [row["thread_key"] for row in second] == ["989121234562",
+                                                     "989121234561"]
+    third = db.chat_summaries(conn, DEVICE, limit=2,
+                              before_ts=second[-1]["last_ts"],
+                              before_key=second[-1]["thread_key"])
+    assert [row["thread_key"] for row in third] == ["989121234560"]
+
+
+def test_chat_summaries_cursor_without_a_key_does_not_repeat_a_row(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    # Three conversations that end in the same second.
+    for index in range(3):
+        db.record_message(conn, {"id": f"m{index}",
+                                 "sender": f"0912123456{index}",
+                                 "body": "x", "received_at": now,
+                                 "state": "delivered", "device_id": DEVICE})
+
+    first = db.chat_summaries(conn, DEVICE, limit=2)
+    assert [row["thread_key"] for row in first] == ["989121234560",
+                                                    "989121234561"]
+    cursor = first[-1]
+    # The timestamp alone is the strict cursor: the rows of that second
+    # are left behind instead of being handed out a second time.
+    strict = db.chat_summaries(conn, DEVICE, limit=10,
+                               before_ts=cursor["last_ts"])
+    assert strict == []
+    # With the key the page continues inside the same second.
+    keyed = db.chat_summaries(conn, DEVICE, limit=10,
+                              before_ts=cursor["last_ts"],
+                              before_key=cursor["thread_key"])
+    assert [row["thread_key"] for row in keyed] == ["989121234562"]
+
+
+def test_thread_timeline_cursor_without_an_id_does_not_repeat_a_row(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 1_700_000_000
+    for index in range(3):
+        db.record_message(conn, {"id": f"m{index}", "sender": "09121234567",
+                                 "body": "x", "received_at": now,
+                                 "state": "delivered", "device_id": DEVICE})
+
+    page = db.thread_timeline(conn, DEVICE, "989121234567", limit=2)
+    assert [event["id"] for event in page] == ["msg:m2", "msg:m1"]
+    # The timestamp alone is the strict cursor: no event is returned twice.
+    strict = db.thread_timeline(conn, DEVICE, "989121234567", before_ts=now,
+                                limit=10)
+    assert strict == []
 
 
 def test_device_seen_upserts_and_preserves_missing_fields(tmp_path):

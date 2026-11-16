@@ -28,10 +28,30 @@ object RoleState {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
         }
+        return isRoleAvailable(context) && isRoleHeld(context)
+    }
+
+    /**
+     * True when the phone knows the default-SMS-app role at all.
+     *
+     * A phone without telephony, or a vendor build that took the role
+     * away, has no role to ask for: the default apps settings are the
+     * only way left.
+     */
+    fun isRoleAvailable(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
         val roleManager = context.getSystemService(RoleManager::class.java) ?: return false
         return runCatching {
-            roleManager.isRoleAvailable(RoleManager.ROLE_SMS) &&
-                roleManager.isRoleHeld(RoleManager.ROLE_SMS)
+            roleManager.isRoleAvailable(RoleManager.ROLE_SMS)
+        }.getOrDefault(false)
+    }
+
+    /** True when this app holds the default-SMS-app role (Android 10+). */
+    fun isRoleHeld(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        val roleManager = context.getSystemService(RoleManager::class.java) ?: return false
+        return runCatching {
+            roleManager.isRoleHeld(RoleManager.ROLE_SMS)
         }.getOrDefault(false)
     }
 

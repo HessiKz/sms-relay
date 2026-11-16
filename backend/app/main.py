@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 
 import app.db as db
-from app import api, config, importer, ingest, miniapp, rev, security
+from app import api, config, importer, ingest, miniapp, pairing, rev, security
 from app.delivery import DeliveryWorker
 from app.tg import TelegramClient
 from app.updater import Updater
@@ -30,6 +30,9 @@ UPDATER_DISABLED_ENV = "RELAY_DISABLE_UPDATER"
 SHUTDOWN_TIMEOUT_S = 2.0
 SHUTDOWN_DRAIN_S = 0.5
 _BODY_METHODS = frozenset({"POST", "PUT"})
+# The pairing endpoints are public: the phone has no token yet, so a
+# malformed body there is a validation error and not an auth failure.
+PUBLIC_PATHS = frozenset({"/pair/start", "/pair/claim"})
 
 BACKEND_DIR = Path(__file__).resolve().parent
 MINIAPP_STATIC_DIR = BACKEND_DIR / "static" / "app"
@@ -198,8 +201,12 @@ def _rejected_bearer(request: Request, settings) -> bool:
         # No credential at all: the route dependency would reject it with
         # 401 anyway, so answer 401 instead of leaking the schema.
         return True
-    accepted = (settings.phone_a_token, settings.admin_token)
-    return not any(security.token_equal(presented, token) for token in accepted)
+    if security.token_equal(presented, settings.admin_token):
+        return False
+    conn = getattr(getattr(request.app, "state", None), "db_conn", None)
+    if conn is not None and db.device_by_token(conn, presented) is not None:
+        return False
+    return True
 
 
 def _updater_disabled() -> bool:
@@ -235,7 +242,9 @@ def create_app(settings, *, run_workers=True) -> FastAPI:
             if not _updater_disabled():
                 updater = Updater(app.state.db_conn, app.state.settings,
                                   app.state.poll_tg, poke_event=poke,
-                                  on_change=lambda: rev.bump_rev(app))
+                                  on_change=lambda device_id=None,
+                                  thread_key=None: rev.bump_rev(
+                                      app, device_id, thread_key))
                 tasks.append(asyncio.create_task(updater.run(stop),
                                                  name="updater"))
                 app.state.updater = updater
@@ -282,7 +291,7 @@ def create_app(settings, *, run_workers=True) -> FastAPI:
                 content={"detail": {"error": "validation_error",
                                     "fields": _validation_fields(exc)}},
             )
-        if _rejected_bearer(request, settings):
+        if request.url.path not in PUBLIC_PATHS and _rejected_bearer(request, settings):
             return JSONResponse(status_code=401,
                                 content={"detail": "unauthorized"},
                                 headers={"WWW-Authenticate": "Bearer"})
@@ -300,6 +309,9 @@ def create_app(settings, *, run_workers=True) -> FastAPI:
     )
     app.include_router(api.build_router(settings))
     app.include_router(miniapp.build_router(settings))
+    # The pairing endpoints are public: the phone has no token yet.
+    app.include_router(pairing.build_router(settings))
+    app.include_router(pairing.build_miniapp_router(settings))
 
     app.mount("/app/assets", StaticFiles(directory=str(MINIAPP_ASSETS_DIR)),
               name="miniapp-assets")

@@ -7,8 +7,9 @@ import pytest
 
 import app.db as db
 from tests.miniapp_support import headers
+from tests.device_support import DEVICE_ID, device_headers
 
-DEVICE_HEADERS = {"Authorization": "Bearer device-token"}
+DEVICE_HEADERS = device_headers()
 ADMIN = headers()
 THREAD = "989121234567"  # 09121234567
 OTHER_THREAD = "989120000003"  # 09120000003
@@ -25,9 +26,10 @@ def _upload_contacts(client, contacts):
 
 
 def _send(client, thread, body="hello", ref="ref-00000001", sub_id=0,
-          confirm_unknown=False):
+          confirm_unknown=False, device_id=DEVICE_ID):
     return client.post(
-        "/app/api/chats/" + quote(thread, safe="") + "/messages",
+        f"/app/api/devices/{device_id}/chats/"
+        + quote(thread, safe="") + "/messages",
         json={
             "body": body,
             "client_ref": ref,
@@ -225,7 +227,7 @@ def test_paused_relay_still_queues_and_body_limits(client):
                                       "ref-paused-01")
     assert stored["body"] == long_body
     assert stored["status"] == "pending"
-    queued = db.pending_commands(client.app.state.db_conn)
+    queued = db.pending_commands(client.app.state.db_conn, DEVICE_ID)
     assert [row["id"] for row in queued] == [stored["id"]]
 
     maxed = _send(client, THREAD, body="y" * 1600, ref="ref-long-1600")
@@ -251,7 +253,8 @@ def test_invalid_body_and_client_ref_are_422(client, body, ref):
 
 
 def test_send_endpoint_requires_init_data(client):
-    response = client.post("/app/api/chats/" + THREAD + "/messages", json={
+    response = client.post(f"/app/api/devices/{DEVICE_ID}/chats/{THREAD}"
+                            "/messages", json={
         "body": "hi", "client_ref": "ref-noauth-1"})
     assert response.status_code == 401
     assert _rows(client) == []

@@ -11,7 +11,7 @@
   <script type="module" src="assets/app.js"></script>
 </head>
 <body>
-  <div id="app" class="app">
+  <div id="app" class="app" data-route="devices">
     <div id="splash" class="splash" role="status" aria-live="polite">
       <div class="splash-card">
         <p id="splash-title" class="splash-title">Loading SMS Relay…</p>
@@ -19,38 +19,59 @@
       </div>
     </div>
 
-    <section id="list-pane" class="pane list-pane" aria-label="Conversations">
+    <section id="devices-pane" class="pane devices-pane" aria-label="Devices">
       <header class="pane-header">
         <div class="list-heading">
-          <h1 class="title">Inbox</h1>
-          <button id="new-chat-button" class="new-chat-button" type="button">
-            New conversation
+          <h1 class="title">Devices</h1>
+          <button id="add-device-button" class="new-chat-button" type="button">
+            Add device
           </button>
         </div>
         <p id="me-line" class="muted"></p>
+        <p id="paused-indicator" class="paused-indicator" role="status" hidden>
+          Relay is paused. New messages will queue on the phone.
+        </p>
+        <p id="devices-status" class="status-line" role="status" aria-live="polite"></p>
+      </header>
+      <ul id="device-list" class="device-list" aria-label="Device list"></ul>
+    </section>
+
+    <section id="chats-pane" class="pane chats-pane" aria-label="Conversations">
+      <header class="pane-header">
+        <div class="list-heading">
+          <button id="chats-back" class="back-button" type="button"
+                  aria-label="Back to devices">Back</button>
+          <div class="thread-heading">
+            <h2 id="chats-device-name" class="title">Conversations</h2>
+            <p id="chats-device-status" class="muted"></p>
+          </div>
+          <button id="new-chat-button" class="new-chat-button" type="button">
+            New
+          </button>
+        </div>
         <form id="search-form" class="search-form" role="search">
           <label class="visually-hidden" for="search">Search conversations</label>
           <input id="search" class="search-input" type="search" inputmode="search"
                  autocomplete="off" spellcheck="false" maxlength="100"
-                 placeholder="Search name, number or text">
+                 placeholder="Search this device">
         </form>
       </header>
-      <p id="paused-indicator" class="paused-indicator" role="status" hidden>
-        Relay is paused. New messages will queue on the phone.
-      </p>
+      <p id="chats-banner" class="paused-indicator" role="status" hidden></p>
       <p id="list-status" class="status-line" role="status" aria-live="polite"></p>
       <ul id="chat-list" class="chat-list" aria-label="Conversation list"></ul>
     </section>
 
-    <section id="thread-pane" class="pane thread-pane" aria-label="Conversation" hidden>
+    <section id="thread-pane" class="pane thread-pane" aria-label="Conversation">
       <header class="thread-header">
         <button id="back-button" class="back-button" type="button"
                 aria-label="Back to conversations">Back</button>
         <div class="thread-heading">
           <h2 id="thread-name" class="thread-name"></h2>
           <p id="thread-number" class="muted"></p>
+          <p id="thread-device" class="muted"></p>
         </div>
       </header>
+      <p id="thread-banner" class="paused-indicator" role="status" hidden></p>
       <div id="timeline-status" class="status-line" role="status" aria-live="polite"></div>
       <ol id="timeline" class="timeline" aria-label="Messages"></ol>
       <form id="composer" class="composer" aria-label="Send a message">
@@ -68,12 +89,78 @@
         <p id="composer-paused" class="composer-hint" hidden>
           Relay is paused. The message will still be queued.
         </p>
+        <p id="composer-disabled" class="composer-hint" hidden></p>
         <p id="composer-error" class="composer-error" role="alert" hidden></p>
         <button id="composer-retry" class="retry-button" type="button" hidden>
           Retry
         </button>
       </form>
     </section>
+
+    <div id="device-menu" class="dialog-backdrop" hidden>
+      <div class="dialog-card" role="dialog" aria-modal="true"
+           aria-labelledby="device-menu-title">
+        <h2 id="device-menu-title" class="dialog-title">Device</h2>
+        <p id="device-menu-sub" class="muted"></p>
+        <div class="dialog-form">
+          <label class="field-label" for="device-rename-name">Name</label>
+          <input id="device-rename-name" class="field-input" type="text"
+                 autocomplete="off" maxlength="64" placeholder="Device name">
+          <button id="device-rename-save" class="secondary-button" type="button">
+            Save name
+          </button>
+          <button id="device-default" class="secondary-button" type="button">
+            Default for bot
+          </button>
+          <button id="device-revoke" class="danger-button" type="button">
+            Revoke device
+          </button>
+        </div>
+        <p id="device-menu-error" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="device-menu-cancel" class="secondary-button" type="button">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="pair-sheet" class="dialog-backdrop" hidden>
+      <div class="dialog-card" role="dialog" aria-modal="true"
+           aria-labelledby="pair-title">
+        <h2 id="pair-title" class="dialog-title">Add a device</h2>
+        <p class="muted">
+          On the phone open the relay app and choose “Pair this phone”.
+          Scan the QR code it shows, or paste the pairing code below.
+        </p>
+        <button id="pair-scan" class="send-button" type="button">
+          Scan QR code
+        </button>
+        <form id="pair-form" class="dialog-form">
+          <label class="field-label" for="pair-code">Pairing code</label>
+          <input id="pair-code" class="field-input" type="text"
+                 autocomplete="off" spellcheck="false" maxlength="200"
+                 placeholder="pair_…">
+          <button id="pair-submit" class="secondary-button" type="submit">
+            Show device
+          </button>
+        </form>
+        <p id="pair-error" class="dialog-error" role="alert" hidden></p>
+        <div id="pair-preview" class="pair-preview" hidden>
+          <p id="pair-preview-name" class="pair-preview-name"></p>
+          <p id="pair-preview-meta" class="muted"></p>
+          <p id="pair-preview-code" class="muted"></p>
+        </div>
+        <div class="dialog-actions">
+          <button id="pair-cancel" class="secondary-button" type="button">
+            Cancel
+          </button>
+          <button id="pair-approve" class="send-button" type="button" hidden>
+            Approve
+          </button>
+        </div>
+      </div>
+    </div>
 
     <div id="new-chat-dialog" class="dialog-backdrop" hidden>
       <div class="dialog-card" role="dialog" aria-modal="true"
@@ -84,6 +171,8 @@
           <input id="new-chat-number" class="field-input" type="tel"
                  inputmode="tel" autocomplete="off" maxlength="32"
                  placeholder="+98 912 123 4567">
+          <ul id="new-chat-suggestions" class="suggestion-list"
+              aria-label="Contacts"></ul>
           <label class="field-label" for="new-chat-body">Message</label>
           <textarea id="new-chat-body" class="field-input" rows="3"
                     maxlength="1600" placeholder="Message"></textarea>

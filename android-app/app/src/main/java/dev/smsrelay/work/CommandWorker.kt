@@ -43,8 +43,13 @@ class CommandWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val settings = SettingsStore(applicationContext)
-        if (settings.baseUri.isBlank()) return@withContext Result.success()
-        val client = RelayClient(settings.baseUri, settings.token)
+        val token = settings.token
+        if (token.isBlank() || settings.baseUri.isBlank()) {
+            // The phone is not paired: it asks the server for nothing.
+            // The chain is started again after the pairing.
+            return@withContext Result.success()
+        }
+        val client = RelayClient(settings.baseUri, token) { settings.handleUnauthorized() }
         val dao = CommandDatabase.get(applicationContext).handledCommandDao()
         var retryNeeded = false
 
@@ -56,6 +61,11 @@ class CommandWorker(
                 retryNeeded = true
             }
         }
+
+        // The device may have been removed on the server while the
+        // results were reported: no request is made with a token that
+        // the server does not accept.
+        if (settings.token.isBlank()) return@withContext Result.success()
 
         // 2) Commands whose execution was interrupted (the app was killed
         //    between taking the command and the radio call). They are
@@ -79,7 +89,11 @@ class CommandWorker(
         }
 
         // 3) New commands.
-        for (command in client.fetchCommands(deviceInfo(settings))) {
+        val commands = client.fetchCommands(deviceInfo(settings))
+        // The device may have been removed on the server while the poll
+        // was running: no command is executed with a dead token.
+        if (settings.token.isBlank()) return@withContext Result.success()
+        for (command in commands) {
             // The local guard: a command that was handled before is never
             // executed a second time.
             if (dao.findById(command.id) != null) continue

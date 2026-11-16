@@ -71,14 +71,28 @@ sealed class ImportResult {
  *
  * Every request is built inside a try block: a server URL that the user
  * emptied in the settings must not crash the app.
+ *
+ * [onUnauthorized] is called when the server refuses the token of this
+ * device. That means the device was removed in the admin app, or the
+ * server was reset: the caller drops the token and asks the user to pair
+ * again. The token itself is never logged or reported.
  */
 class RelayClient(
     private val baseUri: String,
     private val token: String,
-    private val client: OkHttpClient = defaultClient()
+    private val client: OkHttpClient = defaultClient(),
+    private val onUnauthorized: (() -> Unit)? = null
 ) {
 
+    /**
+     * The client only talks to the server with a token. Without one the
+     * device is not paired and no request is made at all.
+     */
+    private val authorized: Boolean
+        get() = token.isNotBlank()
+
     fun upload(record: MessageRecord): ApiResult {
+        if (!authorized) return ApiResult.Unreachable(REASON_NO_TOKEN)
         val payload = JSONObject().apply {
             put("id", record.id)
             put("sender", record.sender)
@@ -109,6 +123,7 @@ class RelayClient(
      */
     fun fetchStates(ids: List<String>): Map<String, BackendState> {
         if (ids.isEmpty()) return emptyMap()
+        if (!authorized) return emptyMap()
         return try {
             val request = Request.Builder()
                 .url(endpoint("sms-state") + "?ids=" +
@@ -117,6 +132,7 @@ class RelayClient(
                 .get()
                 .build()
             client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
                 if (!response.isSuccessful) return emptyMap()
                 val text = response.body?.string().orEmpty()
                 val json = runCatching { JSONObject(text) }.getOrNull()
@@ -149,6 +165,7 @@ class RelayClient(
      * response only costs one duplicate request.
      */
     fun importBatch(messages: List<ImportMessage>): ImportResult {
+        if (!authorized) return ImportResult.Unreachable(REASON_NO_TOKEN)
         val items = JSONArray()
         for (message in messages) {
             items.put(
@@ -171,8 +188,10 @@ class RelayClient(
             client.newCall(request).execute().use { response ->
                 val text = response.body?.string().orEmpty()
                 when {
-                    response.code == 401 || response.code == 403 ->
+                    response.code == 401 || response.code == 403 -> {
+                        onUnauthorized?.invoke()
                         ImportResult.Unauthorized
+                    }
                     response.isSuccessful -> {
                         val json = runCatching { JSONObject(text) }.getOrNull()
                         ImportResult.Accepted(
@@ -226,6 +245,7 @@ class RelayClient(
      * advisory, so a malformed value can never break the poll.
      */
     fun fetchCommands(deviceInfo: String? = null): List<RelayCommand> {
+        if (!authorized) return emptyList()
         return try {
             val builder = Request.Builder()
                 .url(endpoint("commands"))
@@ -235,6 +255,7 @@ class RelayClient(
             }
             val request = builder.get().build()
             client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
                 if (!response.isSuccessful) return emptyList()
                 val text = response.body?.string().orEmpty()
                 val json = runCatching { JSONObject(text) }.getOrNull() ?: return emptyList()
@@ -273,6 +294,7 @@ class RelayClient(
      * Returns false when the upload did not arrive.
      */
     fun uploadContacts(contacts: List<Contact>): Boolean {
+        if (!authorized) return false
         val array = JSONArray()
         for (contact in contacts) {
             val number = contact.number.trim()
@@ -295,7 +317,10 @@ class RelayClient(
                 .addHeader("Authorization", "Bearer $token")
                 .post(payload.toString().toRequestBody(JSON))
                 .build()
-            client.newCall(request).execute().use { response -> response.isSuccessful }
+            client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
+                response.isSuccessful
+            }
         } catch (e: IOException) {
             false
         } catch (e: RuntimeException) {
@@ -311,6 +336,7 @@ class RelayClient(
      * again later instead of losing the outcome.
      */
     fun reportCommandResult(id: String, status: String, detail: String?): Boolean {
+        if (!authorized) return false
         val payload = JSONObject().apply {
             put("status", status)
             if (!detail.isNullOrBlank()) put("detail", detail)
@@ -321,7 +347,10 @@ class RelayClient(
                 .addHeader("Authorization", "Bearer $token")
                 .post(payload.toString().toRequestBody(JSON))
                 .build()
-            client.newCall(request).execute().use { response -> response.isSuccessful }
+            client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
+                response.isSuccessful
+            }
         } catch (e: IOException) {
             false
         } catch (e: RuntimeException) {
@@ -335,7 +364,10 @@ class RelayClient(
         client.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             when {
-                response.code == 401 || response.code == 403 -> ApiResult.Unauthorized
+                response.code == 401 || response.code == 403 -> {
+                    onUnauthorized?.invoke()
+                    ApiResult.Unauthorized
+                }
                 response.isSuccessful -> {
                     val json = runCatching { JSONObject(text) }.getOrNull()
                     ApiResult.Accepted(
@@ -371,6 +403,9 @@ class RelayClient(
 
     companion object {
         private val JSON = "application/json; charset=utf-8".toMediaType()
+
+        /** Why a request was not made at all. */
+        const val REASON_NO_TOKEN = "no token"
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
