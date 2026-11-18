@@ -32,6 +32,20 @@ sealed class PairClaimResult {
     /** The admin approved the code: this is the only answer with a token. */
     data class Claimed(val token: String) : PairClaimResult()
 
+    /**
+     * The admin approved the pairing, but the server hands the token out
+     * only after the user confirmed the pairing on this phone. The names
+     * are the ones the server reported; nothing here is a secret.
+     */
+    data class ConfirmationRequired(
+        val deviceName: String,
+        val approverName: String,
+        val approverUsername: String
+    ) : PairClaimResult()
+
+    /** The pairing was cancelled: there is no token to collect. */
+    object Cancelled : PairClaimResult()
+
     /** The code was already collected by somebody else. */
     object AlreadyClaimed : PairClaimResult()
 
@@ -107,11 +121,26 @@ class PairingClient(
 
     /**
      * Asks the server whether the admin approved the code yet.
+     *
+     * [confirmed] is null while the phone is still waiting and when it
+     * merely polls. It is true only when the user confirmed the pairing
+     * on this phone, and false when the user turned it down.
+     *
+     * The field is always sent, so a poll carries an explicit
+     * `"confirmed": null`. The server answers that with a pending or an
+     * awaiting-confirmation status and never with a token; it only hands
+     * the token out for `confirmed: true`. Older servers ignore the
+     * unknown field and keep their immediate-token behaviour.
      */
-    fun claim(pairingId: String, claimSecret: String): PairClaimResult {
+    fun claim(
+        pairingId: String,
+        claimSecret: String,
+        confirmed: Boolean? = null
+    ): PairClaimResult {
         val payload = JSONObject().apply {
             put("pairing_id", pairingId)
             put("claim_secret", claimSecret)
+            put("confirmed", confirmed ?: JSONObject.NULL)
         }
         return try {
             val request = Request.Builder()
@@ -120,15 +149,40 @@ class PairingClient(
                 .build()
             client.newCall(request).execute().use { response ->
                 val text = response.body?.string().orEmpty()
+                val json = runCatching { JSONObject(text) }.getOrNull()
                 when {
-                    response.code == 202 -> PairClaimResult.Pending
+                    response.code == 202 -> {
+                        // Pending, or approved and waiting for the user to
+                        // confirm on this phone. The names in that answer
+                        // are shown in the dialog; the token is not there.
+                        if (json?.optString("status").orEmpty().trim() ==
+                            STATUS_AWAITING_CONFIRMATION
+                        ) {
+                            val approver = json?.optJSONObject("approved_by")
+                            PairClaimResult.ConfirmationRequired(
+                                deviceName = json?.optJSONObject("device")
+                                    ?.optString("name").orEmpty().trim(),
+                                approverName = approver?.optString("name")
+                                    .orEmpty().trim(),
+                                approverUsername = approver?.optString("username")
+                                    .orEmpty().trim()
+                            )
+                        } else {
+                            PairClaimResult.Pending
+                        }
+                    }
+
                     response.code == 409 -> PairClaimResult.AlreadyClaimed
                     response.code == 410 -> PairClaimResult.Expired
                     response.code == 401 || response.code == 403 || response.code == 404 ->
                         PairClaimResult.Invalid(response.code)
 
                     response.isSuccessful -> {
-                        val json = runCatching { JSONObject(text) }.getOrNull()
+                        if (json?.optString("status").orEmpty().trim() ==
+                            STATUS_CANCELLED
+                        ) {
+                            return@use PairClaimResult.Cancelled
+                        }
                         val token = json?.optString("token").orEmpty().trim()
                         if (token.isEmpty()) {
                             PairClaimResult.Invalid(response.code)
@@ -154,5 +208,11 @@ class PairingClient(
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
         private const val PLATFORM = "android"
+
+        /** The server approved the pairing and wants the phone to confirm. */
+        private const val STATUS_AWAITING_CONFIRMATION = "awaiting_phone_confirmation"
+
+        /** The pairing was cancelled on the server. */
+        private const val STATUS_CANCELLED = "cancelled"
     }
 }

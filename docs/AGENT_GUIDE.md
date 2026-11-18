@@ -24,8 +24,10 @@ A multi-device SMS bridge for a single admin:
   hand-shake before it may talk to it.
 - **Backend (VPS)** receives, stores and filters messages, and posts one short
   notification per inbound SMS to one private Telegram chat: device name,
-  sender, UTC time, and an "Open chat" button. The SMS body never goes to
-  Telegram; it lives in SQLite and in the Mini App. Every notification
+  sender, a `Code:` line when a plausible code is found, a 160-character
+  one-line snippet of the body, and an "Open chat" button. Only that snippet
+  and the extracted code go to Telegram; the full body stays in SQLite and in
+  the Mini App, which is where the message is read in full. Every notification
   carries the name of the device that captured it. It mirrors the call log,
   holds the live call of each device and the queue of remote call actions, and
   posts one bounded message for a ringing or a missed call. It also runs the
@@ -72,21 +74,26 @@ own bearer token.
    and the short scan code only: never a token, never the claim secret. The
    scan code and the claim secret are stored as SHA-256 digests, the claim
    secret never leaves the phone, and the device token is issued exactly
-   once, in the answer of `POST /pair/claim`. A revoked or archived device
-   is refused by the token lookup, so a device that gets a 401 has to pair
-   again.
+   once, in the answer of `POST /pair/claim` — and only after the user on the
+   phone confirmed the approver it was shown (`confirmed: true`). A revoked or
+   archived device is refused by the token lookup, so a device that gets a 401
+   has to pair again.
 4. **Commands are never broadcast; ownership is strict.** A command belongs
    to exactly one device. The phone only polls the commands of its own
    device, and a result report for a command of another device is answered
    with 404 so a phone cannot even learn that the command exists.
 5. **Durability before network.** Android writes to Room before uploading.
    The backend writes `messages` + `jobs` before calling Telegram.
-   **The body never leaves the relay over Telegram.** `DeliveryWorker` sends a
-   notification (device, sender, UTC time, Mini App button), never
-   `messages.body`. Do not add the body back to the notification, and do not
-   log it.
+   **The notification carries a snippet of the body, never the whole body.**
+   `DeliveryWorker` sends the device, the sender, one `Code:` line when
+   `extract_code()` finds a plausible one, and `body_snippet()` — the body
+   collapsed to one line and cut to 160 characters — plus a Mini App button.
+   Only that snippet and the extracted code leave the relay over Telegram; the
+   full `messages.body` never does, and it must not be added back. Neither the
+   body nor the snippet nor the code is ever logged.
 6. **No message body in logs.** Log ids, kinds, counts, and state, never SMS
-   text, phone numbers, contact names, tokens, or initData.
+   text, the notification snippet, an extracted code, phone numbers, contact
+   names, tokens, or initData.
 7. **Fallback is conservative.** Only a confirmed backend `failed` state (or a
    local permanent 4xx rejection with no backend row) authorizes the cellular
    fallback. `timeout`, `network`, `uncertain`, `429`, and `5xx` never do.
@@ -156,6 +163,10 @@ first 11 characters are kept in `devices.token_prefix` for the UI).
   - `status` is `pending`, `approved`, `claimed`, `expired` or `cancelled`.
   - The token is issued exactly once: `claimed_at` is set in the same
     transaction that writes `devices.token_hash`.
+  - `approved_by` is the Telegram user id of the admin, `approved_by_name`
+    (`first_name`, cleaned) and `approved_by_username` (cleaned) are the
+    approver shown on the phone. Both are additive, nullable columns, and a
+    blank value is valid: the phone then says "Approved in the Mini App".
 - `device_contacts`: the contact list of one device, primary key
   `(device_id, number)`.
 - `thread_reads_scoped`: the read markers of one device, primary key
@@ -191,6 +202,18 @@ first 11 characters are kept in `devices.token_prefix` for the UI).
     writes it and clears `telegram_msg_id`/`telegram_delete_at`.
   - `idx_messages_tg_delete` is a partial index on `telegram_delete_at`, so
     `db.due_notifications()` scans only the live deadlines.
+- `tg_messages`: the bot's own chatter notes ("✅ SMS sent to …", failures,
+  rejections, the bot's replies) that must be deleted again.
+  - `chat_id`, `message_id`, `kind` (`command_result`, `updater`, …),
+    `delete_at`, `deleted_at`, `created_at`. A note is **not** an SMS
+    notification and has no `messages` row, so it cannot live on `messages`.
+  - `record_tg_message()` is called from `api.py` (a command result) and
+    `updater.py` (a reply) with `now + TG_NOTE_TTL_S`, and `TG_NOTE_TTL_S` is
+    **3600 s** in `delivery.py`. Change the constant, not the two call sites.
+  - `due_tg_messages()` feeds `NotificationReaper._reap_notes()`;
+    `mark_tg_message_deleted()` keeps the row as a tombstone and
+    `reschedule_tg_message()` pushes it back 300 s.
+  - `idx_tg_messages_due` on `delete_at` keeps the scan cheap.
 - `jobs`: one row per message that still needs forwarding. It has its own
   `attempts`, `next_attempt_at`, and `locked_at`. A job lock older than 300 s
   is stale and can be reclaimed after a crash.
@@ -304,8 +327,9 @@ imported sent history ─► sms_commands, status='sent'  (terminal, no job)
   why the duplicate capture has to be stopped in Android, not here: 1.3.3
   ignores `SMS_RECEIVED` while the app holds the default-SMS role.
 - Delivered means "the notification was accepted", not "every chunk was
-  sent". The body is not part of the Telegram message any more, so there is
-  no chunking on the delivery path and no partial-send retry.
+  sent". The notification carries only a 160-character snippet and the
+  extracted code, so there is no chunking on the delivery path and no
+  partial-send retry.
 
 ### Delivery and the notification reaper
 
@@ -318,19 +342,37 @@ Two tasks run when workers are enabled (`main.create_app(run_workers=True)`):
 
 `DeliveryWorker._deliver()`:
 
-1. `_notification_text(row)` builds four lines: `📥 New SMS`, `📱 <device>`,
-   the sender, and the UTC timestamp. The device name comes from
+1. `_notification_text(row)` builds the message: `📥 <b>New SMS</b>`,
+   `📱 <b><device></b>`, the sender, a `Code: <b>…</b>` line when a code was
+   found (and the snippet does not already show it in full), and the snippet
+   in `<i>…</i>`. There is no date or time line: the chat stamps every
+   message. The device name comes from
    `db.device_by_id` (fallback `Unknown device`); the sender from
    `_sender_label()`: `db.device_contact_name_for_key()` first, then
    `sender_name` from the phone, then `phones.display_number(thread_key)`,
    then the raw sender. Both lookups are wrapped: a failure logs a warning and
    degrades to the fallback, it never fails the delivery.
-2. `delivery.thread_url(miniapp_url, thread_key, device_id)` builds the
+2. `body_snippet(body, SNIPPET_MAX=160)` collapses whitespace runs into single
+   spaces and cuts the result to 160 characters (no ellipsis); the caller
+   HTML-escapes it.
+3. `extract_code(body)` returns the first plausible one-time code or `None`:
+   a standalone 4–8 character token with at least one digit. It is
+   deliberately conservative and skips a candidate that is a date
+   (`_DATE_LIKE`), part of a phone number (`_names_a_phone`, runs of 8+
+   digits), an amount (`_is_amount`, currency chars or words around it), the
+   visible tail of a masked card/account (`_is_masked_digits`: `*`, `x`, `X`,
+   `•` immediately before it), or an identifier introduced by a label word
+   (`_names_an_identifier`: `card`, `a/c`, `acct`, `account`, `order`, `ref`,
+   `reference`, `txn`, `transaction`, `invoice`, `bill`, `policy`, `ticket`,
+   with at most three small link words such as `ending`, `no`, `last`, `is`
+   between). `_snippet_shows_code()` decides whether the snippet already
+   carries the whole token; a truncated snippet does not count as showing it.
+4. `delivery.thread_url(miniapp_url, thread_key, device_id)` builds the
    `Open chat` `web_app` button. No URL means no button; the notification is
    still sent.
-3. One `send_to_chat(..., parse_mode="HTML")`. The result must carry an int
+5. One `send_to_chat(..., parse_mode="HTML")`. The result must carry an int
    `message_id`; anything else is `api_error`.
-4. `db.update_state(..., "delivered", telegram_msg_id=...)` then
+6. `db.update_state(..., "delivered", telegram_msg_id=...)` then
    `db.mark_message_notified()`. The bookkeeping is wrapped separately: the
    notification is already in the chat, so a failure there must not turn a
    delivered message into a retry (which would post it twice).
@@ -350,6 +392,22 @@ Two tasks run when workers are enabled (`main.create_app(run_workers=True)`):
    REAPER_RETRY_S=300)` and a warning; one row never stops the loop.
 5. The cycle itself is wrapped: an exception logs `reaper cycle aborted` and
    the loop sleeps again.
+
+The same `run_once()` then calls `_reap_notes(now)`, which deletes the bot's
+chatter notes from `tg_messages`:
+
+1. `db.due_tg_messages(now, limit=batch)` — `delete_at <= now`,
+   `deleted_at` NULL, ordered by deadline.
+2. `int(message_id)`; a value that is not an int clears the row (`bad_id`).
+3. `tg.delete_message(row["chat_id"], message_id)` — the chat id comes from the
+   note's own row, because a note may have gone to another chat.
+4. `ValueError`, a `TGError` of kind `bad_request`, and "not found" →
+   `db.mark_tg_message_deleted()`. Any other `TGError` or exception →
+   `db.reschedule_tg_message(now, REAPER_RETRY_S=300)` and a warning.
+5. Notes are tracked with `TG_NOTE_TTL_S = 3600`: `api.py` records a
+   `command_result` note after an accepted `sent`/`failed`/`rejected` report,
+   and `updater.py` records its own replies. A `delivered` report posts no
+   note by design.
 
 `deleteMessage` limits: the bot may delete only messages it posted itself, in
 a chat where it has the right, and never a message older than **48 hours**.
@@ -431,7 +489,22 @@ Pairing (public, no token, rate limited per address):
 | Route | Purpose |
 |---|---|
 | `POST /pair/start` | the phone asks for a pairing; answer: `pairing_id`, `scan_code`, `qr_payload`, `expires_at`. No token. |
-| `POST /pair/claim` | the phone polls with its claim secret; `202` = waiting for the admin, `200` = the token, exactly once. |
+| `POST /pair/claim` | the phone polls with its claim secret. `202 {"status":"pending"}` = waiting for the admin. `202 {"status":"awaiting_phone_confirmation","device":…,"approved_by":{"name":…,"username":…}}` = approved, the phone's user has to confirm. `200 {"status":"claimed","token":…,"device":…}` = the token, exactly once, after `confirmed: true`. `confirmed: false` cancels the pairing (no token). `confirmed` absent = an older APK, the token is issued on the first approved poll. |
+
+`PairClaimBody.confirmed` is `bool | None`. The decision is three-way and must
+stay that way:
+
+- `False` → `db.pairing_cancel()`, `{"status": "cancelled"}`, no token, and the
+  admin's approval is withdrawn too.
+- Present but not `True` (`null` while polling) → `202
+  awaiting_phone_confirmation` with `device` (from `db.device_by_id`, or the
+  pairing row when the device is gone) and `approved_by`
+  (`approved_by_name`/`approved_by_username`). Nothing secret is in this
+  answer.
+- `True` → `db.claim_pairing()` issues the token exactly once.
+- Absent (`"confirmed" not in payload.model_fields_set`) → the legacy path:
+  the token is issued on the first approved poll, exactly as before. Do not
+  turn an absent field into an error: old APKs still poll that way.
 
 Mini App pairing and devices (admin only):
 
@@ -693,8 +766,19 @@ Pairing and secrets:
   requests; it is never part of the QR code and never logged.
 - `PairingController` owns the state of a running pairing (it survives a
   restart of the app through the settings), polls every 2 s, and writes the
-  token into `TokenStore` the moment the claim succeeds. A generation
-  counter makes a stale answer harmless.
+  token into `TokenStore` only after the phone's user tapped Pair — the claim
+  the `202 awaiting_phone_confirmation` answer ends with is the one that
+  returns it. A generation counter makes a stale answer harmless.
+- The claim is **confirmed on the phone**. `PairingClient.claim(...)` sends
+  `confirmed: null` while polling, `true` after the user tapped Pair and
+  `false` when the dialog was cancelled, dismissed, or could not be shown
+  (`MainActivity.onPairingConfirmationRequired`). `MainActivity` draws the
+  dialog with `setCancelable(false)` and
+  `setCanceledOnTouchOutside(false)` and names the server URL, the device and
+  the approver from `approved_by.name` / `approved_by.username`; a dismissal
+  without an answer is a `false`, never a silent pairing. `respond(false)` is
+  also the answer when the activity is finishing, so no token is stored
+  without consent.
 - `QrCode` renders the payload the server returned; the phone needs no
   camera permission of its own.
 - A 401 (or 403) from the backend calls `SettingsStore.handleUnauthorized()`:
@@ -703,10 +787,13 @@ Pairing and secrets:
   can be paired again.
 - Changing the base URL invalidates the token (`invalidateForNewServer()`,
   state `server_changed`): a token belongs to one server only.
-- The default-SMS-role request uses the `RoleManager` on Android 10+ and
-  the platform intent on Android 8/9, and it re-reads the role instead of
-  trusting the result code, because a vendor build can refuse the change
-  without a word.
+- The default-SMS-role request uses the `RoleManager` on Android 10+, the
+  `ACTION_CHANGE_DEFAULT` intent on Android 8/9 and the default-apps settings
+  as the last fallback, and it re-reads the role instead of trusting the
+  result code, because a vendor build can refuse the change without a word.
+- The dialer role is requested **before** its permissions: a denial used to
+  hide the role dialog for good. `askRolePermissions()` runs after the role
+  result (or immediately when the role dialog could not be shown).
 
 Android capture invariant (1.3.3, versionCode 8, commit `149504e`):
 
@@ -768,15 +855,15 @@ deliberately separate from the relay's Room queue:
 
 | Component | Does | Does not |
 |---|---|---|
-| `SmsRepository.conversations()` | reads `content://mms-sms/conversations?simple=true` (`_id, date, recipient_ids, snippet`, `date DESC`), resolves **every** `recipient_ids` entry through `content://mms-sms/canonical-addresses` (per-call cache), merges contact names, unread counts | touch Room, write anything |
+| `SmsRepository.conversations()` | reads `content://mms-sms/conversations?simple=true` (`_id, date, recipient_ids, snippet`, `date DESC`), resolves **every** `recipient_ids` entry through `content://mms-sms/canonical-addresses` (per-call cache), falls back to the first SMS row's `ADDRESS` for a one-to-one thread (`ADDRESS_FALLBACK_LIMIT = 300` reads), keeps an unresolvable thread as "Unknown" with its real `thread_id`, merges contact names, unread counts | drop a thread it cannot name, touch Room, write anything |
 | `SmsRepository.messages()` | `content://sms` where `thread_id = ?`, newest first, `MESSAGE_LIMIT = 500` per page plus one extra row for `hasOlder` | decode MMS |
 | `SmsRepository.insertSent()` | one `content://sms` row: `ADDRESS`, `BODY`, `DATE`, `DATE_SENT`, `TYPE=SENT`, `READ=1`, `SEEN=1`, `SUBSCRIPTION_ID` when known; returns `_id` + `THREAD_ID` | create a thread by hand, write `MmsSms` internals |
 | `SmsRepository.markThreadRead()` | sets `READ=1` for one thread | mark a thread it could not read |
 | `SmsObserver` | content observer on `content://sms` and the conversations URI | upload, refresh the relay |
-| `ShellActivity` | the only `ACTION_MAIN`+`LAUNCHER`: conversation list, search, role/pairing banners, contact-picker FAB, menu to Phone home and setup | send, dial |
+| `ShellActivity` | the only `ACTION_MAIN`+`LAUNCHER`: conversation list, search, prominent SMS-role card, pairing banner, contact-picker FAB, bottom bar (Messages / Phone / Contacts / Settings), `Role & SMS diagnostics` dialog | send, dial |
 | `ThreadActivity` | one thread: day headers, in/out bubbles, mark read, load older, composer for one-to-one SMS | send to a group, send MMS |
 | `ThreadLabels` | the single source of a conversation label; groups are first names (`+n`) or `Group (n)`, never one member's number | guess a group's number |
-| `DialerHomeActivity` | Favorites / Recents / Contacts / Voicemail, search, `ACTION_DIAL` rows, dialpad FAB, call-log delete with `WRITE_CALL_LOG` | place a call, read visual voicemail |
+| `DialerHomeActivity` | Favorites / Recents / Contacts / Voicemail, search, `ACTION_DIAL` rows, dialpad FAB, call-log delete with `WRITE_CALL_LOG`, dialer-role card, bottom bar | place a call, read visual voicemail |
 | `DialerRepository` | `CallLog.Calls` (200 newest), `ContactsContract` contacts and starred favourites, `TelecomManager` voicemail number; `Load` distinguishes denied / failed / empty | cache rows, log a number or a name |
 
 The local send and mirror flow:
@@ -811,7 +898,8 @@ Group, MMS and role handling:
   `showMmsNote()` raises when the provider's snippet is not the body of the
   newest visible SMS (prefix-tolerant, so a truncated long SMS does not raise
   a false note). An unresolved canonical address is reported separately
-  (`messages_no_address`) and is never blamed on MMS.
+  (`messages_no_address`) and is never blamed on MMS; the list repairs the
+  thread from its first SMS row first (see below).
 - RCS does not exist for this app: no public API, no receiver, no promise.
 - `SettingsStore.sendingEnabled` is **not** consulted by the composer. That
   switch exists so a remote command cannot make the phone send without its
@@ -824,6 +912,54 @@ Group, MMS and role handling:
 - `DialerActivity` and `CallActivity` survive this phase untouched:
   `DialerActivity` keeps `ACTION_DIAL`/`tel:` and stays the default-dialer
   candidate, just not the launcher; `CallService`/`ROLE_DIALER` are unchanged.
+
+Bottom navigation (wave 3):
+
+- `res/menu/menu_bottom_nav.xml` has exactly four items — `nav_messages`,
+  `nav_phone`, `nav_contacts`, `nav_settings` — and both
+  `ShellActivity.installBottomNav()` and `DialerHomeActivity.installBottomNav()`
+  use it through the shared `res/layout/view_bottom_nav.xml`, which each home
+  layout includes as a real row (not an overlay). Four is
+  the cap on purpose: `BottomNavigationView` keeps every label at any width
+  with four items and starts hiding them with five.
+- A tap goes through `startTopLevel(...)` (Phone home with `TAB_RECENTS` or
+  `TAB_CONTACTS`, `MainActivity` for Settings) so the same page is never
+  stacked twice, and the bar then restores its own selection with
+  `selectNavSilently()`: assigning `selectedItemId` fires the listener, so a
+  guard flag (`suppressNav`, reset in a `finally`) is required.
+- `ThreadActivity`, `DialerActivity` and the in-call screen deliberately have
+  **no** bar: they are detail screens, reached from a list, and a bar there
+  would offer a "top level" that does not exist for them.
+
+Role cards, diagnostics and the address fallback (wave 3):
+
+- The SMS role card is **prominent** (`MessagesBanner.prominentCard`) and is
+  the first banner in `ShellActivity.renderBanners()`, because the list is
+  empty by design until the role is held. `requestSmsRole()` runs the full
+  flow: `RoleManager.ROLE_SMS` intent on API 29+, `ACTION_CHANGE_DEFAULT` +
+  `EXTRA_PACKAGE_NAME` on API 26–28, `ACTION_MANAGE_DEFAULT_APPS_SETTINGS` as
+  the fallback; `handleSmsRoleResult()` re-reads `RoleState.isDefaultSmsApp()`
+  instead of trusting the result code.
+- The dialer role card lives on the Phone home (`renderRoleCard()`, with a
+  separate sentence from `dialer_role_unavailable_card` when the phone offers
+  no dialer role). `requestDialerRole()` asks for the role **first**;
+  `askRolePermissions()` (missing `CALL_PHONE`, `ANSWER_PHONE_CALLS`,
+  `READ_CALL_LOG`) runs from the role result, or right away when the role
+  dialog could not be shown. Permissions are never a gate on the role dialog:
+  a single denial used to hide the dialog for good.
+- `RoleState.diagnosticsReport()` builds the "Role & SMS diagnostics" text from
+  the same helpers the cards use: SDK, SMS/dialer role offered and held, the
+  current default SMS and dialer packages, this package, and whether
+  `READ_SMS`, `READ_CALL_LOG`, `READ_CONTACTS` are granted. It is reachable by
+  long-pressing the Messages role card or from the `menuDiagnostics` menu item,
+  and it never contains a number, a name or a message.
+- `SmsRepository.conversations()` repairs a one-to-one thread whose
+  `canonical-addresses` lookup gave nothing with the `ADDRESS` of the thread's
+  first `content://sms` row (`firstAddressOfThread()`, capped by
+  `ADDRESS_FALLBACK_LIMIT = 300` per list). If that is empty too, the thread is
+  **kept** with its real `thread_id` and `ThreadLabels` renders "Unknown";
+  messages stay readable. The debug log line carries counts only
+  (`read`, `withAddress`, `withoutAddress`, `fallbacks`).
 
 ### Calls on the phone (wave 1 + wave 2 dialer)
 
@@ -849,12 +985,16 @@ The **wave 2 dialer role** is what makes the app the phone's dialer:
   it needs no `ROLE_DIALER` and no network, so it places a call even when the
   relay is down or the phone is unpaired. `DialerHomeActivity` opens it from
   its dialpad FAB with the number already in the field.
-- `MainActivity` is the setup screen, reached from the menus of both homes; it
-  requests the roles through `RoleState` and starts the pairing flow.
+- `MainActivity` is the setup screen, reached from the **Settings** item of the
+  bottom bar (or the setup menu entry); it
+  requests the roles through `RoleState`, starts the pairing flow and shows the
+  non-cancelable pairing confirmation dialog
+  (`MainActivity.onPairingConfirmationRequired`).
 - `CallService` is an `InCallService` with
   `android.telecom.IN_CALL_SERVICE_UI` and `IN_CALL_SERVICE_RINGING` metadata;
-  Android binds it only while the app holds `ROLE_DIALER`. `MainActivity`
-  offers the role through `RoleState.dialerRoleIntent()` and re-reads
+  Android binds it only while the app holds `ROLE_DIALER`. The dialer-role
+  card on the Phone home offers the role through `RoleState.dialerRoleIntent()`
+  (the setup screen can too) and re-reads
   `RoleState.isDialer()` afterwards, because a vendor build can refuse without
   saying so.
 - `CallActivity` is `showWhenLocked`, `turnScreenOn`, `singleTask`: a ringing
@@ -877,6 +1017,11 @@ must never make an emergency call depend on the relay. `DialerActivity` and
 `CallActivity` survive that phase as the dialpad and the in-call screen. There
 is no visual verification: the host has no JDK, Gradle or emulator, so only
 the `android-build` workflow proves the code compiles.
+
+Wave 3 adds the shared four-item bottom bar, the prominent role cards, the
+"Role & SMS diagnostics" dialog and the `conversations()` address fallback —
+see "Messages and dialer UI" above for the exact wiring. It is the same
+`android-build`-only story: no device was available.
 
 ## 7. Change recipes
 
@@ -912,6 +1057,14 @@ the `android-build` workflow proves the code compiles.
    token, so the old token stops working immediately.
 5. Update `pairing.py`, `db.py`, the Mini App `store.js`/`ui.js` and the
    Android `PairingController`/`SettingsStore` in the same change.
+6. A field the phone must show before it stores the token (like the approver)
+   travels in the `202 awaiting_phone_confirmation` answer, not in the
+   approval: the approval still issues nothing. Keep the three-way
+   `confirmed` contract intact (absent = older APK, `null` = still polling,
+   `true`/`false` = the user answered), or an old build loses its token path.
+7. `pairings.approved_by_name` / `approved_by_username` are the pattern for
+   such a field: additive and nullable, filled at approval from the Telegram
+   admin profile, never a secret, and allowed to be empty.
 
 ### Change the database schema
 
@@ -946,26 +1099,41 @@ the `android-build` workflow proves the code compiles.
 1. `delivery.NotificationReaper` and `delivery.DeliveryWorker` are separate
    tasks; a change to one must not make the other depend on it. Both start
    only when `run_workers=True`.
-2. `delivery.py` builds the notification: `📥 New SMS`, `📱 <b>device</b>`,
-   the sender, and the UTC timestamp. **Do not add the body.** A missing
+2. `delivery.py` builds the notification: `📥 <b>New SMS</b>`,
+   `📱 <b>device</b>`, the sender, an optional `Code: <b>…</b>` line from
+   `extract_code()`, and the HTML-escaped `body_snippet()` in `<i>…</i>`.
+   **Do not add the full body and do not add a date or time line** — the
+   snippet and the extracted code are the whole of what leaves the relay, and
+   the chat already stamps every message. A missing
    device row must not block the delivery, it degrades to `Unknown device`.
-3. The Mini App link in the "Open chat" button is built by
+   `extract_code()` must stay conservative: a masked tail, an identifier
+   label, a date, an amount or a phone number is never a code, and an
+   unrecognised shape means no `Code:` line (the snippet still shows it).
+   `_snippet_shows_code()` keeps the line off when the snippet already holds
+   the token in full.
+3. The bot's chatter notes are a different stream: `api.py` and `updater.py`
+   call `db.record_tg_message(..., kind, now + TG_NOTE_TTL_S)` and
+   `NotificationReaper._reap_notes()` deletes them from `tg_messages`. Do not
+   store a note on `messages`: it has no message row. Change the TTL in
+   `TG_NOTE_TTL_S` (3600 s), not at the call sites.
+4. The Mini App link in the "Open chat" button is built by
    `delivery.thread_url(base, thread_key, device_id)`; the device id has to
    be in the URL, otherwise the Mini App cannot open the right conversation.
-4. The deadline written by `db.mark_message_notified()` and the one written by
+5. The deadline written by `db.mark_message_notified()` and the one written by
    `db.mark_thread_read()` are the same contract: 86400 s by default, 300 s
    after a read, 300 s retry after a failed delete. Change all three together,
    and keep the default under 48 h (Telegram's delete limit).
-5. Tests: `test_delivery.py` (format, button, deadline, reaper outcomes),
-   `test_tg.py` (`deleteMessage`, not-found, 429), `test_db.py` (schema,
-   `seen_at`, `due_notifications`, rescheduling), `test_miniapp_inbox.py`
-   (read sets `seen_at` and shortens the deadline).
-6. A reply to a notification goes back to the device that captured it
+6. Tests: `test_delivery.py` (format, snippet, code extraction, button,
+   deadline, reaper outcomes), `test_tg.py` (`deleteMessage`, not-found, 429),
+   `test_db.py` (schema, `seen_at`, `due_notifications`, `tg_messages`,
+   rescheduling), `test_miniapp_inbox.py` (read sets `seen_at` and shortens the
+   deadline).
+7. A reply to a notification goes back to the device that captured it
    (`updater._handle_reply`). A device that is no longer active cannot be
    replied to: say so instead of queueing a command nobody would run.
-4. The bot never broadcasts: `db.resolve_command_device()` picks exactly one
+8. The bot never broadcasts: `db.resolve_command_device()` picks exactly one
    device or the command is refused with a readable error.
-5. Add backend tests for the state transitions and the label.
+9. Add backend tests for the state transitions and the label.
 
 ### Add a Messages screen or a conversation/row field
 
@@ -1153,27 +1321,30 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests -q
 ```
 
-The suite collects **738 tests**: **734 passed, 3 failed, 1 error**. The
+The suite collects **785 tests**: **781 passed, 3 failed, 1 error**. The
 four non-passing tests do not pass for reasons that predate the multi-device
 work and are still open:
 
 - `tests/test_commands.py::test_search_by_name_suggests_contacts`
 - `tests/test_commands.py::test_contacts_are_uploaded_and_searchable`
 - `tests/test_db.py::test_chat_search_matches_name_number_and_body_and_escapes_wildcards`
-  (two contact-search failures and one chat-search failure)
 - `tests/test_app_assembly.py::test_shutdown_is_prompt_when_updater_blocked_in_long_poll`
-  (the shutdown-timing error)
 
-Everything else passes, including the notification tests in
-`test_delivery.py` (format, no body, button, deadline, reaper outcome and
-retry). Do not report the suite as green, and do not treat these four as new
+The first three are contact/chat-search failures, and the last is the
+shutdown-timing error. Everything else passes, including the notification
+tests in `test_delivery.py` (format, 160-character snippet, code extraction and
+its skip rules, button, deadline, reaper outcome and retry), the sent-note
+tests in `test_db.py`/`test_delivery.py` (`tg_messages`, the one-hour TTL,
+`not found` as success, reschedule, bad id), the command note tests in
+`test_commands.py` (one note per accepted `sent`/`failed`/`rejected`,
+`delivered` silent, bookkeeping failure harmless) and the pairing-confirmation
+tests in `test_pairing.py` (`awaiting_phone_confirmation`, `confirmed:
+true`/`false`, the absent-field legacy path, the approver columns).
+`test_tg.py` covers `deleteMessage`, already-gone and 429,
+`test_miniapp_inbox.py` covers a read setting `seen_at` and shortening the
+deadline, and `test_app_assembly.py` covers the reaper task starting with the
+workers. Do not report the suite as green, and do not treat these four as new
 regressions.
-
-Everything else passes, including the notification tests:
-`test_tg.py` (`deleteMessage`, already-gone, 429),
-`test_db.py` (new columns, `seen_at`, `due_notifications`, rescheduling),
-`test_miniapp_inbox.py` (read sets `seen_at` and shortens the deadline) and
-`test_app_assembly.py` (the reaper task starts with the workers).
 
 Useful focused runs:
 
@@ -1197,11 +1368,12 @@ Test modules: `test_db`, `test_delivery`, `test_ingest`, `test_import`,
 There are no Android instrumentation tests and no JavaScript test runner. The
 Mini App tests are Python static assertions plus API tests. If you change the
 Android app, state clearly in the log that it was not built or tested on the
-VPS. A change to the Messages or Phone-home screens is proven only by the
-`android-build` GitHub Actions workflow, which must publish
-`sms-relay-debug.apk` on the rolling `android-latest` release; the screen
-behaviour itself still needs a manual device matrix (dialer role, locked-screen
-calls, dual SIM, emergency, provider/vendor quirks, notifications).
+VPS. A change is proven to compile only by the `android-build` GitHub Actions
+workflow, which must publish `sms-relay-debug.apk` on the rolling
+`android-latest` release; the app itself is **not device-tested** — the screen
+behaviour (role prompts, bottom navigation, diagnostics, pairing confirmation)
+still needs a manual device matrix (dialer role, SMS role, locked-screen calls,
+dual SIM, emergency, provider/vendor quirks, notifications).
 
 ## 9. Debugging and operations
 
@@ -1409,6 +1581,51 @@ calls, dual SIM, emergency, provider/vendor quirks, notifications).
     wordmarks, animations or code, and no `ACTION_CALL` shortcut that pretends
     to be Google Dialer. Use Material Symbols or original vector paths and the
     stock Material 3 theme (`Theme.SmsRelay.Messages`).
+40. **The snippet and the code leave the relay over Telegram.** The
+    notification carries `body_snippet()` (160 characters, whitespace
+    collapsed) and the `extract_code()` result in the private admin chat. That
+    is a deliberate product decision; the **full** body stays in SQLite and
+    the Mini App. Do not go back to a notification with no SMS text, do not
+    widen the snippet, and do not put the snippet, the code, a number or a
+    name in a log line. `test_delivery.py` asserts the format.
+41. **OTP extraction is a conservative heuristic.** `extract_code()` takes the
+    first standalone 4–8 character token with at least one digit and skips
+    dates (`_DATE_LIKE`), phone numbers (`_names_a_phone`), amounts
+    (`_is_amount`), masked card/account tails (`_is_masked_digits`: `*`, `x`,
+    `X`, `•`), and identifiers introduced by `card`, `a/c`, `acct`, `account`,
+    `order`, `ref`, `reference`, `txn`, `transaction`, `invoice`, `bill`,
+    `policy`, `ticket` (`_names_an_identifier`). A code-shaped card or order
+    number must never be labelled `Code:`; an unusual OTP format can be
+    missed, and the snippet still shows it. Do not widen the filters to "find
+    more codes" — a wrong code line is worse than none.
+42. **The phone confirmation needs a backend that speaks it.** A current APK
+    sends `confirmed` and waits for `202 awaiting_phone_confirmation`; an
+    older backend returns the token on the first approved poll, so the dialog
+    never appears. The absent-field path is the older-APK path and must keep
+    working (token issued directly): do not make it an error and do not claim
+    the confirmation is enforced end-to-end.
+43. **An OEM can suppress the role dialogs.** Some builds ignore the
+    `ROLE_SMS`/`ROLE_DIALER` request or answer OK without changing anything.
+    The Messages list shows the SMS-role card as a prominent card and the
+    Phone home shows the dialer-role card, so the state is visible; the
+    "Role & SMS diagnostics" dialog (long-press the Messages card, or the
+    `menuDiagnostics` item) reports the SDK, whether each role is offered and
+    held, the default SMS/dialer package and the permission grants. Check it
+    first before hunting the app; when no role is offered the flow falls back
+    to the default-apps settings.
+44. **The bottom bar has exactly four items and only on the top level.**
+    `menu_bottom_nav.xml` is four items (`nav_messages`, `nav_phone`,
+    `nav_contacts`, `nav_settings`); five starts hiding labels.
+    `ThreadActivity`, `DialerActivity` and the in-call screen have no bar on
+    purpose. A tap must go through `startTopLevel(...)`, and the bar must
+    restore its own selection with `selectNavSilently()` — assigning
+    `selectedItemId` fires the listener and would re-enter navigation.
+45. **"Unknown sender" is a readable thread, not a dropped one.**
+    `SmsRepository.conversations()` repairs a one-to-one thread from its first
+    SMS `ADDRESS`, and keeps the row with its real `thread_id` and
+    `messages_unknown_sender` ("Unknown") when even that fails
+    (`ADDRESS_FALLBACK_LIMIT = 300` reads per list). Do not filter such a
+    thread out to tidy the list: the messages are real and still open.
 
 ## 11. Definition of done
 - [ ] The requested behavior is implemented or the investigation is complete.
@@ -1421,6 +1638,14 @@ calls, dual SIM, emergency, provider/vendor quirks, notifications).
       writes conversation, contact, call or read data of another device.
 - [ ] The dialer works offline, and an emergency call never depends on the
       backend: no pairing, no network, no remote action.
+- [ ] A notification is a snippet plus an optional extracted code; the full
+      body is still only in the relay. No snippet, code, number, name or body
+      appears in a log, and the OTP extractor was not widened.
+- [ ] The pairing still hands out exactly one token, and only after the phone
+      user confirmed the approver (`confirmed: true`); the absent-field path
+      still works for an older APK.
+- [ ] Bottom navigation, role cards and the diagnostics dialog still work on
+      both top-level screens, and detail screens still have no bar.
 - [ ] README/guide updated if behavior, contracts, commands, env vars, or
       limitations changed.
 - [ ] `docs/AGENT_LOG.md` has a new appended entry with date, agent, task,

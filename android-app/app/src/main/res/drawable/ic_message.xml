@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Original vector: a speech bubble with a tail, the Messages entry of
+     the bottom navigation. It is deliberately not `ic_start_chat` (a
+     bubble with a plus): that one is an action, this one is a place.
+     Untinted, so `itemIconTint` of the navigation bar decides the
+     colour and it follows day/night. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M4,3 L20,3 A2,2 0 0 1 22,5 L22,15 A2,2 0 0 1 20,17 L11,17 L6,21 L6,17 L4,17 A2,2 0 0 1 2,15 L2,5 A2,2 0 0 1 4,3 Z" />
+</vector>

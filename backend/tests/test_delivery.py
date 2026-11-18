@@ -213,15 +213,16 @@ def test_invalid_input_last_error_composed_capped_at_200(conn, settings):
     assert last_error.startswith("invalid_input: ")
 
 
-def test_large_body_sends_one_short_notification_without_the_body(conn, settings):
+def test_large_body_sends_one_short_notification_with_a_truncated_snippet(
+        conn, settings):
     """A 9 KB SMS still produces exactly one short notification.
 
-    The body is never forwarded, so there is nothing to chunk: the
-    notification only says who wrote, on which phone and when.
+    Only the first few characters travel: there is nothing to chunk,
+    because the snippet is bounded and the full body stays in the relay.
     """
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
-    body = "SECRETBODY" * 900
+    body = "Hello there, " + "SECRETBODY" * 900
     msg_id = _seed(conn, body=body)
 
     processed = asyncio.run(worker.run_once(time.time() + 5))
@@ -229,22 +230,25 @@ def test_large_body_sends_one_short_notification_without_the_body(conn, settings
     assert processed == 1
     assert len(telegram.sent) == 1
     text = telegram.sent[0][1]
-    assert "SECRETBODY" not in text
-    assert len(text) < 500
-    assert f"<i>{FIXED_ISO} UTC</i>" in text
+    assert "Hello there," in text
+    # The cut is at SNIPPET_MAX characters, so the tail never travels.
+    assert len(delivery.body_snippet(body)) == delivery.SNIPPET_MAX
+    assert text.count("<i>") == 1
+    assert len(text) < 600
     msg = _message(conn, msg_id)
     assert msg["state"] == "delivered"
     assert msg["telegram_msg_id"] == "1"
     assert db.next_jobs(conn, time.time() + 60, limit=5) == []
 
 
-def test_notification_names_the_device_the_sender_and_the_time(conn, settings):
+def test_notification_names_the_device_and_the_sender_but_no_time(
+        conn, settings):
     db.activate_device(conn, "dev-pixel-0009", "Pixel 8", "android", "1.0",
                        int(time.time()))
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
     _seed(conn, msg_id="notify00-aaaa", sender="+15550001111",
-          body="the body must stay in the relay",
+          body="your parcel arrives tomorrow",
           device_id="dev-pixel-0009")
 
     asyncio.run(worker.run_once(time.time() + 5))
@@ -252,8 +256,11 @@ def test_notification_names_the_device_the_sender_and_the_time(conn, settings):
     text = telegram.sent[0][1]
     assert "Pixel 8" in text
     assert "+15550001111" in text
-    assert f"{FIXED_ISO} UTC" in text
-    assert "the body must stay in the relay" not in text
+    assert "your parcel arrives tomorrow" in text
+    # The chat already stamps every message, so the UTC line is gone.
+    assert "UTC" not in text
+    assert FIXED_ISO not in text
+    assert "2023-11-14" not in text
 
 
 def test_notification_uses_the_device_contact_name(conn, settings):
@@ -474,8 +481,7 @@ def test_header_format_single_part(conn, settings):
 
     text = telegram.sent[0][1]
     assert text.startswith("📥 <b>New SMS</b>")
-    assert "<i>" in text
-    assert "hello" not in text
+    assert "<i>hello</i>" in text
 
 
 def test_device_label_shows_the_device_name(conn, settings):
@@ -513,7 +519,8 @@ def test_notification_is_one_message_per_part(conn, settings):
 
     assert len(telegram.sent) == 2
     assert all("📱 <b>Pixel 8</b>" in text for _, text in telegram.sent)
-    assert all("x" * 10 not in text and "y" * 10 not in text
+    # Each part is its own short snippet: the whole 9 KB never travels.
+    assert all("x" * 200 not in text and "y" * 200 not in text
                for _, text in telegram.sent)
 
 
@@ -649,9 +656,25 @@ async def test_paused_worker_does_not_spin(conn, settings):
     assert task.exception() is None
 
 
-# --- The notification payload never carries the SMS body -----------------
+# --- The body travels as one short snippet, plus an extracted code -------
+#
+# The operator lifted the old "the body never leaves the relay over
+# Telegram" rule for the private admin chat: the notification carries a
+# bounded snippet and, when the body holds one, a code. The full body
+# still stays in the relay and is what the Mini App shows.
 
-def test_body_is_never_forwarded(conn, settings):
+def test_body_snippet_is_one_line_cut_to_the_limit():
+    assert delivery.body_snippet("line one\nline two") == "line one line two"
+    assert delivery.body_snippet("  a \t b  ") == "a b"
+    assert delivery.body_snippet("x" * 500) == "x" * delivery.SNIPPET_MAX
+    assert delivery.body_snippet("x" * 160) == "x" * 160
+    assert delivery.body_snippet("") == ""
+    assert delivery.body_snippet(None) == ""
+    # No trailing space survives the cut.
+    assert delivery.body_snippet("a" * 159 + " b c") == "a" * 159
+
+
+def test_notification_carries_the_snippet_html_escaped(conn, settings):
     telegram = FakeTelegram()
     worker = _worker(conn, settings, telegram)
     _seed(conn, msg_id="escape00-aaaa", body="<b>bank</b> & co")
@@ -659,9 +682,122 @@ def test_body_is_never_forwarded(conn, settings):
     asyncio.run(worker.run_once(time.time() + 5))
 
     text = telegram.sent[0][1]
-    assert "bank" not in text
-    assert "&lt;b&gt;" not in text
+    assert "&lt;b&gt;bank&lt;/b&gt; &amp; co" in text
+    # The raw markup is never forwarded, so Telegram cannot render it.
+    assert "<b>bank</b>" not in text
     assert _message(conn, "escape00-aaaa")["state"] == "delivered"
+
+
+def test_notification_shows_the_code_above_the_snippet(conn, settings):
+    """A code the snippet cut away gets its own line, above the snippet."""
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    prefix = ("Thank you for using our service. This message confirms your "
+              "request and explains what happens next in a few short "
+              "sentences, so please read it carefully before you close it. ")
+    body = prefix + "Your verification code is 483920 and it expires soon."
+    assert len(" ".join(body.split())) > delivery.SNIPPET_MAX
+    _seed(conn, msg_id="otp00000-aaaa", body=body)
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "Code: <b>483920</b>" in text
+    assert text.index("Code: <b>483920</b>") < text.index("<i>")
+    assert text.count("483920") == 1
+
+
+def test_notification_omits_the_code_line_without_a_code(conn, settings):
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="nocode00-aaaa",
+          body="See you at the usual place tomorrow.")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert "Code:" not in text
+    assert "See you at the usual place tomorrow." in text
+
+
+def test_notification_does_not_repeat_a_code_the_snippet_already_shows(
+        conn, settings):
+    """A short SMS shows its code once, in the snippet."""
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="once0000-aaaa", body="Your code is 44821")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = telegram.sent[0][1]
+    assert text.count("44821") == 1
+    assert "Code:" not in text
+
+
+def test_notification_code_line_is_escaped(conn, settings):
+    """A code is alphanumeric, and the line still goes through the escaper."""
+    assert delivery._html_escape("AB12CD") == "AB12CD"
+    assert delivery._html_escape("A&B<2>") == "A&amp;B&lt;2&gt;"
+    assert delivery._snippet_shows_code("code AB12CD here", "AB12CD") is True
+    assert delivery._snippet_shows_code("code AB12CDX here", "AB12CD") is False
+    assert delivery._snippet_shows_code("", "AB12CD") is False
+
+
+def test_the_notification_never_logs_the_body_or_the_code(conn, settings, caplog):
+    caplog.set_level("DEBUG")
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    body = "Your verification code is 483920. Do not share it."
+    _seed(conn, msg_id="nolog000-aaaa", body=body)
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "483920" not in text
+    assert "Do not share" not in text
+    assert body not in text
+
+
+def test_extract_code_skips_masked_and_labelled_identifiers():
+    # Card/account tails are masked digits, not codes.
+    assert delivery.extract_code(
+        "Card *1234 debited Rs.5000 on 12/03/2026") is None
+    assert delivery.extract_code("Card ending 1234") is None
+    assert delivery.extract_code("Card is 1234") is None
+    assert delivery.extract_code("A/c **9876 credited") is None
+    assert delivery.extract_code("Acct xx4321 debited") is None
+    # A label word before the digits names an identifier too.
+    assert delivery.extract_code("Order 5511 has shipped") is None
+    assert delivery.extract_code("Ref no. 7722") is None
+    assert delivery.extract_code("Txn 998877 completed") is None
+
+
+def test_extract_code_keeps_real_codes_next_to_masked_numbers():
+    assert delivery.extract_code("Your OTP is 123456") == "123456"
+    assert delivery.extract_code("Use 4821 to log in") == "4821"
+    assert delivery.extract_code("Your code is A1B2C3") == "A1B2C3"
+    assert delivery.extract_code("123456") == "123456"
+    # A code that follows a masked number in the same SMS still counts.
+    assert delivery.extract_code(
+        "Card *1234: your code is 5612") == "5612"
+
+
+def test_extract_code_skips_dates_amounts_and_phone_numbers():
+    assert delivery.extract_code("Your code is 4921") == "4921"
+    assert delivery.extract_code("G-731944 is your Google code") == "731944"
+    assert delivery.extract_code("Use AB12CD at the till") == "AB12CD"
+    # A date is not a code, even when a part of it is four digits.
+    assert delivery.extract_code("Booked for 2024-11-14") is None
+    # An amount is not a code.
+    assert delivery.extract_code("Paid 120000 dollars") is None
+    # A phone number is not a code, and a standalone code is not lost
+    # because it shares digits with a number elsewhere in the SMS.
+    assert delivery.extract_code("Call +989121234567 for help") is None
+    assert delivery.extract_code(
+        "Your code: 123456. Call +989121234567 if this was not you."
+    ) == "123456"
+    assert delivery.extract_code("") is None
+    assert delivery.extract_code(None) is None
 
 
 # --- Reaper --------------------------------------------------------------
@@ -828,3 +964,169 @@ def test_bookkeeping_failure_does_not_undo_a_successful_send(conn, settings,
     assert msg["state"] == "delivered"
     assert msg["telegram_msg_id"] == "1"
     assert db.next_jobs(conn, time.time() + 60, limit=5) == []
+
+
+# --- The bot notes the relay creates are deleted after an hour -----------
+#
+# An "SMS sent" note is a bot message, not an SMS notification, so it has
+# no row in ``messages``. It is tracked in ``tg_messages`` and removed by
+# the same reaper.
+
+def _note(conn, *, chat_id="test-chat-id", message_id=42,
+          kind="command_result", delete_at=2000, created_at=1000):
+    return db.record_tg_message(conn, chat_id, message_id, kind, delete_at,
+                                created_at)
+
+
+def _note_row(conn, row_id):
+    return db._asdict(conn.execute("SELECT * FROM tg_messages WHERE id = ?",
+                                   (row_id,)).fetchone())
+
+
+def test_a_note_is_recorded_with_its_deletion_deadline(conn):
+    row_id = _note(conn, message_id=77, delete_at=5000, created_at=1400)
+
+    row = _note_row(conn, row_id)
+    assert row["chat_id"] == "test-chat-id"
+    assert row["message_id"] == 77
+    assert row["kind"] == "command_result"
+    assert row["delete_at"] == 5000
+    assert row["created_at"] == 1400
+    assert row["deleted_at"] is None
+
+
+def test_a_note_that_cannot_name_a_message_is_not_recorded(conn):
+    """A missing message id must never create a row that spins forever."""
+    assert _note(conn, message_id=None) == 0
+    assert _note(conn, message_id="not-a-number") == 0
+    assert _note(conn, chat_id=None) == 0
+    assert _note(conn, chat_id="") == 0
+    assert db.due_tg_messages(conn, 10 ** 9) == []
+
+
+def test_the_reaper_deletes_a_due_note(conn, settings):
+    telegram = FakeTelegram()
+    row_id = _note(conn, message_id=77, delete_at=2000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 1
+    assert telegram.deleted == [("test-chat-id", 77)]
+    row = _note_row(conn, row_id)
+    assert row["deleted_at"] == 2500
+
+
+def test_the_reaper_ignores_a_note_that_is_not_due(conn, settings):
+    telegram = FakeTelegram()
+    row_id = _note(conn, message_id=78, delete_at=9000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 0
+    assert telegram.deleted == []
+    assert _note_row(conn, row_id)["deleted_at"] is None
+
+
+def test_the_reaper_reschedules_a_failed_note_delete(conn, settings):
+    telegram = FakeTelegram(delete_error=TGError("network"))
+    row_id = _note(conn, message_id=79, delete_at=2000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 0
+    row = _note_row(conn, row_id)
+    assert row["deleted_at"] is None
+    assert row["delete_at"] == 2500 + delivery.REAPER_RETRY_S
+
+
+def test_the_reaper_clears_a_note_whose_id_is_bad(conn, settings):
+    """A row that cannot name its message would be retried forever."""
+    telegram = FakeTelegram()
+    row_id = _note(conn, message_id=80, delete_at=2000)
+    conn.execute("UPDATE tg_messages SET message_id = ? WHERE id = ?",
+                 ("not-a-number", row_id))
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 0
+    assert telegram.deleted == []
+    assert _note_row(conn, row_id)["deleted_at"] == 2500
+
+
+def test_the_reaper_clears_a_note_telegram_refuses(conn, settings):
+    """A permanent rejection must not be retried forever either."""
+    telegram = FakeTelegram(delete_error=TGError("bad_request",
+                                                 detail="message can't be deleted"))
+    row_id = _note(conn, message_id=81, delete_at=2000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 0
+    assert _note_row(conn, row_id)["deleted_at"] == 2500
+
+
+def test_the_reaper_treats_a_missing_note_as_success(conn, settings):
+    telegram = FakeTelegram(delete_gone=True)
+    row_id = _note(conn, message_id=82, delete_at=2000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 1
+    assert _note_row(conn, row_id)["deleted_at"] == 2500
+
+
+def test_the_reaper_never_deletes_an_untracked_message(conn, settings):
+    """Only the notes this relay recorded are deleted.
+
+    A message with no row anywhere - a message the admin wrote, or one
+    the bot sent before this feature existed - is never touched.
+    """
+    telegram = FakeTelegram()
+    _note(conn, message_id=83, delete_at=9000)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 0
+    assert telegram.deleted == []
+
+
+def test_a_deleted_note_is_not_deleted_twice(conn, settings):
+    telegram = FakeTelegram()
+    row_id = _note(conn, message_id=84, delete_at=2000)
+    reaper = _reaper(conn, settings, telegram)
+
+    assert asyncio.run(reaper.run_once(2500)) == 1
+    assert asyncio.run(reaper.run_once(2500)) == 0
+    assert telegram.deleted == [("test-chat-id", 84)]
+    assert _note_row(conn, row_id)["deleted_at"] == 2500
+
+
+def test_an_sms_notification_is_not_tracked_as_a_bot_note(conn, settings):
+    """A delivered notification already has a messages row: no second row.
+
+    Tracking it twice would make the reaper try to delete the same
+    Telegram message from two places.
+    """
+    telegram = FakeTelegram()
+    worker = _worker(conn, settings, telegram)
+    _seed(conn, msg_id="twice-note-aaa", body="hi")
+
+    asyncio.run(worker.run_once(time.time() + 5))
+
+    assert len(telegram.sent) == 1
+    assert _message(conn, "twice-note-aaa")["telegram_msg_id"] == "1"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tg_messages").fetchone()[0] == 0
+
+
+def test_the_reaper_deletes_both_kinds_of_message_in_one_pass(conn, settings):
+    telegram = FakeTelegram()
+    _seed(conn, msg_id="both0000-aaaa")
+    _notified(conn, "both0000-aaaa", sent_at=1000, delete_at=1100,
+              msg_number=90)
+    _note(conn, message_id=91, delete_at=1100)
+
+    removed = asyncio.run(_reaper(conn, settings, telegram).run_once(2500))
+
+    assert removed == 2
+    assert telegram.deleted == [("test-chat-id", 90), ("test-chat-id", 91)]

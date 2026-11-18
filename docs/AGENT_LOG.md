@@ -1740,3 +1740,79 @@ to Telegram. They are logged under separate headings below.
   number with the relay offline, service rebind, and the vendor call-log /
   contact quirks. Then a screenshot pass for visual parity, and the MMS /
   group-send / durable-mirror phases.
+
+## 2026-11-18 — Fix the two device blockers: empty Messages list and the dialer role
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode). No subagent tool was exposed in
+  this runtime, so the lead did the implementation itself; that is the
+  documented fallback, not the preferred path.
+- **Task:** the installed APK showed (a) an empty Messages list and (b) no way
+  to become the default dialer. Both were fixed at the cause, not with a
+  prompt.
+- **Files:** `android-app/.../messages/SmsRepository.kt`,
+  `.../ui/ShellActivity.kt`, `.../ui/MainActivity.kt`,
+  `.../ui/DialerHomeActivity.kt`, `.../ui/messages/MessagesBanner.kt`,
+  `.../util/RoleState.kt`, `.../res/values/strings.xml`; this entry.
+  No change to the manifest, the backend, `calls/`, `messages/SmsObserver`,
+  `ThreadActivity` or the pairing files.
+- **Changed — Messages list:** `conversations()` no longer drops a thread when
+  `content://mms-sms/canonical-addresses` resolves nothing (that `continue`
+  was why the screen was empty even with messages on the phone). The address
+  is now read from the thread's first SMS row (`thread_id = ?`,
+  `DATE ASC, _ID ASC LIMIT 1`) for a one-to-one thread, and a thread that
+  still has none is kept with a blank address, so the label falls back to the
+  existing "Unknown" string and the composer stays disabled. `threadFor` and
+  `addressForThread` use the same fallback so a thread screen opened by id
+  agrees with the list. A debug-only line logs counts (threads read, with
+  address, without address) and nothing else.
+- **Changed — dialer role:** `MainActivity.requestDialerRole()` no longer
+  returns early when a call permission is missing; the role dialog is the
+  first thing it opens, and the missing permissions are asked afterwards
+  through a launcher, never as a condition. The role is re-read in
+  `onResume`, an unavailable role intent now opens the default-apps settings,
+  and the pending flag only repeats the request after a later grant.
+  `DialerHomeActivity` has a prominent "not your dialer" card with held /
+  available / unavailable states and a settings fallback; the result is
+  re-read rather than trusted.
+- **Changed — SMS role:** `ShellActivity` replaces the bare
+  `startActivity(createRequestRoleIntent)` with the setup screen's flow:
+  a `registerForActivityResult` launcher, role manager on API 29+,
+  `ACTION_CHANGE_DEFAULT` + `EXTRA_PACKAGE_NAME` on 8/9, default-apps settings
+  as the fallback, and a reload after the result. The role is now a prominent
+  card at the top of the list ("messages are hidden until you allow it"), and
+  the empty state names the role instead of a read error while it is missing.
+- **Changed — diagnostics:** a "Role & SMS diagnostics" entry in the Messages
+  menu (added in code, so the shared menu file of the Phone home is unchanged;
+  also on long-press of the role card) opens a scrollable dialog with the SDK
+  level, SMS and dialer role availability and holding, the default SMS package
+  and default dialer package, this package name, and the READ_SMS /
+  READ_CALL_LOG / READ_CONTACTS state. Built from `RoleState` helpers, so it
+  cannot disagree with the cards; no number, name or body is in it.
+- **Verification:** static only, no JDK/Gradle/emulator on this host. All 39
+  resource XML files and the manifest parse; no duplicate string names; every
+  `R.string` reference resolves; braces/parens balance in all six touched
+  Kotlin files with strings and comments stripped; no duplicate function names
+  or unused imports in them; `recipients.isEmpty()` appears only in the two
+  fallback branches of `conversations`/`threadFor`, never as a drop;
+  `pendingDialerRole` is gone and `hasAllCallPermissions()` is no longer a
+  gate anywhere in the role path; the manifest diff is empty;
+  `git diff --check` is clean.
+- **Decisions / risks:** keeping an address-less thread is deliberate - a
+  conversation the user can open beats a silently missing one, and the call
+  button and composer already refuse a blank address. `ThreadActivity` still
+  carries its own copy of the old raw role `startActivity`; it was outside the
+  owned files and was not touched, so its banner is unchanged (follow-up).
+  Untested on a device: the vendor provider may still answer nothing for a
+  non-default app, which is exactly what the diagnostics dialog is for.
+- **Follow-ups:** GitHub Actions must compile this; the APK must be rebuilt and
+  published by the lead as `sms-relay-debug.apk`
+  (<https://github.com/HessiKz/sms-relay/releases/download/android-latest/sms-relay-debug.apk>).
+  Then on the device: open Messages with and without the role, grant the role
+  from the card, open the diagnostics and report the two lines about the SMS
+  role and the default SMS package, and make SMS Relay the dialer from the
+  Phone home card. Port the robust role flow to `ThreadActivity` next.
+- **Addendum (same task, same files):** the address fallback of the list is
+  bounded (`ADDRESS_FALLBACK_LIMIT = 300` per read), so a phone whose
+  canonical table refuses everything cannot turn one list read into
+  thousands of queries; the remaining threads are still listed, just
+  address-less. The debug line also reports how many fallbacks ran.

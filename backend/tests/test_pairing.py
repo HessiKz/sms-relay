@@ -590,3 +590,130 @@ def test_a_revoked_device_cannot_poll(client):
     conn = client.app.state.db_conn
     db.revoke_device(conn, DEVICE_ID, int(time.time()))
     assert client.get("/commands", headers=device_headers()).status_code == 401
+
+
+# --- The phone confirms the approver before it takes the token ------------
+#
+# An approval is no longer a token. The phone asks the server whether the
+# admin approved, is shown who approved it, and only then collects the
+# token. An older APK does not send the field at all and keeps the old
+# behaviour.
+
+def _claim(client, pairing, **extra):
+    body = {"pairing_id": pairing["pairing_id"],
+            "claim_secret": pairing["claim_secret"]}
+    body.update(extra)
+    return client.post("/pair/claim", json=body)
+
+
+def test_an_approved_pairing_waits_for_the_phone_confirmation(client):
+    pairing = _start(client, device_id="new-phone", name="New Phone")
+    approve_pairing(client, pairing)
+
+    response = _claim(client, pairing, confirmed=None)
+
+    assert response.status_code == 202
+    data = response.json()
+    assert data["status"] == "awaiting_phone_confirmation"
+    assert data["device"]["id"] == "new-phone"
+    assert data["device"]["name"] == "New Phone"
+    assert data["approved_by"] == {"name": "Ada Lovelace", "username": "ada"}
+    # Nothing secret is in the answer that holds no token.
+    assert "token" not in data
+    assert SECRET not in response.text
+    assert "claim_secret" not in response.text
+    assert db.device_by_id(client.app.state.db_conn,
+                           "new-phone")["token_hash"] is None
+
+
+def test_the_phone_confirmation_issues_the_token_once(client):
+    pairing = _start(client, device_id="new-phone")
+    approve_pairing(client, pairing)
+    assert _claim(client, pairing, confirmed=None).status_code == 202
+
+    claimed = _claim(client, pairing, confirmed=True)
+
+    assert claimed.status_code == 200
+    data = claimed.json()
+    assert data["status"] == "claimed"
+    assert data["token"].startswith("sr_")
+    assert data["device"]["id"] == "new-phone"
+    assert db.device_by_id(client.app.state.db_conn,
+                           "new-phone")["token_hash"] == db.token_hash(
+                               data["token"])
+
+    again = _claim(client, pairing, confirmed=True)
+    assert again.status_code == 409
+
+
+def test_the_phone_can_refuse_the_pairing(client):
+    pairing = _start(client, device_id="new-phone")
+    approve_pairing(client, pairing)
+
+    response = _claim(client, pairing, confirmed=False)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "cancelled"}
+    assert "token" not in response.text
+    conn = client.app.state.db_conn
+    assert db.device_by_id(conn, "new-phone")["token_hash"] is None
+    assert db.pairing_by_id(conn, pairing["pairing_id"])["status"] == "cancelled"
+
+    # A cancelled pairing cannot be collected afterwards.
+    later = _claim(client, pairing, confirmed=True)
+    assert later.status_code == 410
+    assert "sr_" not in later.text
+
+
+def test_an_older_apk_that_sends_no_field_still_gets_the_token(client):
+    """Backwards compatibility: absent means "take the token now"."""
+    pairing = _start(client, device_id="new-phone")
+    approve_pairing(client, pairing)
+
+    claimed = claim_pairing(client, pairing)
+
+    assert claimed["status_code"] == 200
+    assert claimed["json"]["status"] == "claimed"
+    assert claimed["json"]["token"].startswith("sr_")
+
+
+def test_the_approver_name_is_trimmed_and_limited(client):
+    pairing = _start(client, device_id="new-phone")
+    approve_pairing(client, pairing)
+
+    response = _claim(client, pairing, confirmed=None)
+
+    approved_by = response.json()["approved_by"]
+    # The signed test user is "Ada Lovelace" / "ada": stored as trimmed
+    # values, and never with an "@" in the username.
+    assert approved_by == {"name": "Ada Lovelace", "username": "ada"}
+    conn = client.app.state.db_conn
+    row = db.pairing_by_id(conn, pairing["pairing_id"])
+    assert len(row["approved_by_name"]) <= 64
+    assert len(row["approved_by_username"]) <= 64
+    assert not row["approved_by_username"].startswith("@")
+
+
+def test_the_approver_columns_migrate_additively(client):
+    conn = client.app.state.db_conn
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(pairings)")}
+    assert {"approved_by_name", "approved_by_username"} <= columns
+
+
+def test_the_approver_helpers_trim_and_cap():
+    """The stored values are the admin's, trimmed and bounded."""
+    from app.pairing import (_clean_name, _clean_username,
+                             MAX_APPROVER_NAME_LEN, MAX_APPROVER_USERNAME_LEN)
+
+    assert _clean_name("  Ada   Lovelace  ") == "Ada Lovelace"
+    assert _clean_name("A" * 200) == "A" * MAX_APPROVER_NAME_LEN
+    assert _clean_name("") is None
+    assert _clean_name("   ") is None
+    assert _clean_name(None) is None
+    assert _clean_name(42) is None
+
+    assert _clean_username("@ada") == "ada"
+    assert _clean_username("  @ada  ") == "ada"
+    assert _clean_username("u" * 200) == "u" * MAX_APPROVER_USERNAME_LEN
+    assert _clean_username("") is None
+    assert _clean_username(None) is None

@@ -56,6 +56,11 @@ MAX_CLAIM_FAILURES_PER_IP = 60
 MAX_VALID_CLAIMS_PER_PAIRING = 600
 CLAIM_WINDOW_S = 60.0
 MAX_NAME_LEN = 64
+# The approver's Telegram name and username are shown on the phone that is
+# being paired. They are trimmed and capped; nothing else about the admin
+# is stored, and neither value is a secret.
+MAX_APPROVER_NAME_LEN = 64
+MAX_APPROVER_USERNAME_LEN = 64
 MAX_PLATFORM_LEN = 16
 MAX_VERSION_LEN = 32
 MAX_DEVICE_ID_LEN = 64
@@ -88,6 +93,10 @@ class PairClaimBody(BaseModel):
     pairing_id: str = Field(min_length=1, max_length=64)
     claim_secret: str = Field(min_length=MIN_CLAIM_SECRET_LEN,
                                max_length=MAX_CLAIM_SECRET_LEN)
+    # The phone confirms the approver it was shown. An older APK does not
+    # send the field at all, and that must keep working: absent means
+    # "take the token now", exactly as before.
+    confirmed: bool | None = None
 
 
 class PairPreviewBody(BaseModel):
@@ -138,6 +147,27 @@ def _qr_payload(settings, pairing_id: str, scan_code: str) -> str:
     return token
 
 
+def _clean_name(value) -> str | None:
+    """The approver's Telegram first name, trimmed and capped.
+
+    It comes from Telegram initData, so it is trusted for identity but is
+    still user-controlled text: the cap keeps the column and the dialog
+    bounded, and an empty value is stored as NULL.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())[:MAX_APPROVER_NAME_LEN].strip()
+    return cleaned or None
+
+
+def _clean_username(value) -> str | None:
+    """The approver's Telegram @username without the ``@``, capped."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lstrip("@").strip()[:MAX_APPROVER_USERNAME_LEN]
+    return cleaned or None
+
+
 def _device_public(row: dict) -> dict:
     """The device fields the Mini App may see."""
     return {
@@ -150,6 +180,26 @@ def _device_public(row: dict) -> dict:
         "paired_at": row.get("paired_at"),
         "last_seen_at": row.get("last_seen_at"),
         "created_at": row.get("created_at"),
+    }
+
+
+def _pairing_device_public(pairing: dict) -> dict:
+    """The device shape of a pairing whose device row is not there yet.
+
+    The claim answer must have the same shape as the Mini App device
+    shape even in the rare moment between the approval and the device
+    row, so the phone can always render the confirmation dialog.
+    """
+    return {
+        "id": pairing.get("device_id"),
+        "name": pairing.get("device_name"),
+        "platform": pairing.get("platform"),
+        "app_version": pairing.get("app_version"),
+        "archived": False,
+        "revoked": False,
+        "paired_at": None,
+        "last_seen_at": None,
+        "created_at": pairing.get("created_at"),
     }
 
 
@@ -302,6 +352,40 @@ def build_router(settings) -> APIRouter:
         if status != "approved":
             raise _unknown_pairing()
 
+        if payload.confirmed is False:
+            # The user on this phone refused the pairing (or the screen
+            # could not ask). The code is dead: no token is issued, and
+            # the admin's approval is withdrawn so it cannot be collected
+            # later either.
+            db.pairing_cancel(conn, pairing["id"])
+            rev.bump_rev(request.app, pairing.get("device_id"), None)
+            return {"status": "cancelled"}
+
+        # A phone that knows about the confirmation sends the field
+        # (possibly as null) and gets the approver first. A phone that
+        # does not send it at all is an older APK: it gets the token
+        # straight away, exactly as before. A newer client therefore has
+        # to send ``"confirmed": null`` while it is only polling, and
+        # true/false once its user answered.
+        if ("confirmed" in payload.model_fields_set
+                and payload.confirmed is not True):
+            # An approval is not a token any more: the phone shows who
+            # approved it and asks its own user. Nothing secret is in this
+            # answer - no claim secret, and of course no token.
+            device = db.device_by_id(conn, pairing["device_id"])
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "awaiting_phone_confirmation",
+                    "device": (_device_public(device) if device is not None
+                               else _pairing_device_public(pairing)),
+                    "approved_by": {
+                        "name": pairing.get("approved_by_name"),
+                        "username": pairing.get("approved_by_username"),
+                    },
+                },
+            )
+
         token = _new_token()
         device = db.claim_pairing(conn, pairing["id"], db.token_hash(token),
                                   token[:TOKEN_PREFIX_LEN], now)
@@ -411,9 +495,11 @@ def build_miniapp_router(settings) -> APIRouter:
             # approval must be able to finish the pairing.
             raise HTTPException(409, "device is already paired")
         admin = getattr(request.state, "tg_user", {}) or {}
-        approved = db.pairing_approve(conn, pairing["id"], now,
-                                      admin.get("id"),
-                                      (payload.name or "").strip() or None)
+        approved = db.pairing_approve(
+            conn, pairing["id"], now, admin.get("id"),
+            (payload.name or "").strip() or None,
+            _clean_name(admin.get("first_name")),
+            _clean_username(admin.get("username")))
         if not approved and pairing.get("status") != "approved":
             raise HTTPException(409, "pairing is not pending")
         name = (payload.name or "").strip() or pairing["device_name"]

@@ -10,7 +10,7 @@ import app.db as db
 import app.calls as calls
 import app.phones as phones
 from app.flow import (MODE_IDLE, MODE_NUMBER, MODE_SEARCH, MODE_TEXT, Flow)
-from app.delivery import _html_escape
+from app.delivery import TG_NOTE_TTL_S, _html_escape
 from app.tg import TGError
 from app.tg_ui import button, keyboard, mask_number, normalize_number
 
@@ -824,8 +824,19 @@ class Updater:
         return "\n".join(lines)
 
     async def _reply(self, chat_id, text, keyboard=None) -> None:
-        await self.telegram.send_to_chat(chat_id, text, keyboard=keyboard)
+        sent = await self.telegram.send_to_chat(chat_id, text, keyboard=keyboard)
         log.info("sms-relay updater reply sent")
+        # A reply is a bot note, not an SMS notification: it gets its own
+        # deletion row so the chat does not grow forever. Bookkeeping must
+        # never undo a reply that is already in the chat.
+        message_id = sent.get("message_id") if isinstance(sent, dict) else None
+        try:
+            now = int(time.time())
+            db.record_tg_message(self.db_conn, chat_id, message_id, "updater",
+                                 now + TG_NOTE_TTL_S, now)
+        except Exception as exc:
+            log.warning("sms-relay updater note bookkeeping failed kind=%s",
+                        type(exc).__name__)
 
     def _poke(self) -> None:
         if self.poke_event is not None:

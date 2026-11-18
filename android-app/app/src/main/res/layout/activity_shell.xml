@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- The Messages home.
 
-     A plain vertical layout: toolbar, the optional role/pairing notes,
-     the list (which takes the rest of the height) and the extended FAB
-     over it. Nothing overlaps except the FAB, whose space is reserved by
-     the list's bottom padding, so no inset has to guess a view height. -->
+     One vertical column: toolbar, the optional role/pairing notes, the
+     list (which takes the rest of the height) and, at the very bottom,
+     the page bar. The list and the FAB live in the weighted frame above
+     the bar, so the bar cannot cover either of them and no padding has
+     to guess its height.
+
+     Only the FAB overlaps anything, and that overlap is reserved by the
+     list's bottom padding. The page bar is the one view that takes the
+     system navigation inset; the activities add it in code. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/rootShell"
@@ -68,22 +73,29 @@
                 android:layout_gravity="center"
                 android:indeterminate="true"
                 android:visibility="gone" />
-        </FrameLayout>
-    </LinearLayout>
 
-    <!-- Extended FAB: icon plus text, the "Start chat" action. Its label
-         is also its content description. -->
-    <com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
-        android:id="@+id/fabStartChat"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom|end"
-        android:layout_marginEnd="16dp"
-        android:layout_marginBottom="16dp"
-        android:contentDescription="@string/messages_start_chat"
-        android:text="@string/messages_start_chat"
-        android:textColor="?attr/colorOnPrimaryContainer"
-        app:backgroundTint="?attr/colorPrimaryContainer"
-        app:icon="@drawable/ic_start_chat"
-        app:iconTint="?attr/colorOnPrimaryContainer" />
+            <!-- Extended FAB: icon plus text, the "Start chat" action. Its
+                 label is also its content description. Being inside the
+                 weighted frame means it floats over the list only, never
+                 over the page bar. -->
+            <com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
+                android:id="@+id/fabStartChat"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:layout_marginEnd="16dp"
+                android:layout_marginBottom="16dp"
+                android:contentDescription="@string/messages_start_chat"
+                android:text="@string/messages_start_chat"
+                android:textColor="?attr/colorOnPrimaryContainer"
+                app:backgroundTint="?attr/colorPrimaryContainer"
+                app:icon="@drawable/ic_start_chat"
+                app:iconTint="?attr/colorOnPrimaryContainer" />
+        </FrameLayout>
+
+        <include
+            layout="@layout/view_bottom_nav"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
 </FrameLayout>

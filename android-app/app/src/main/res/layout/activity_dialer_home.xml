@@ -2,12 +2,15 @@
 <!-- The Phone home: the dialer hub of the app.
 
      One vertical column - toolbar, tab strip, the optional permission
-     notes and one list - plus the dialpad FAB over it. A single list is
-     reused for every tab; only its adapter changes, so the scroll
-     position, the ripples and the insets are set up exactly once.
+     notes, one list and, at the very bottom, the page bar - plus the
+     dialpad FAB over the list. A single list is reused for every tab;
+     only its adapter changes, so the scroll position, the ripples and
+     the insets are set up exactly once.
 
-     The FAB floats over the list, whose bottom padding reserves its
-     height, so the last row can always be scrolled clear of it. -->
+     The FAB and the list live in the weighted frame above the page bar,
+     so the bar never covers a row or the FAB; only the FAB overlaps the
+     list, whose bottom padding reserves its height. The page bar is the
+     one view that takes the system navigation inset (added in code). -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/rootDialerHome"
@@ -110,21 +113,28 @@
                 android:layout_gravity="center"
                 android:indeterminate="true"
                 android:visibility="gone" />
-        </FrameLayout>
-    </LinearLayout>
 
-    <!-- The dialpad. Circular on purpose: it is the one action of the
-         screen that is always one tap away, and a round button does not
-         cover a second row of text the way an extended one would. -->
-    <com.google.android.material.floatingactionbutton.FloatingActionButton
-        android:id="@+id/fabDialpad"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom|end"
-        android:layout_marginEnd="16dp"
-        android:layout_marginBottom="16dp"
-        android:contentDescription="@string/dialer_open_dialpad"
-        app:backgroundTint="?attr/colorPrimaryContainer"
-        app:srcCompat="@drawable/ic_dialpad_fab"
-        app:tint="?attr/colorOnPrimaryContainer" />
+            <!-- The dialpad. Circular on purpose: it is the one action of
+                 the screen that is always one tap away, and a round button
+                 does not cover a second row of text the way an extended
+                 one would. It stays inside the content frame, so the page
+                 bar is never covered. -->
+            <com.google.android.material.floatingactionbutton.FloatingActionButton
+                android:id="@+id/fabDialpad"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:layout_marginEnd="16dp"
+                android:layout_marginBottom="16dp"
+                android:contentDescription="@string/dialer_open_dialpad"
+                app:backgroundTint="?attr/colorPrimaryContainer"
+                app:srcCompat="@drawable/ic_dialpad_fab"
+                app:tint="?attr/colorOnPrimaryContainer" />
+        </FrameLayout>
+
+        <include
+            layout="@layout/view_bottom_nav"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
 </FrameLayout>

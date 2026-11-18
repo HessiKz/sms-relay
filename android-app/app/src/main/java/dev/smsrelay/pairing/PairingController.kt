@@ -39,6 +39,19 @@ class PairingController(
         /** The phone waits for the admin: the code is on the screen. */
         fun onPairingStarted(state: State)
 
+        /**
+         * The admin approved the pairing, and the server hands the
+         * token out only after the user confirmed it on this phone.
+         *
+         * [respond] is called exactly once with the answer of the user.
+         * When the screen cannot show the dialog it has to call
+         * `respond(false)`: a pairing is never confirmed silently.
+         */
+        fun onPairingConfirmationRequired(
+            confirmation: Confirmation,
+            respond: (Boolean) -> Unit
+        )
+
         /** The device was paired: the token is stored. */
         fun onPaired(deviceName: String)
 
@@ -61,8 +74,22 @@ class PairingController(
         Expired,
 
         /** The code is unknown to the server. */
-        Invalid
+        Invalid,
+
+        /** The user did not confirm the pairing on this phone. */
+        Cancelled
     }
+
+    /**
+     * What the dialog on the phone says. Only names and the server URL:
+     * the token and the claim secret are never part of it.
+     */
+    data class Confirmation(
+        val deviceName: String,
+        val serverUrl: String,
+        val approverName: String,
+        val approverUsername: String
+    )
 
     /** The visible part of a running pairing. */
     data class State(
@@ -203,7 +230,20 @@ class PairingController(
                     return
                 }
 
+                is PairClaimResult.ConfirmationRequired -> {
+                    // The admin approved, and the server wants the user
+                    // to confirm on this phone. The wait ends here: the
+                    // answer of the user decides, and it is asked once.
+                    askConfirmation(settings, pairingId, secret, result, mine, pairingClient)
+                    return
+                }
+
                 PairClaimResult.Pending -> wait = POLL_INTERVAL_MS
+
+                PairClaimResult.Cancelled -> {
+                    fail(Reason.Cancelled, mine)
+                    return
+                }
 
                 PairClaimResult.AlreadyClaimed -> {
                     fail(Reason.AlreadyClaimed, mine)
@@ -227,6 +267,125 @@ class PairingController(
             }
             if (!sleep(wait)) return
         }
+    }
+
+    /**
+     * Asks the user to confirm the pairing on this phone.
+     *
+     * The dialog names the server and the phone and who approved the
+     * pairing. Only the answer of the user collects the token: a screen
+     * that cannot show the dialog answers "no", so a pairing is never
+     * confirmed without the user.
+     */
+    private fun askConfirmation(
+        settings: SettingsStore,
+        pairingId: String,
+        secret: String,
+        result: PairClaimResult.ConfirmationRequired,
+        mine: Int,
+        pairingClient: PairingClient
+    ) {
+        val confirmation = Confirmation(
+            deviceName = result.deviceName.ifBlank { settings.deviceName },
+            serverUrl = settings.baseUri,
+            approverName = result.approverName,
+            approverUsername = result.approverUsername
+        )
+        val answered = AtomicBoolean(false)
+        main.post {
+            if (mine != generation.get()) {
+                // A newer pairing took over: this dialog is not shown and
+                // the pairing it belonged to is not cancelled either - it
+                // was superseded, not refused.
+                return@post
+            }
+            if (!running.get()) {
+                // The screen is gone before the question could be shown.
+                // A pairing is never confirmed silently: it is cancelled,
+                // and the call to the server runs off the main thread.
+                if (answered.compareAndSet(false, true)) {
+                    Thread { sendCancellation(pairingId, secret, mine, pairingClient) }.start()
+                }
+                return@post
+            }
+            listener.onPairingConfirmationRequired(confirmation) { confirmed ->
+                if (!answered.compareAndSet(false, true)) return@onPairingConfirmationRequired
+                Thread {
+                    if (confirmed) {
+                        confirmAndCollect(settings, pairingId, secret, mine, pairingClient)
+                    } else {
+                        sendCancellation(pairingId, secret, mine, pairingClient)
+                    }
+                }.start()
+            }
+        }
+    }
+
+    /**
+     * The user confirmed: the token is collected with `confirmed:true`.
+     * This is the only place a token is written, and it keeps the
+     * generation check of [succeed]: a stale answer from a pairing that
+     * is not on the screen any more writes nothing.
+     */
+    private fun confirmAndCollect(
+        settings: SettingsStore,
+        pairingId: String,
+        secret: String,
+        mine: Int,
+        pairingClient: PairingClient
+    ) {
+        if (mine != generation.get() || !running.get()) {
+            // The pairing this dialog belonged to is over, so no token is
+            // collected. The server is not told "no" here: the same
+            // pairing may have been picked up again, and a stale answer
+            // must never cancel the code that is on the screen now.
+            return
+        }
+        when (val result = pairingClient.claim(pairingId, secret, confirmed = true)) {
+            is PairClaimResult.Claimed -> succeed(settings, result.token, mine)
+            PairClaimResult.Cancelled -> fail(Reason.Cancelled, mine)
+            PairClaimResult.Expired -> fail(Reason.Expired, mine)
+            PairClaimResult.AlreadyClaimed -> fail(Reason.AlreadyClaimed, mine)
+            is PairClaimResult.Invalid -> fail(Reason.Invalid, mine)
+            is PairClaimResult.Unreachable -> fail(Reason.Network, mine)
+            // The server still wants a confirmation, or answers something
+            // unexpected: this pairing did not happen.
+            else -> fail(Reason.Server, mine)
+        }
+    }
+
+    /**
+     * The user turned the pairing down, or the dialog could not be shown.
+     *
+     * The local pairing is reset only when it is still this very pairing:
+     * a code that a newer pairing put on the screen keeps its secret. The
+     * screen is told only when this pairing is still the current one. The
+     * server is told in every case, so the pairing cannot be collected
+     * later; a failure here changes nothing, the phone holds no token.
+     */
+    private fun sendCancellation(
+        pairingId: String,
+        secret: String,
+        mine: Int,
+        pairingClient: PairingClient
+    ) {
+        val settings = SettingsStore(context)
+        // Only the pairing this answer belongs to is cleared: a newer
+        // pairing has its own id and keeps its code and secret.
+        if (settings.pairingId == pairingId) {
+            settings.clearPairing()
+            settings.pairingState = SettingsStore.STATE_UNPAIRED
+        }
+        if (mine == generation.get()) {
+            // The user said no: every thread of this pairing is stale now,
+            // so a late answer can never write a token.
+            generation.incrementAndGet()
+            running.set(false)
+            main.post { listener.onPairingFailed(Reason.Cancelled) }
+        }
+        // The server is told as well, so the pairing cannot be collected
+        // later. A failure here changes nothing: the phone has no token.
+        runCatching { pairingClient.claim(pairingId, secret, confirmed = false) }
     }
 
     /** The token is here: it is stored and the workers are started again. */

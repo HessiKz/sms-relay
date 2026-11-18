@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SearchView
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -25,6 +28,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.appbar.MaterialToolbar
+import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.floatingactionbutton.FloatingActionButton
@@ -39,6 +43,8 @@ import dev.smsrelay.ui.dialer.FavoritesAdapter
 import dev.smsrelay.ui.dialer.RecentsAdapter
 import dev.smsrelay.messages.SmsRepository
 import dev.smsrelay.ui.messages.MessagesBanner
+import dev.smsrelay.util.Diagnostics
+import dev.smsrelay.util.RoleState
 import kotlinx.coroutines.launch
 
 /**
@@ -77,6 +83,7 @@ class DialerHomeActivity : AppCompatActivity() {
     private lateinit var stateButton: MaterialButton
     private lateinit var progress: View
     private lateinit var fab: FloatingActionButton
+    private lateinit var bottomNav: BottomNavigationView
 
     private lateinit var recents: RecentsAdapter
     private lateinit var contacts: ContactsAdapter
@@ -111,6 +118,15 @@ class DialerHomeActivity : AppCompatActivity() {
      */
     private var loadGeneration = 0
 
+    /**
+     * True while a page-bar item is selected from code.
+     *
+     * `selectedItemId` fires the listener exactly like a tap, and this
+     * screen sets it on every resume and on every tab change; without
+     * this flag the highlight would start a screen each time.
+     */
+    private var suppressNav = false
+
     /** The permission asked for last, so several can be requested at once. */
     private var pendingPermission: String = ""
 
@@ -133,6 +149,27 @@ class DialerHomeActivity : AppCompatActivity() {
     private var resumed = false
 
     /**
+     * True while a tab is selected from an incoming intent.
+     *
+     * `onNewIntent` runs just before `onResume`, and `onResume` reads the
+     * tab anyway. Letting the tab listener read as well would query the
+     * provider twice for one tap, so the selection is made silent here and
+     * the resume does the single read.
+     */
+    private var suppressTabLoad = false
+
+    /**
+     * True while the page-bar listener is dispatching a tap.
+     *
+     * Material calls the listener *before* it sets the new
+     * `selectedItemId`, so the field still holds the previous page inside
+     * the callback. Moving the highlight from there would re-enter the
+     * dispatch; the flag tells [syncBottomNav] to stay out of the way,
+     * because the framework is about to set the id itself.
+     */
+    private var dispatchingNav = false
+
+    /**
      * The runtime permissions the screen reads with.
      *
      * The result is not inspected: the user may have granted one and
@@ -151,6 +188,43 @@ class DialerHomeActivity : AppCompatActivity() {
         pendingPermission = ""
         renderBanners()
         loadCurrentTab()
+    }
+
+    /**
+     * The call permissions that follow the role dialog.
+     *
+     * A launcher, so the answer cannot be lost while the role screen is
+     * still closing; the screen re-reads the role and its tab either way.
+     */
+    private val rolePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        renderBanners()
+        loadCurrentTab()
+    }
+
+    /**
+     * The system dialog that asks for the dialer role.
+     *
+     * The result code is not trusted: a vendor build can answer OK and
+     * change nothing, so only [RoleState.isDialerRoleHeld] decides, and
+     * the screen re-reads it here and again on every resume.
+     */
+    private val dialerRoleLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (RoleState.isDialerRoleHeld(this)) {
+            Toast.makeText(this, R.string.action_dialer_role_granted, Toast.LENGTH_SHORT).show()
+        } else if (result.resultCode == RESULT_OK) {
+            Toast.makeText(this, R.string.action_dialer_role_not_applied, Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(this, R.string.action_dialer_role_refused, Toast.LENGTH_LONG).show()
+        }
+        renderBanners()
+        loadCurrentTab()
+        // The permissions are a separate question, asked only now: some
+        // builds drop a dialog opened on top of the role screen.
+        askRolePermissions()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -172,6 +246,7 @@ class DialerHomeActivity : AppCompatActivity() {
         stateButton = findViewById(R.id.buttonDialerState)
         progress = findViewById(R.id.progressDialer)
         fab = findViewById(R.id.fabDialpad)
+        bottomNav = findViewById(R.id.bottomNav)
 
         toolbar.title = getString(R.string.dialer_title)
         toolbar.setOnMenuItemClickListener(::onMenuItem)
@@ -195,6 +270,10 @@ class DialerHomeActivity : AppCompatActivity() {
         list.setHasFixedSize(true)
 
         installTabs()
+        // Before the tab is selected below: selecting one fires the tab
+        // listener, which now also moves the page bar, so the bar has to
+        // exist by then.
+        installBottomNav()
         fab.setOnClickListener { openDialpad(null) }
 
         // The search belongs to the screen, not to one tab: it comes back
@@ -203,10 +282,20 @@ class DialerHomeActivity : AppCompatActivity() {
         query = savedInstanceState?.getString(STATE_QUERY).orEmpty()
 
         // `TabLayout` mirrors this selection and fires its listener, which
-        // draws the right adapter and loads that tab; a missing value (a
-        // first open, or a bundle from an older build) falls back to the
+        // draws the right adapter and loads that tab.
+        //
+        // Precedence matters here. A restored bundle beats the intent's
+        // extra, because after the process was killed Android re-delivers
+        // the *original* launch intent while the bundle holds the tab the
+        // user actually last had: the extra would silently drag the screen
+        // back to the tab it was first opened with. A fresh start has no
+        // bundle, so a page-bar tap's extra decides then. A missing value
+        // (a first open, or a bundle from an older build) falls back to the
         // call log.
-        tab = DialerTab.of(savedInstanceState?.getInt(STATE_TAB, -1) ?: -1)
+        val requested = consumeRequestedTab()
+        tab = DialerTab.of(
+            savedInstanceState?.getInt(STATE_TAB, -1) ?: requested ?: -1
+        )
         tabs.getTabAt(tab.ordinal)?.select()
         restoreSearch()
 
@@ -219,6 +308,32 @@ class DialerHomeActivity : AppCompatActivity() {
         outState.putString(STATE_QUERY, query)
     }
 
+    /**
+     * A page-bar tap that found this screen already running.
+     *
+     * `REORDER_TO_FRONT` raises the instance instead of starting another
+     * one, so the tab it asked for arrives here rather than in `onCreate`.
+     * The strip is moved now - the user must see the right tab the moment
+     * the screen is in front - but the read is left to the `onResume`
+     * that follows, so one tap still costs exactly one query.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val requested = consumeRequestedTab() ?: return
+        val wanted = DialerTab.of(requested)
+        if (wanted == tab) return
+        // The strip is moved now so the user sees the right tab the moment
+        // the screen is in front; the read is left to the resume that
+        // follows, which is why the listener stays silent here.
+        suppressTabLoad = true
+        try {
+            tabs.getTabAt(wanted.ordinal)?.select()
+        } finally {
+            suppressTabLoad = false
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         resumed = true
@@ -228,6 +343,11 @@ class DialerHomeActivity : AppCompatActivity() {
         // dialog.
         loadCurrentTab()
         renderBanners()
+        // The bar mirrors the tab in front of the user: Contacts is the
+        // only dialer tab with its own page-bar entry, so every other tab
+        // reads as Phone. Silent, so returning from a call does not
+        // re-select a tab or start a screen.
+        syncBottomNav()
     }
 
     // ------------------------------------------------------------- tabs
@@ -246,8 +366,12 @@ class DialerHomeActivity : AppCompatActivity() {
         tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
             override fun onTabSelected(selected: TabLayout.Tab) {
                 tab = selected.tag as? DialerTab ?: DialerTab.RECENTS
-                if (resumed) loadCurrentTab()
+                if (resumed && !suppressTabLoad) loadCurrentTab()
                 renderBanners()
+                // A tab tapped with the finger, or selected from a page-bar
+                // tap, moves the bar with it: Contacts is the only tab that
+                // has its own entry there, every other one reads as Phone.
+                syncBottomNav()
             }
 
             override fun onTabUnselected(selected: TabLayout.Tab) = Unit
@@ -837,6 +961,89 @@ class DialerHomeActivity : AppCompatActivity() {
         }
     }
 
+    // -------------------------------------------------------------- roles
+
+    /**
+     * The dialer-role card of the Phone home.
+     *
+     * The setup screen was the only place the role could be asked for,
+     * and a phone whose call permissions were refused could never get
+     * there. The role is offered here, on the screen the user actually
+     * uses, in three states: held, available, and not offered by this
+     * phone (then the settings screen is the only answer).
+     */
+    private fun renderRoleCard() {
+        if (RoleState.isDialerRoleHeld(this)) return
+        val available = RoleState.isDialerRoleAvailable(this)
+        MessagesBanner.addProminentTo(
+            column = banners,
+            context = this,
+            text = getString(
+                if (available) R.string.dialer_role_card else R.string.dialer_role_unavailable_card
+            )
+        ) {
+            if (available) requestDialerRole() else openDialerSettings()
+        }
+    }
+
+    /**
+     * Asks the system for the dialer role.
+     *
+     * The permissions are never a gate: they are asked for separately,
+     * after the role dialog, because a single "no" used to hide the role
+     * dialog for good. The role itself is read again on resume.
+     */
+    private fun requestDialerRole() {
+        val intent = RoleState.dialerRoleIntent(this)
+        if (intent == null) {
+            openDialerSettings()
+            askRolePermissions()
+            return
+        }
+        val launched = runCatching { dialerRoleLauncher.launch(intent) }.isSuccess
+        if (!launched) {
+            openDialerSettings()
+            askRolePermissions()
+        }
+    }
+
+    /**
+     * The call permissions, asked after the role and never before it.
+     *
+     * A dialog opened on top of the role screen is dropped by some
+     * builds, so this runs from the role result, or right away when the
+     * role dialog could not be shown. The answer is not inspected: the
+     * dialpad works either way, and the role is read again on resume.
+     */
+    private fun askRolePermissions() {
+        if (RoleState.isDialerRoleHeld(this)) return
+        val missing = arrayOf(
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.ANSWER_PHONE_CALLS,
+            Manifest.permission.READ_CALL_LOG
+        ).filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) return
+        runCatching { rolePermissionLauncher.launch(missing.toTypedArray()) }
+    }
+
+    /** The default-apps screen, where the dialer can be chosen by hand. */
+    private fun openDialerSettings() {
+        if (runCatching {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+            }.isSuccess
+        ) {
+            Toast.makeText(this, R.string.action_dialer_role_settings, Toast.LENGTH_LONG).show()
+            return
+        }
+        if (runCatching { startActivity(Diagnostics.appDetailsIntent(this)) }.isSuccess) {
+            Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+            return
+        }
+        Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+    }
+
     // ------------------------------------------------------------ banners
 
     /**
@@ -851,6 +1058,7 @@ class DialerHomeActivity : AppCompatActivity() {
      */
     private fun renderBanners() {
         banners.removeAllViews()
+        renderRoleCard()
         if (tab != DialerTab.RECENTS) return
         if (!DialerRepository.canReadCallLog(this)) return
         if (DialerRepository.canWriteCallLog(this)) return
@@ -883,16 +1091,17 @@ class DialerHomeActivity : AppCompatActivity() {
      * Edge to edge without guessing at a status bar height.
      *
      * The content column takes the top, left and right insets, so the
-     * toolbar, the tabs and the rows all sit inside the safe area. The
-     * list takes the bottom inset plus the space the FAB floats over, so
-     * the last row can still be scrolled clear of both, and the FAB moves
-     * up by the navigation inset.
+     * toolbar, the tabs, the notes and the rows all sit inside the safe
+     * area. The list keeps only the space its FAB floats over, because
+     * the page bar sits below it as a real row: the list ends where the
+     * bar begins, so the bottom inset is not added to it a second time.
+     * The bar takes that inset itself and fills the gesture area with its
+     * own surface colour. The FAB moves in from the sides only.
      */
     private fun applyInsets() {
         val fabParams: ViewGroup.MarginLayoutParams =
             fab.layoutParams as ViewGroup.MarginLayoutParams
         val fabMarginEnd = fabParams.marginEnd
-        val fabMarginBottom = fabParams.bottomMargin
         val content = findViewById<View>(R.id.layoutDialerContent)
         val listBottom = resources.getDimensionPixelSize(R.dimen.messages_list_bottom_padding)
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.rootDialerHome)) { _, insets ->
@@ -900,22 +1109,167 @@ class DialerHomeActivity : AppCompatActivity() {
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             )
             content.updatePadding(top = bars.top, left = bars.left, right = bars.right)
-            list.updatePadding(bottom = listBottom + bars.bottom)
+            list.updatePadding(bottom = listBottom)
             fabParams.marginEnd = fabMarginEnd + bars.right
-            fabParams.bottomMargin = fabMarginBottom + bars.bottom
             fab.layoutParams = fabParams
+            insets
+        }
+        // The page bar takes the bottom inset itself, and only that one.
+        //
+        // Material installs its own insets listener on this view in its
+        // constructor (`BottomNavigationView.applyWindowInsets`), so
+        // setting ours replaces it rather than stacking on it. Replacing
+        // is deliberate: Material's listener also adds the left and right
+        // system insets, and the content column above already takes those,
+        // which would pad the bar twice on a landscape phone with a side
+        // navigation bar. The bar is a child of that column, so it still
+        // receives the insets even though the root listener above does not
+        // consume them.
+        val navBottom = bottomNav.paddingBottom
+        ViewCompat.setOnApplyWindowInsetsListener(bottomNav) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.updatePadding(bottom = navBottom + bars.bottom)
             insets
         }
     }
 
-    private companion object {
+    // -------------------------------------------------------- navigation
+
+    /**
+     * The page bar of the Phone home.
+     *
+     * Phone and Contacts are both this screen. Contacts selects its tab in
+     * place - same screen, same list, one tab over - so it starts nothing.
+     * Phone keeps the current tab, unless that tab is Contacts: Contacts
+     * has its own entry here, so leaving the highlight on it while the
+     * user asked for Phone would misreport where they are, and Recents is
+     * the tab Phone means. Messages and Settings are other screens and are
+     * brought forward with [Intent.FLAG_ACTIVITY_REORDER_TO_FRONT], never
+     * stacked.
+     */
+    private fun installBottomNav() {
+        bottomNav.setOnItemSelectedListener { item ->
+            if (suppressNav) return@setOnItemSelectedListener true
+            dispatchingNav = true
+            try {
+                when (item.itemId) {
+                    R.id.nav_phone -> {
+                        if (tab == DialerTab.CONTACTS) {
+                            tabs.getTabAt(DialerTab.RECENTS.ordinal)?.select()
+                        }
+                    }
+                    R.id.nav_contacts -> {
+                        if (tab != DialerTab.CONTACTS) {
+                            tabs.getTabAt(DialerTab.CONTACTS.ordinal)?.select()
+                        }
+                    }
+                    R.id.nav_messages -> startTopLevel(Intent(this, ShellActivity::class.java))
+                    R.id.nav_settings -> startTopLevel(Intent(this, MainActivity::class.java))
+                    else -> return@setOnItemSelectedListener false
+                }
+            } finally {
+                dispatchingNav = false
+            }
+            true
+        }
+        syncBottomNav()
+    }
+
+    /**
+     * Points the bar at the page the user is actually on.
+     *
+     * Guarded because the tab strip can fire before the bar is inflated
+     * (a selection made in `onCreate`); reading a `lateinit` field there
+     * would crash for a highlight that is only a decoration.
+     */
+    private fun syncBottomNav() {
+        if (!this::bottomNav.isInitialized) return
+        // A tap is being dispatched: the framework sets the id right after
+        // the listener returns, so correcting it here would fight it.
+        if (dispatchingNav) return
+        selectNavSilently(
+            if (tab == DialerTab.CONTACTS) R.id.nav_contacts else R.id.nav_phone
+        )
+    }
+
+    /**
+     * Selects an item without running the listener.
+     *
+     * `selectedItemId` is the only way to move the highlight and it fires
+     * the listener exactly like a tap, so the flag guards it and is reset
+     * in a `finally`: an exception must not leave the bar deaf.
+     */
+    private fun selectNavSilently(itemId: Int) {
+        if (bottomNav.selectedItemId == itemId) return
+        suppressNav = true
+        try {
+            bottomNav.selectedItemId = itemId
+        } finally {
+            suppressNav = false
+        }
+    }
+
+    /**
+     * Brings a top-level screen forward instead of starting a copy.
+     *
+     * `REORDER_TO_FRONT` raises the instance already in this task and
+     * makes the platform deliver this intent to it, which is what lets the
+     * Messages home come back as the Messages page instead of a second
+     * copy on top of this one.
+     */
+    private fun startTopLevel(intent: Intent) {
+        intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        startActivity(intent)
+    }
+
+    /**
+     * The tab the current intent asks for, read once and then cleared.
+     *
+     * Clearing matters: the tab can move on afterwards - the user taps
+     * Contacts in the strip, or switches to Voicemail - and a rotation
+     * must restore that tab, not the one this screen was opened with. A
+     * value this build does not know is ignored, never fatal.
+     */
+    private fun consumeRequestedTab(): Int? {
+        val current: Intent? = getIntent()
+        val ordinal = when (current?.getStringExtra(EXTRA_TAB)) {
+            TAB_RECENTS -> DialerTab.RECENTS.ordinal
+            TAB_CONTACTS -> DialerTab.CONTACTS.ordinal
+            else -> null
+        }
+        if (current != null && current.hasExtra(EXTRA_TAB)) current.removeExtra(EXTRA_TAB)
+        return ordinal
+    }
+
+    companion object {
+        /**
+         * The tab an incoming intent asks for.
+         *
+         * [TAB_RECENTS] or [TAB_CONTACTS]; a plain string, so an unknown
+         * value from a newer build is ignored instead of crashing.
+         */
+        const val EXTRA_TAB = "dev.smsrelay.extra.DIALER_TAB"
+
+        /** The two tabs the page bar can ask for. */
+        const val TAB_RECENTS = "recents"
+        const val TAB_CONTACTS = "contacts"
+
+        /**
+         * The intent that opens the Phone home on [tab].
+         *
+         * The extra is spelled here and nowhere else, so the Messages
+         * home and this screen cannot disagree about it.
+         */
+        fun intentForTab(context: Context, tab: String): Intent =
+            Intent(context, DialerHomeActivity::class.java).putExtra(EXTRA_TAB, tab)
+
         /** The selected tab across a rotation or a process restart. */
-        const val STATE_TAB = "dialer_tab"
+        private const val STATE_TAB = "dialer_tab"
 
         /** The search text, so a rotation keeps the list filtered. */
-        const val STATE_QUERY = "dialer_query"
+        private const val STATE_QUERY = "dialer_query"
 
         /** Marks a SearchView whose listeners are already installed. */
-        const val TAG_SEARCH_BOUND = "search_bound"
+        private const val TAG_SEARCH_BOUND = "search_bound"
     }
 }

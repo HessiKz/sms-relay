@@ -80,6 +80,13 @@
     <string name="pair_error_qr">The code could not be drawn — generate a new one.</string>
     <string name="pair_replace_title">Replace the pairing code?</string>
     <string name="pair_replace_message">The QR code currently shown in the Mini App will stop working. Generate a new code and scan the new QR.</string>
+    <string name="pair_confirm_title">Pair this phone?</string>
+    <string name="pair_confirm_message">Server: %1$s\nPhone: %2$s\n%3$s</string>
+    <string name="pair_confirm_approver">Approved by %1$s</string>
+    <string name="pair_confirm_approver_username">Approved by %1$s (@%2$s)</string>
+    <string name="pair_confirm_approver_unknown">Approved in the Mini App</string>
+    <string name="pair_confirm_positive">Pair</string>
+    <string name="pair_error_cancelled">Pairing cancelled on this phone. Generate a new code to pair.</string>
 
     <!-- Writing a message -->
     <string name="hint_compose_number">Number or contact name</string>
@@ -299,6 +306,23 @@
     <string name="messages_empty">No messages yet</string>
     <string name="messages_error_read">Messages could not be read. Allow SMS Relay to read your messages.</string>
     <string name="messages_role_banner">SMS Relay is not the default SMS app — open settings</string>
+    <string name="messages_role_card">SMS Relay is not the default SMS app — messages are hidden until you allow it. Tap to fix.</string>
+    <string name="messages_role_needed_state">Messages cannot be read until SMS Relay is your default SMS app. Tap the card above to allow it.</string>
+    <string name="dialer_role_card">SMS Relay is not your dialer — calls come in through your usual phone app until you allow it. Tap to fix.</string>
+    <string name="dialer_role_unavailable_card">This phone does not offer the dialer role — tap to open the settings and choose SMS Relay by hand.</string>
+    <string name="diagnostics_title">Role &amp; SMS diagnostics</string>
+    <string name="diagnostics_android">Android SDK: %1$d</string>
+    <string name="diagnostics_role_sms_available">SMS role offered by this phone: %1$s</string>
+    <string name="diagnostics_role_sms_held">SMS role held by SMS Relay: %1$s</string>
+    <string name="diagnostics_role_dialer_available">Dialer role offered by this phone: %1$s</string>
+    <string name="diagnostics_role_dialer_held">Dialer role held by SMS Relay: %1$s</string>
+    <string name="diagnostics_sms_package">Default SMS app: %1$s</string>
+    <string name="diagnostics_dialer_package">Default dialer: %1$s</string>
+    <string name="diagnostics_package">This app: %1$s</string>
+    <string name="diagnostics_permission">%1$s granted: %2$s</string>
+    <string name="diagnostics_yes">yes</string>
+    <string name="diagnostics_no">no</string>
+    <string name="diagnostics_none">none</string>
     <string name="messages_relay_banner">Relay not paired — messages stay on this phone. Tap to set up.</string>
     <string name="messages_pick_no_number">That contact has no phone number.</string>
     <string name="messages_unknown_sender">Unknown</string>
@@ -372,4 +396,13 @@
     <string name="dialer_copy_failed">This number cannot be copied.</string>
     <string name="dialer_delete_failed">The call could not be deleted</string>
     <string name="dialer_no_number">This row has no number to dial.</string>
+
+    <!-- The page bar shared by the two homes. Short on purpose: a bottom
+         navigation label is read at a glance and is truncated sooner
+         than a toolbar title. "Phone" and "Contacts" match the toolbar
+         and the tab strip above them; "Settings" is the setup screen. -->
+    <string name="nav_messages">Messages</string>
+    <string name="nav_phone">Phone</string>
+    <string name="nav_contacts">Contacts</string>
+    <string name="nav_settings">Settings</string>
 </resources>

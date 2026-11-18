@@ -5,6 +5,8 @@ import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.Telephony
+import android.util.Log
+import dev.smsrelay.BuildConfig
 import dev.smsrelay.data.ContactsRepository
 import dev.smsrelay.util.PhoneNumbers
 import kotlinx.coroutines.Dispatchers
@@ -57,8 +59,21 @@ object SmsRepository {
     /** How many messages one page of a thread holds. */
     const val MESSAGE_LIMIT = 500
 
+    /** The log tag of the reads; never carries a number, name or body. */
+    private const val TAG = "SmsRepository"
+
     /** How many rows the unread scan may touch. */
     private const val UNREAD_SCAN_LIMIT = 2000
+
+    /**
+     * How many threads may be repaired from their first SMS row.
+     *
+     * The fallback costs one query per thread. A phone whose canonical
+     * table refuses everything would otherwise turn one list read into
+     * thousands of queries; past this bound the remaining threads are
+     * shown address-less (still visible, still openable by thread id).
+     */
+    private const val ADDRESS_FALLBACK_LIMIT = 300
 
     /** The projection of a conversation row; the order is the one used below. */
     private val CONVERSATION_PROJECTION = arrayOf(
@@ -105,6 +120,13 @@ object SmsRepository {
      * Every id is resolved, not just the first one: a row with two or
      * more recipients is a group, and a group must not be shown - or
      * dialled - as a private chat with whoever happened to be first.
+     *
+     * The canonical table is internal to the platform and a vendor build
+     * can refuse it or leave it empty, so an unresolved thread is not
+     * dropped any more: the address is read from its first SMS row, and
+     * a thread that still has none is kept with a blank address. The
+     * label then falls back to "Unknown" and the composer stays
+     * disabled, which is honest; an empty list was not.
      */
     suspend fun conversations(context: Context): SmsThreads = withContext(Dispatchers.IO) {
         val appContext = context.applicationContext
@@ -112,6 +134,10 @@ object SmsRepository {
         val addressCache = HashMap<String, String>()
         val unread = unreadCounts(appContext)
         val threads = ArrayList<SmsThread>()
+        var readThreads = 0
+        var resolvedThreads = 0
+        var unresolvedThreads = 0
+        var fallbackReads = 0
         try {
             appContext.contentResolver.query(
                 CONVERSATIONS_URI,
@@ -130,12 +156,29 @@ object SmsRepository {
                 }
                 while (cursor.moveToNext()) {
                     val threadId = cursor.getLong(idCol)
-                    val recipients = resolveRecipients(
+                    readThreads++
+                    var recipients = resolveRecipients(
                         appContext,
                         cursor.getString(recipientsCol).orEmpty(),
                         addressCache
                     )
-                    if (recipients.isEmpty()) continue
+                    if (recipients.isEmpty()) {
+                        // No canonical address: ask the thread itself.
+                        // Only a one-to-one thread is repaired this way,
+                        // because the first SMS row of a group names one
+                        // member, not the group.
+                        val ids = cursor.getString(recipientsCol).orEmpty()
+                        if (recipientIdCount(ids) <= 1 && fallbackReads < ADDRESS_FALLBACK_LIMIT) {
+                            fallbackReads++
+                            val fromStore = firstAddressOfThread(appContext, threadId)
+                            if (fromStore.isNotEmpty()) recipients = listOf(fromStore)
+                        }
+                    }
+                    if (recipients.isEmpty()) {
+                        unresolvedThreads++
+                    } else {
+                        resolvedThreads++
+                    }
                     val recipientNames = recipients.map { number ->
                         names[numberKey(number)].orEmpty()
                     }
@@ -169,9 +212,56 @@ object SmsRepository {
         } catch (e: Exception) {
             return@withContext SmsThreads(emptyList(), true)
         }
+        // Counts only, and only in a debug build: no number, name, body or
+        // thread id is ever logged, so the line can be pasted anywhere.
+        if (BuildConfig.DEBUG) {
+            Log.d(
+                TAG,
+                "conversations: read=$readThreads threads, " +
+                    "withAddress=$resolvedThreads, withoutAddress=$unresolvedThreads, " +
+                    "fallbacks=$fallbackReads"
+            )
+        }
         // The provider already sorts, but a row without a date would
         // otherwise sit at the wrong end of the list on some builds.
         SmsThreads(threads.sortedByDescending { it.dateMillis }, false)
+    }
+
+    /** How many recipient ids a `RECIPIENT_IDS` value names. */
+    private fun recipientIdCount(recipientIds: String): Int =
+        recipientIds.split(' ', '\t', ',').count { it.trim().isNotEmpty() }
+
+    /**
+     * The address of the first SMS row of one thread, or "".
+     *
+     * This is the fallback when `canonical-addresses` gives nothing: the
+     * message rows carry the address themselves, and one row is enough
+     * to name a one-to-one conversation. It never throws; a provider
+     * refusal is simply an empty answer.
+     */
+    private fun firstAddressOfThread(context: Context, threadId: Long): String = try {
+        context.contentResolver.query(
+            SMS_URI,
+            arrayOf("address"),
+            "thread_id = ?",
+            arrayOf(threadId.toString()),
+            "date ASC, _id ASC LIMIT 1"
+        ).use { cursor ->
+            if (cursor != null && cursor.moveToFirst()) {
+                val column = cursor.getColumnIndex("address")
+                if (column >= 0) {
+                    cursor.getString(column)?.trim().orEmpty()
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            }
+        }
+    } catch (e: SecurityException) {
+        ""
+    } catch (e: Exception) {
+        ""
     }
 
     /**
@@ -363,12 +453,19 @@ object SmsRepository {
                     if (cursor == null || !cursor.moveToFirst()) return@withContext null
                     val recipientsCol = cursor.getColumnIndex("recipient_ids")
                     if (recipientsCol < 0) return@withContext null
-                    val recipients = resolveRecipients(
+                    var recipients = resolveRecipients(
                         appContext,
                         cursor.getString(recipientsCol).orEmpty(),
                         cache
                     )
-                    if (recipients.isEmpty()) return@withContext null
+                    if (recipients.isEmpty() &&
+                        recipientIdCount(cursor.getString(recipientsCol).orEmpty()) <= 1
+                    ) {
+                        // Same fallback as the list: the row itself knows
+                        // the address even when the canonical table does not.
+                        val fromStore = firstAddressOfThread(appContext, threadId)
+                        if (fromStore.isNotEmpty()) recipients = listOf(fromStore)
+                    }
                     val dateCol = cursor.getColumnIndex("date")
                     val snippetCol = cursor.getColumnIndex("snippet")
                     SmsThread(
@@ -570,6 +667,8 @@ object SmsRepository {
      *
      * Empty for a group: a group has no single address, and returning one
      * member's number would let the caller dial that person privately.
+     * When the canonical table resolves nothing the first SMS row of the
+     * thread is asked, exactly as the conversation list does.
      */
     suspend fun addressForThread(context: Context, threadId: Long): String =
         withContext(Dispatchers.IO) {
@@ -584,12 +683,20 @@ object SmsRepository {
                     if (cursor == null || !cursor.moveToFirst()) return@withContext ""
                     val column = cursor.getColumnIndex("recipient_ids")
                     if (column < 0) return@withContext ""
+                    val raw = cursor.getString(column).orEmpty()
                     val recipients = resolveRecipients(
                         context.applicationContext,
-                        cursor.getString(column).orEmpty(),
+                        raw,
                         HashMap()
                     )
-                    if (recipients.size == 1) recipients[0] else ""
+                    if (recipients.size == 1) return@withContext recipients[0]
+                    if (recipients.isEmpty() && recipientIdCount(raw) <= 1) {
+                        return@withContext firstAddressOfThread(
+                            context.applicationContext,
+                            threadId
+                        )
+                    }
+                    ""
                 }
             } catch (e: Exception) {
                 ""

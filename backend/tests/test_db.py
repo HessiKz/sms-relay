@@ -823,3 +823,195 @@ def test_reschedule_notification_pushes_the_deadline(tmp_path):
     db.reschedule_notification(conn, "push", 5000, delay=300)
 
     assert _row(conn, "push")["telegram_delete_at"] == 5300
+
+
+# --- Bot notes that the relay deletes later -----------------------------
+
+def _tg_row(conn, row_id):
+    return db._asdict(conn.execute("SELECT * FROM tg_messages WHERE id = ?",
+                                   (row_id,)).fetchone())
+
+
+def test_record_tg_message_stores_the_note(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+
+    row_id = db.record_tg_message(conn, "chat-1", 77, "command_result",
+                                  5000, 1400)
+
+    assert row_id > 0
+    row = _tg_row(conn, row_id)
+    assert row["chat_id"] == "chat-1"
+    assert row["message_id"] == 77
+    assert row["kind"] == "command_result"
+    assert row["delete_at"] == 5000
+    assert row["created_at"] == 1400
+    assert row["deleted_at"] is None
+
+
+def test_record_tg_message_refuses_unusable_arguments(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+
+    assert db.record_tg_message(conn, "chat-1", None, "note", 5, 1) == 0
+    assert db.record_tg_message(conn, "chat-1", "x", "note", 5, 1) == 0
+    assert db.record_tg_message(conn, None, 5, "note", 5, 1) == 0
+    assert db.record_tg_message(conn, "", 5, "note", 5, 1) == 0
+    assert db.due_tg_messages(conn, 10 ** 9) == []
+
+
+def test_record_tg_message_caps_the_kind(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+
+    row_id = db.record_tg_message(conn, "chat-1", 1, "k" * 200, 5, 1)
+
+    assert len(_tg_row(conn, row_id)["kind"]) == db.TG_KIND_MAX_LEN
+
+
+def test_due_tg_messages_returns_only_live_due_rows(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 2_000_000_000
+    due = db.record_tg_message(conn, "chat-1", 1, "note", now - 1, now - 10)
+    later = db.record_tg_message(conn, "chat-1", 2, "note", now + 500, now)
+    gone = db.record_tg_message(conn, "chat-1", 3, "note", now - 1, now - 10)
+    db.mark_tg_message_deleted(conn, gone, now - 5)
+
+    rows = db.due_tg_messages(conn, now)
+
+    assert [row["id"] for row in rows] == [due]
+    assert _tg_row(conn, later)["deleted_at"] is None
+
+
+def test_due_tg_messages_is_ordered_and_limited(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    now = 2_000_000_000
+    first = db.record_tg_message(conn, "chat-1", 1, "note", now - 50, now)
+    second = db.record_tg_message(conn, "chat-1", 2, "note", now - 60, now)
+    db.record_tg_message(conn, "chat-1", 3, "note", now - 40, now)
+
+    rows = db.due_tg_messages(conn, now, limit=2)
+
+    assert [row["id"] for row in rows] == [second, first]
+
+
+def test_mark_tg_message_deleted_keeps_the_row_as_a_tombstone(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    row_id = db.record_tg_message(conn, "chat-1", 1, "note", 1000, 900)
+
+    db.mark_tg_message_deleted(conn, row_id, 1200)
+
+    row = _tg_row(conn, row_id)
+    assert row["deleted_at"] == 1200
+    assert row["message_id"] == 1
+    assert db.due_tg_messages(conn, 10 ** 9) == []
+
+
+def test_mark_tg_message_deleted_is_idempotent(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    row_id = db.record_tg_message(conn, "chat-1", 1, "note", 1000, 900)
+
+    db.mark_tg_message_deleted(conn, row_id, 1200)
+    db.mark_tg_message_deleted(conn, row_id, 1300)
+
+    assert _tg_row(conn, row_id)["deleted_at"] == 1200
+
+
+def test_reschedule_tg_message_pushes_the_deadline(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    row_id = db.record_tg_message(conn, "chat-1", 1, "note", 1000, 900)
+
+    db.reschedule_tg_message(conn, row_id, 1200, delay=300)
+
+    row = _tg_row(conn, row_id)
+    assert row["delete_at"] == 1500
+    assert row["deleted_at"] is None
+
+
+def test_reschedule_tg_message_does_not_revive_a_deleted_row(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    row_id = db.record_tg_message(conn, "chat-1", 1, "note", 1000, 900)
+    db.mark_tg_message_deleted(conn, row_id, 1200)
+
+    db.reschedule_tg_message(conn, row_id, 1200, delay=300)
+
+    row = _tg_row(conn, row_id)
+    assert row["delete_at"] == 1000
+    assert row["deleted_at"] == 1200
+
+
+def test_the_tg_messages_table_survives_a_reopen(tmp_path):
+    path = str(tmp_path / "x.db")
+    conn = db.open_db(path)
+    row_id = db.record_tg_message(conn, "chat-1", 1, "note", 1000, 900)
+    conn.close()
+
+    conn2 = db.open_db(path)
+
+    assert _tg_row(conn2, row_id)["message_id"] == 1
+    assert len(db.due_tg_messages(conn2, 5000)) == 1
+
+
+# --- The approver of a pairing ------------------------------------------
+
+def test_migration_adds_the_approver_columns_to_pairings(tmp_path):
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+    CREATE TABLE pairings (
+        id TEXT PRIMARY KEY,
+        scan_code_hash TEXT NOT NULL,
+        claim_secret_hash TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        app_version TEXT,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        approved_at INTEGER,
+        approved_by INTEGER,
+        claimed_at INTEGER,
+        status TEXT NOT NULL
+    );
+    INSERT INTO pairings VALUES ('p1', 'h', 'c', 'd', 'N', 'android', NULL,
+                                 1, 2, NULL, NULL, NULL, 'pending');
+    """)
+    conn.commit()
+    conn.close()
+
+    conn = db.open_db(path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(pairings)")}
+        assert {"approved_by_name", "approved_by_username"} <= columns
+        row = conn.execute("SELECT * FROM pairings WHERE id = 'p1'").fetchone()
+        assert row["approved_by_name"] is None
+        assert row["approved_by_username"] is None
+        db.migrate(conn)
+        db.migrate(conn)
+        # The old row is untouched by the additive migration.
+        assert db.pairing_by_id(conn, "p1")["status"] == "pending"
+    finally:
+        conn.close()
+
+
+def test_pairing_approve_stores_the_approver(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    db.pairing_create(conn, "p1", "scan", "claim", "dev-1", "Phone",
+                      "android", None, 1000, 2000)
+
+    assert db.pairing_approve(conn, "p1", 1500, 7, None, "Ada Lovelace",
+                              "ada") is True
+
+    pairing = db.pairing_by_id(conn, "p1")
+    assert pairing["approved_by_name"] == "Ada Lovelace"
+    assert pairing["approved_by_username"] == "ada"
+
+
+def test_pairing_approve_keeps_the_approver_when_it_is_not_resupplied(tmp_path):
+    conn = db.open_db(str(tmp_path / "x.db"))
+    db.pairing_create(conn, "p1", "scan", "claim", "dev-1", "Phone",
+                      "android", None, 1000, 2000)
+    db.pairing_approve(conn, "p1", 1500, 7, None, "Ada", "ada")
+
+    db.pairing_approve(conn, "p1", 1600, 7, None, None, None)
+
+    pairing = db.pairing_by_id(conn, "p1")
+    assert pairing["approved_by_name"] == "Ada"
+    assert pairing["approved_by_username"] == "ada"

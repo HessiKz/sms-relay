@@ -411,6 +411,78 @@ def _result(client, command_id, status, detail=None):
                        headers=DEVICE_HEADERS)
 
 
+def test_a_result_note_is_tracked_for_deletion(client):
+    """The note is a bot message, so the reaper needs its own row."""
+    _queue(client, command_id="cmd-note")
+    fake = FakeTelegram()
+    client.app.state.tg = fake
+
+    r = _result(client, "cmd-note", "sent")
+
+    assert r.status_code == 200
+    rows = client.app.state.db_conn.execute(
+        "SELECT chat_id, message_id, kind, delete_at, created_at"
+        " FROM tg_messages").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["chat_id"] == "test-chat-id"
+    assert row["message_id"] == 1
+    assert row["kind"] == "command_result"
+    assert row["delete_at"] - row["created_at"] == 3600
+    assert row["delete_at"] > int(time.time())
+
+
+def test_a_delivered_result_is_not_tracked_and_not_sent(client):
+    _queue(client, command_id="cmd-silent")
+    fake = FakeTelegram()
+    client.app.state.tg = fake
+
+    r = _result(client, "cmd-silent", "delivered")
+
+    assert r.status_code == 200
+    assert fake.sent == []
+    assert client.app.state.db_conn.execute(
+        "SELECT COUNT(*) FROM tg_messages").fetchone()[0] == 0
+
+
+def test_the_note_is_tracked_even_without_a_message_id(client):
+    """A missing id is not recorded rather than recorded unusable."""
+    _queue(client, command_id="cmd-noid")
+
+    class NoIdTelegram(FakeTelegram):
+        async def send_to_chat(self, chat_id, text, reply_to=None,
+                               keyboard=None):
+            self.sent.append((chat_id, text, keyboard))
+            return {"ok": True}
+
+    fake = NoIdTelegram()
+    client.app.state.tg = fake
+
+    r = _result(client, "cmd-noid", "sent")
+
+    assert r.status_code == 200
+    assert len(fake.sent) == 1
+    assert client.app.state.db_conn.execute(
+        "SELECT COUNT(*) FROM tg_messages").fetchone()[0] == 0
+
+
+def test_a_bookkeeping_failure_does_not_break_the_result(client, monkeypatch):
+    _queue(client, command_id="cmd-boom")
+    fake = FakeTelegram()
+    client.app.state.tg = fake
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(db, "record_tg_message", boom)
+
+    r = _result(client, "cmd-boom", "sent")
+
+    assert r.status_code == 200
+    assert r.json() == {"accepted": True, "status": "sent"}
+    assert len(fake.sent) == 1
+
+
 def test_result_endpoint_sent_then_delivered_posts_one_note(client):
     _queue(client)
     fake = FakeTelegram()

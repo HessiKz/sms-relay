@@ -164,4 +164,91 @@ object RoleState {
             else -> context.getString(R.string.capture_state_none)
         }
     }
+
+    /**
+     * The facts an operator needs to say why a role is or is not held.
+     *
+     * It is built here, from the same helpers the screens use, so the
+     * report cannot disagree with the card next to it. It only holds
+     * settings and permissions: no number, name or message is ever in it.
+     */
+    fun diagnosticsReport(context: Context): String {
+        val smsPackage = runCatching {
+            Telephony.Sms.getDefaultSmsPackage(context)
+        }.getOrNull()
+        val dialerPackage = runCatching {
+            context.getSystemService(TelecomManager::class.java)?.defaultDialerPackage
+        }.getOrNull()
+        val lines = ArrayList<String>(12)
+        lines.add(context.getString(R.string.diagnostics_android, Build.VERSION.SDK_INT))
+        lines.add(
+            context.getString(
+                R.string.diagnostics_role_sms_available,
+                yesNo(context, isRoleAvailable(context))
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_role_sms_held,
+                yesNo(context, isRoleHeld(context))
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_role_dialer_available,
+                yesNo(context, isDialerRoleAvailable(context))
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_role_dialer_held,
+                yesNo(context, isDialerRoleHeld(context))
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_sms_package,
+                smsPackage ?: context.getString(R.string.diagnostics_none)
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_dialer_package,
+                dialerPackage ?: context.getString(R.string.diagnostics_none)
+            )
+        )
+        lines.add(context.getString(R.string.diagnostics_package, context.packageName))
+        lines.add(
+            context.getString(
+                R.string.diagnostics_permission,
+                "READ_SMS",
+                yesNo(context, hasPermission(context, Manifest.permission.READ_SMS))
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_permission,
+                "READ_CALL_LOG",
+                yesNo(context, hasPermission(context, Manifest.permission.READ_CALL_LOG))
+            )
+        )
+        lines.add(
+            context.getString(
+                R.string.diagnostics_permission,
+                "READ_CONTACTS",
+                yesNo(context, hasPermission(context, Manifest.permission.READ_CONTACTS))
+            )
+        )
+        return lines.joinToString("\n")
+    }
+
+    private fun hasPermission(context: Context, permission: String): Boolean =
+        runCatching {
+            ContextCompat.checkSelfPermission(context, permission) ==
+                PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+
+    private fun yesNo(context: Context, value: Boolean): String = context.getString(
+        if (value) R.string.diagnostics_yes else R.string.diagnostics_no
+    )
 }

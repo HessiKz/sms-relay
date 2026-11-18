@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The page bar of the app: the four top-level destinations.
+
+     It is a real row of both home layouts, not an overlay, so the list
+     above it simply ends where the bar begins and no padding has to
+     guess a bar height. The bar takes the bottom system inset itself (the
+     activities own that listener, because Material installs one that also
+     pads the sides), so it also fills the gesture area with the same
+     surface colour as the screen.
+
+     The labels come from the menu file; every colour is a Material 3
+     theme attribute, so day/night and dynamic colour apply without a
+     selector here. -->
+<com.google.android.material.bottomnavigation.BottomNavigationView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/bottomNav"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="?attr/colorSurface"
+    android:elevation="3dp"
+    app:labelVisibilityMode="labeled"
+    app:menu="@menu/menu_bottom_nav" />

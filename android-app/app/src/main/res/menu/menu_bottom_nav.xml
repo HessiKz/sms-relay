@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The app's top-level pages.
+
+     Messages and Phone are the two homes; Contacts is a destination of
+     the Phone home selected in place; Settings is the setup screen that
+     already owns the role and permission switches. Order is deliberate:
+     the two daily pages sit under the thumb, Settings at the far edge.
+
+     Four items, never five: `BottomNavigationView` keeps labels for all
+     of them at any width. -->
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item
+        android:id="@+id/nav_messages"
+        android:icon="@drawable/ic_message"
+        android:title="@string/nav_messages" />
+
+    <item
+        android:id="@+id/nav_phone"
+        android:icon="@drawable/ic_call"
+        android:title="@string/nav_phone" />
+
+    <item
+        android:id="@+id/nav_contacts"
+        android:icon="@drawable/ic_person"
+        android:title="@string/nav_contacts" />
+
+    <item
+        android:id="@+id/nav_settings"
+        android:icon="@drawable/ic_settings"
+        android:title="@string/nav_settings" />
+</menu>

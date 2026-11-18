@@ -176,6 +176,8 @@ _SCHEMA = [
         expires_at       INTEGER NOT NULL,
         approved_at      INTEGER,
         approved_by      INTEGER,
+        approved_by_name      TEXT,
+        approved_by_username  TEXT,
         claimed_at       INTEGER,
         status           TEXT NOT NULL CHECK
           (status IN ('pending','approved','claimed','expired','cancelled'))
@@ -268,6 +270,19 @@ _SCHEMA = [
     " ON call_actions(device_id, status, created_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_call_actions_client_ref"
     " ON call_actions(client_ref) WHERE client_ref IS NOT NULL",
+    """
+    CREATE TABLE IF NOT EXISTS tg_messages (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id    TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        kind       TEXT NOT NULL,
+        delete_at  INTEGER NOT NULL,
+        deleted_at INTEGER,
+        created_at INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tg_messages_due"
+    " ON tg_messages(delete_at)",
 ]
 
 # Indexes may reference columns that only exist after _ensure_column() has
@@ -310,6 +325,10 @@ _COLUMNS = (
      "ALTER TABLE messages ADD COLUMN telegram_deleted_at INTEGER"),
     ("sms_commands", "device_id",
      "ALTER TABLE sms_commands ADD COLUMN device_id TEXT"),
+    ("pairings", "approved_by_name",
+     "ALTER TABLE pairings ADD COLUMN approved_by_name TEXT"),
+    ("pairings", "approved_by_username",
+     "ALTER TABLE pairings ADD COLUMN approved_by_username TEXT"),
 )
 
 _WRITE_LOCK = threading.Lock()  # writes and reads; app is single-threaded asyncio, lock is cheap, and reads must never observe another thread's uncommitted tx
@@ -1701,6 +1720,81 @@ def reschedule_notification(conn: sqlite3.Connection, msg_id: str,
     ))
 
 
+# --- bot notes that are deleted later ------------------------------------
+#
+# Command notes ("SMS sent to ...") are ordinary bot messages, not SMS
+# notifications: they have no row in ``messages``. They are tracked here
+# so the reaper can drop them after a while instead of leaving them in
+# the chat forever. Only the notes this relay creates are recorded.
+
+TG_KIND_MAX_LEN = 32
+
+
+def record_tg_message(conn: sqlite3.Connection, chat_id, message_id: int,
+                      kind: str, delete_at: int, now: int) -> int:
+    """Remember a bot message that must be deleted at ``delete_at``.
+
+    Returns the row id, or 0 when the arguments cannot name a message:
+    a bookkeeping failure must never break the send that already
+    happened.
+    """
+    try:
+        parsed = int(message_id)
+    except (TypeError, ValueError):
+        return 0
+    if chat_id is None or str(chat_id) == "":
+        return 0
+    label = str(kind or "note")[:TG_KIND_MAX_LEN]
+
+    def fn() -> int:
+        cur = conn.execute(
+            "INSERT INTO tg_messages"
+            " (chat_id, message_id, kind, delete_at, deleted_at, created_at)"
+            " VALUES (?, ?, ?, ?, NULL, ?)",
+            (str(chat_id), parsed, label, int(delete_at), int(now)),
+        )
+        return int(cur.lastrowid or 0)
+
+    return int(_write_tx(conn, fn) or 0)
+
+
+def due_tg_messages(conn: sqlite3.Connection, now: int,
+                    limit: int = 20) -> list[dict]:
+    """Bot notes whose deletion deadline has passed."""
+    limit = max(1, min(int(limit), 200))
+    with _WRITE_LOCK:
+        rows = conn.execute(
+            "SELECT id, chat_id, message_id, kind, delete_at"
+            " FROM tg_messages"
+            " WHERE delete_at <= ? AND deleted_at IS NULL"
+            " ORDER BY delete_at, id LIMIT ?",
+            (int(now), limit),
+        ).fetchall()
+    return [_asdict(row) for row in rows]
+
+
+def mark_tg_message_deleted(conn: sqlite3.Connection, row_id: int,
+                            now: int) -> None:
+    """Mark a bot note as gone; the row stays as a tombstone."""
+    stamp = int(now)
+    _write_tx(conn, lambda: conn.execute(
+        "UPDATE tg_messages SET deleted_at = ?"
+        " WHERE id = ? AND deleted_at IS NULL",
+        (stamp, int(row_id)),
+    ))
+
+
+def reschedule_tg_message(conn: sqlite3.Connection, row_id: int, now: int,
+                          delay: int = 300) -> None:
+    """Push a failed delete back, so the reaper does not spin on it."""
+    stamp = int(now)
+    _write_tx(conn, lambda: conn.execute(
+        "UPDATE tg_messages SET delete_at = ?"
+        " WHERE id = ? AND deleted_at IS NULL",
+        (stamp + int(delay), int(row_id)),
+    ))
+
+
 def mark_thread_read(conn: sqlite3.Connection, device_id: str,
                      thread_key: str, until_ts: int) -> int:
     """Advance the read cursor of a thread, never moving it backwards.
@@ -2377,15 +2471,25 @@ def pairing_pending_count(conn: sqlite3.Connection, now: int) -> int:
 
 
 def pairing_approve(conn: sqlite3.Connection, pairing_id: str, approved_at: int,
-                    approved_by: int | None, device_name: str | None) -> bool:
-    """Mark a pairing as approved; the device token comes later."""
+                    approved_by: int | None, device_name: str | None,
+                    approved_by_name: str | None = None,
+                    approved_by_username: str | None = None) -> bool:
+    """Mark a pairing as approved; the device token comes later.
+
+    The admin's display name and username are kept so the phone can show
+    who approved the pairing before it accepts the token. They are
+    optional, and only ever the values Telegram handed the Mini App.
+    """
     def fn() -> bool:
         cur = conn.execute(
             "UPDATE pairings SET status = 'approved', approved_at = ?,"
             " approved_by = ?,"
+            " approved_by_name = COALESCE(?, approved_by_name),"
+            " approved_by_username = COALESCE(?, approved_by_username),"
             " device_name = COALESCE(?, device_name)"
             " WHERE id = ? AND status = 'pending'",
-            (int(approved_at), approved_by, device_name, pairing_id),
+            (int(approved_at), approved_by, approved_by_name,
+             approved_by_username, device_name, pairing_id),
         )
         return cur.rowcount > 0
 

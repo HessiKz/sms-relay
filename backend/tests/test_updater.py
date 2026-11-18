@@ -137,6 +137,44 @@ async def test_pause_sets_setting_replies_and_pokes(conn, settings):
 
 
 @pytest.mark.anyio
+async def test_a_reply_is_tracked_for_deletion(conn, settings):
+    """Every reply is a bot note, so the reaper gets its own row."""
+    fake = FakeTelegram(script=[[_msg(1, "/pause")]])
+    updater = _updater(fake, conn, settings)
+
+    await _drive(fake, updater, lambda: len(fake.sent) >= 1)
+
+    rows = conn.execute(
+        "SELECT chat_id, message_id, kind, delete_at, created_at"
+        " FROM tg_messages").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["chat_id"] == str(CHAT_ID)
+    assert row["message_id"] == 1
+    assert row["kind"] == "updater"
+    assert row["delete_at"] - row["created_at"] == 3600
+
+
+@pytest.mark.anyio
+async def test_a_reply_still_sends_when_bookkeeping_fails(conn, settings,
+                                                         monkeypatch):
+    fake = FakeTelegram(script=[[_msg(1, "/pause")]])
+    updater = _updater(fake, conn, settings)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(db, "record_tg_message", boom)
+
+    await _drive(fake, updater, lambda: len(fake.sent) >= 1)
+
+    assert fake.sent == [(CHAT_ID, "Forwarding paused.")]
+    assert db.settings_get(conn, "paused") == "1"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tg_messages").fetchone()[0] == 0
+
+
+@pytest.mark.anyio
 async def test_pause_accepts_case_and_bot_name_suffix(conn, settings):
     fake = FakeTelegram(script=[[_msg(1, "/PAUSE@relay_bot")]])
 

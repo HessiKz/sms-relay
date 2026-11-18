@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import app.db as db
 from app import rev, security
+from app.delivery import TG_NOTE_TTL_S
 
 VERSION = "0.1.0"
 QUEUE_SCAN_LIMIT = 1000
@@ -371,9 +372,23 @@ def build_router(settings) -> APIRouter:
                             + (f" ({detail})" if detail else ""),
             }.get(status, status)
             try:
-                await telegram.send_to_chat(chat_id, note)
+                sent = await telegram.send_to_chat(chat_id, note)
             except Exception:
                 pass
+            else:
+                # The note is a bot message, not an SMS notification, so
+                # it needs its own deletion row: the reaper removes it an
+                # hour from now. A bookkeeping failure must never undo a
+                # note that is already in the chat.
+                now = int(time.time())
+                message_id = (sent.get("message_id")
+                              if isinstance(sent, dict) else None)
+                try:
+                    db.record_tg_message(conn, chat_id, message_id,
+                                         "command_result", now + TG_NOTE_TTL_S,
+                                         now)
+                except Exception:
+                    pass
         return {"accepted": True, "status": status}
 
     @router.post("/contacts", dependencies=[Depends(device_required)])

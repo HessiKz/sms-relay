@@ -114,8 +114,12 @@ class MainActivity : AppCompatActivity() {
     private var buttonDialerRole: Button? = null
     private var textDialerRoleState: TextView? = null
 
-    /** Set when the role was asked for before the permissions were given. */
-    private var pendingDialerRole = false
+    /**
+     * True while the role dialog has to be opened as soon as the
+     * permission dialog is answered. It is not a gate: the answer is
+     * ignored, and the role is requested either way.
+     */
+    private var roleRequestPending = false
 
     // The pairing of this phone with the server.
     private lateinit var buttonPair: Button
@@ -128,6 +132,9 @@ class MainActivity : AppCompatActivity() {
 
     /** When the running pairing runs out (epoch seconds). */
     private var pairingExpiresAt = 0L
+
+    /** The dialog that asks the user to confirm the pairing. */
+    private var pairConfirmDialog: AlertDialog? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -202,12 +209,17 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
-        // The role was asked for before the permissions: Android never
-        // grants it to an app that cannot place or answer a call, so the
-        // request is repeated now that something was allowed.
-        if (pendingDialerRole && hasAllCallPermissions()) {
-            pendingDialerRole = false
-            requestDialerRole()
+        // The role was asked for while a call permission was missing and
+        // Android refused it for that reason: now that something was
+        // allowed, ask once more, so the user does not have to find the
+        // button again. A granted role ends the wish.
+        if (roleRequestPending) {
+            if (RoleState.isDialerRoleHeld(this)) {
+                roleRequestPending = false
+            } else if (hasAllCallPermissions()) {
+                roleRequestPending = false
+                requestDialerRole()
+            }
         }
     }
 
@@ -224,12 +236,22 @@ class MainActivity : AppCompatActivity() {
     ) { result ->
         if (RoleState.isDialerRoleHeld(this)) {
             Toast.makeText(this, R.string.action_dialer_role_granted, Toast.LENGTH_SHORT).show()
+            roleRequestPending = false
         } else if (result.resultCode == Activity.RESULT_OK) {
             Toast.makeText(this, R.string.action_dialer_role_not_applied, Toast.LENGTH_LONG).show()
         } else {
             Toast.makeText(this, R.string.action_dialer_role_refused, Toast.LENGTH_LONG).show()
         }
         updateCallCard()
+        // The permissions are a second, separate question, and only now:
+        // a dialog opened on top of the role dialog would be dropped by
+        // some builds. Android may have refused the role for exactly
+        // these permissions, so the role is asked for once more after
+        // they are granted, without the user having to find the button.
+        if (!RoleState.isDialerRoleHeld(this) && !hasAllCallPermissions()) {
+            roleRequestPending = true
+            requestCallPermissions()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -353,6 +375,13 @@ class MainActivity : AppCompatActivity() {
         refreshStatus()
         refreshPairingUi()
         updateCallCard()
+        // The role dialog can be answered while this screen is away, and
+        // a vendor build can change the answer later: the role is re-read
+        // here, never remembered from the last tap.
+        if (roleRequestPending && RoleState.isDialerRoleHeld(this)) {
+            roleRequestPending = false
+            Toast.makeText(this, R.string.action_dialer_role_granted, Toast.LENGTH_SHORT).show()
+        }
         // A pairing that was running when the app was closed goes on.
         pairing.resume()
         if (waitingForDefaultSmsChoice) {
@@ -377,6 +406,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // A dialog that is still open is not an answer.
+        //
+        // When the screen is really going away, closing it answers "no",
+        // so the pairing is cancelled instead of a token being stored
+        // that nobody agreed to. After a rotation only the window is
+        // gone: the new screen asks again.
+        dismissPairConfirmDialog(cancelPairing = !isChangingConfigurations)
         // The waiting for the admin stops with the screen. The pairing
         // itself is not thrown away: it goes on the next time the app is
         // opened.
@@ -508,6 +544,10 @@ class MainActivity : AppCompatActivity() {
             showPairMessage(getString(R.string.pair_error_url))
             return
         }
+        // A confirmation dialog of the old pairing is not an answer for
+        // the new one: it is closed without answering, so the old pairing
+        // is simply superseded instead of being reported as cancelled.
+        dismissPairConfirmDialog(cancelPairing = false)
         // The URL and the name are written before the pairing starts.
         settings.baseUri = url
         settings.deviceName = name
@@ -537,6 +577,57 @@ class MainActivity : AppCompatActivity() {
     /** A message of the pairing, in plain words. */
     private fun showPairMessage(message: String) {
         textPairState.text = message
+    }
+
+    /**
+     * What the confirmation dialog says: the server, this phone and who
+     * approved the pairing. Never the token or the claim secret.
+     */
+    private fun confirmationMessage(
+        confirmation: PairingController.Confirmation
+    ): String {
+        val approver = when {
+            confirmation.approverName.isNotBlank() &&
+                confirmation.approverUsername.isNotBlank() ->
+                getString(
+                    R.string.pair_confirm_approver_username,
+                    confirmation.approverName,
+                    confirmation.approverUsername
+                )
+
+            confirmation.approverName.isNotBlank() ->
+                getString(R.string.pair_confirm_approver, confirmation.approverName)
+
+            confirmation.approverUsername.isNotBlank() ->
+                getString(
+                    R.string.pair_confirm_approver,
+                    "@" + confirmation.approverUsername
+                )
+
+            else -> getString(R.string.pair_confirm_approver_unknown)
+        }
+        val device = confirmation.deviceName.ifBlank { settings.deviceName }
+        return getString(
+            R.string.pair_confirm_message,
+            confirmation.serverUrl,
+            device,
+            approver
+        )
+    }
+
+    /**
+     * Closes the confirmation dialog.
+     *
+     * With [cancelPairing] the dialog answers "no" on the way out, so the
+     * pairing is cancelled and no token is stored - the answer is never
+     * assumed. Without it the listener is detached first and the pairing
+     * stays pending on the server, so the next screen asks again.
+     */
+    private fun dismissPairConfirmDialog(cancelPairing: Boolean) {
+        val dialog = pairConfirmDialog ?: return
+        pairConfirmDialog = null
+        if (!cancelPairing) dialog.setOnDismissListener(null)
+        dialog.dismiss()
     }
 
     /** The code and the QR code are only shown while the admin waits. */
@@ -598,6 +689,60 @@ class MainActivity : AppCompatActivity() {
             showPairingCode(state)
         }
 
+        /**
+         * The admin approved the pairing. The user has to confirm it on
+         * this phone before the token is handed out and stored.
+         *
+         * The dialog is not cancelable: back or a tap outside is not an
+         * answer, and an unanswered dialog must not pair the phone.
+         */
+        override fun onPairingConfirmationRequired(
+            confirmation: PairingController.Confirmation,
+            respond: (Boolean) -> Unit
+        ) {
+            if (isFinishing || isDestroyed) {
+                // No screen, no confirmation: the pairing is cancelled
+                // instead of storing a token nobody agreed to.
+                respond(false)
+                return
+            }
+            hidePairingCode()
+            buttonPair.isEnabled = false
+            showPairMessage(getString(R.string.pair_state_waiting))
+            var answered = false
+            val dialog = AlertDialog.Builder(this@MainActivity)
+                .setTitle(R.string.pair_confirm_title)
+                .setMessage(confirmationMessage(confirmation))
+                .setPositiveButton(R.string.pair_confirm_positive) { _, _ ->
+                    answered = true
+                    respond(true)
+                }
+                .setNegativeButton(android.R.string.cancel) { _, _ ->
+                    answered = true
+                    respond(false)
+                }
+                .create()
+            dialog.setCancelable(false)
+            dialog.setCanceledOnTouchOutside(false)
+            dialog.setOnDismissListener {
+                if (pairConfirmDialog === dialog) pairConfirmDialog = null
+                if (!answered) {
+                    // Dismissed without an answer: do not pair.
+                    answered = true
+                    respond(false)
+                }
+            }
+            val shown = runCatching { dialog.show() }.isSuccess
+            if (shown) {
+                pairConfirmDialog = dialog
+            } else if (!answered) {
+                // The screen went away between the check and the show:
+                // a pairing is cancelled, never confirmed silently.
+                answered = true
+                respond(false)
+            }
+        }
+
         override fun onPaired(deviceName: String) {
             if (isFinishing || isDestroyed) return
             showPairMessage(getString(R.string.pair_state_paired, deviceName))
@@ -628,6 +773,7 @@ class MainActivity : AppCompatActivity() {
 
                         PairingController.Reason.Expired -> R.string.pair_error_expired
                         PairingController.Reason.Invalid -> R.string.pair_error_invalid
+                        PairingController.Reason.Cancelled -> R.string.pair_error_cancelled
                     }
                 )
             )
@@ -1202,24 +1348,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Asks for the dialer role.
+     * Ask for the dialer role.
      *
-     * The call permissions come first: Android does not grant the role
-     * to an app that cannot place or answer a call, and the system
-     * dialog would simply refuse without saying why. When a permission
-     * is still missing the request is remembered and repeated as soon as
-     * something is granted.
+     * The role request is the first thing that happens: gating it behind
+     * the call permissions was a dead end, because a single "no" (for
+     * example to ANSWER_PHONE_CALLS) hid the role dialog for good and the
+     * app could never become the dialer. Android does check the
+     * permissions itself before it grants the role, so the dialog
+     * decides; when it fails for lack of a permission the card is still
+     * there, and the permission button asks for the missing ones.
+     *
+     * The permissions are asked for afterwards, separately, so the user
+     * sees both questions instead of only the one that blocked the other.
      */
     private fun requestDialerRole() {
         if (RoleState.isDialerRoleHeld(this)) {
             Toast.makeText(this, R.string.calls_role_held, Toast.LENGTH_SHORT).show()
             updateCallCard()
-            return
-        }
-        if (!hasAllCallPermissions()) {
-            pendingDialerRole = true
-            Toast.makeText(this, R.string.call_perm_needed_for_role, Toast.LENGTH_LONG).show()
-            requestCallPermissions()
             return
         }
         val intent = RoleState.dialerRoleIntent(this)
@@ -1229,12 +1374,31 @@ class MainActivity : AppCompatActivity() {
             if (!openDefaultAppsSettings()) {
                 Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
             }
+            askCallPermissionsAfterRole()
             return
         }
         val launched = runCatching { dialerRoleLauncher.launch(intent) }.isSuccess
-        if (!launched && !openDefaultAppsSettings()) {
-            Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+        if (!launched) {
+            if (!openDefaultAppsSettings()) {
+                Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+            }
+            // The dialog never opened, so nothing will ask later.
+            askCallPermissionsAfterRole()
         }
+    }
+
+    /**
+     * The missing call permissions, asked after the role, never before.
+     *
+     * A dialog opened on top of the role screen is dropped by some
+     * builds, so the role answer comes first: [dialerRoleLauncher] calls
+     * this when it returns, and [requestDialerRole] calls it only when
+     * the role dialog could not be shown at all.
+     */
+    private fun askCallPermissionsAfterRole() {
+        if (hasAllCallPermissions()) return
+        roleRequestPending = true
+        requestCallPermissions()
     }
 
     /**

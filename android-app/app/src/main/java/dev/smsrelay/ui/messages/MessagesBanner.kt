@@ -68,6 +68,53 @@ object MessagesBanner {
         column.addView(card(context, text, onClick), params)
     }
 
+    /**
+     * Adds one prominent note: the same card, larger, and not truncated.
+     *
+     * The default-SMS role is not a hint: without it the list is empty,
+     * so its card must read as a blocker rather than as a passing note.
+     */
+    fun addProminentTo(column: ViewGroup, context: Context, text: String, onClick: () -> Unit) {
+        val params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(context, 12) }
+        column.addView(prominentCard(context, text, onClick), params)
+    }
+
+    /** A tappable card that carries a blocking message. */
+    fun prominentCard(context: Context, text: String, onClick: () -> Unit): View {
+        val card = MaterialCardView(context).apply {
+            radius = dp(context, 16).toFloat()
+            cardElevation = 0f
+            setCardBackgroundColor(
+                AvatarDrawable.themeColor(
+                    context,
+                    MaterialR.attr.colorPrimaryContainer,
+                    0xFFD0BCFF.toInt()
+                )
+            )
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+        }
+        val label = TextView(context).apply {
+            this.text = text
+            setTextColor(
+                AvatarDrawable.themeColor(
+                    context,
+                    MaterialR.attr.colorOnPrimaryContainer,
+                    0xFF21005D.toInt()
+                )
+            )
+            textSize = 16f
+            gravity = Gravity.START
+            setPadding(dp(context, 18), dp(context, 16), dp(context, 18), dp(context, 16))
+        }
+        card.addView(label)
+        return card
+    }
+
     private fun dp(context: Context, value: Int): Int =
         (value * context.resources.displayMetrics.density).toInt()
 }
