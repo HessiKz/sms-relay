@@ -449,16 +449,24 @@ object DialerRepository {
     /**
      * The voicemail number the carrier configured, or null.
      *
-     * `getVoiceMailNumber` needs `READ_PHONE_STATE`; without it, or on a
-     * card that never received one, the answer is null and the screen
-     * says so instead of dialling a made-up number.
+     * The public lookup takes the account it should ask about, so it is
+     * asked about the first call-capable account of this phone: a carrier
+     * sets the number per account, and without an account the answer is
+     * unknown rather than guessed.
+     *
+     * Both calls can throw `SecurityException` without `READ_PHONE_STATE`:
+     * listing the accounts needs it, and so does reading the number. A
+     * refusal, a phone with no call-capable account, or a card that never
+     * received a number all come back as null, and the screen says so
+     * instead of dialling a made-up number.
      */
     suspend fun voicemailNumber(context: Context): String? = withContext(Dispatchers.IO) {
         val manager = runCatching {
             context.getSystemService(TelecomManager::class.java)
         }.getOrNull() ?: return@withContext null
-        runCatching { manager.getVoiceMailNumber()?.trim() }
-            .getOrNull()
-            ?.takeIf { it.isNotEmpty() }
+        runCatching {
+            val handle = manager.callCapablePhoneAccounts.firstOrNull()
+            if (handle == null) null else manager.getVoiceMailNumber(handle)?.trim()
+        }.getOrNull()?.takeIf { it.isNotEmpty() }
     }
 }
