@@ -3,9 +3,11 @@ package dev.smsrelay.util
 import android.Manifest
 import android.app.role.RoleManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Telephony
+import android.telecom.TelecomManager
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import dev.smsrelay.R
@@ -52,6 +54,77 @@ object RoleState {
         val roleManager = context.getSystemService(RoleManager::class.java) ?: return false
         return runCatching {
             roleManager.isRoleHeld(RoleManager.ROLE_SMS)
+        }.getOrDefault(false)
+    }
+
+    /**
+     * True when the phone knows the default-dialer role at all.
+     *
+     * A phone without telephony, or a vendor build that took the role
+     * away, has no role to ask for: the default apps settings are then
+     * the only way left.
+     */
+    fun isDialerRoleAvailable(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        val roleManager = context.getSystemService(RoleManager::class.java) ?: return false
+        return runCatching {
+            roleManager.isRoleAvailable(RoleManager.ROLE_DIALER)
+        }.getOrDefault(false)
+    }
+
+    /**
+     * The system intent that asks the user to make this app the dialer.
+     *
+     * Android 10+ owns the choice in the role manager. Android 8 and 9
+     * have no role yet: there the platform still accepts
+     * `TelecomManager.ACTION_CHANGE_DEFAULT_DIALER` with the package name
+     * of the candidate, which shows the same system dialog.
+     *
+     * Returns null when the phone offers neither path; the caller then
+     * sends the user to the default-apps settings instead of doing
+     * nothing. The answer is never trusted: the role is re-read.
+     */
+    fun dialerRoleIntent(context: Context): Intent? {
+        val packageName = context.packageName
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = context.getSystemService(RoleManager::class.java)
+                ?: return null
+            if (!runCatching { roleManager.isRoleAvailable(RoleManager.ROLE_DIALER) }
+                    .getOrDefault(false)
+            ) {
+                return null
+            }
+            return runCatching {
+                roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER)
+            }.getOrNull()
+        }
+        // Android 8 and 9: the telecom service shows the dialog. The
+        // extra is the one the platform reads for this action.
+        val intent = Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER)
+            .putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, packageName)
+        return if (intent.resolveActivity(context.packageManager) != null) intent else null
+    }
+
+    /**
+     * True when this app is the phone's dialer.
+     *
+     * Android 10+ owns the choice in the role manager. Android 8 and 9
+     * have no role yet; there the platform tracks the default dialer
+     * package in the telecom service, which is the same thing the role
+     * manager reports on newer releases.
+     */
+    fun isDialerRoleHeld(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = context.getSystemService(RoleManager::class.java)
+                ?: return false
+            return runCatching {
+                roleManager.isRoleHeld(RoleManager.ROLE_DIALER)
+            }.getOrDefault(false)
+        }
+        val telecom = context.getSystemService(TelecomManager::class.java)
+            ?: return false
+        return runCatching {
+            telecom.defaultDialerPackage == context.packageName
         }.getOrDefault(false)
     }
 

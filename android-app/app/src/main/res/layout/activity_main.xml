@@ -472,6 +472,80 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@id/buttonImportSms" />
 
+        <!-- ============ 8. Calls ============ -->
+        <TextView
+            android:id="@+id/textSectionCalls"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="20dp"
+            android:text="@string/section_calls_title"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textImportState" />
+
+        <TextView
+            android:id="@+id/textSectionCallsHelp"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="2dp"
+            android:text="@string/section_calls_help"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionCalls" />
+
+        <TextView
+            android:id="@+id/textCallPermissions"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textSectionCallsHelp" />
+
+        <Button
+            android:id="@+id/buttonCallPermissions"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:layout_marginEnd="4dp"
+            android:text="@string/action_call_permissions"
+            app:layout_constraintEnd_toStartOf="@id/buttonSyncCalls"
+            app:layout_constraintHorizontal_chainStyle="spread"
+            app:layout_constraintHorizontal_weight="1"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/textCallPermissions" />
+
+        <Button
+            android:id="@+id/buttonSyncCalls"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="@string/action_sync_calls"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintHorizontal_weight="1"
+            app:layout_constraintStart_toEndOf="@id/buttonCallPermissions"
+            app:layout_constraintTop_toTopOf="@id/buttonCallPermissions" />
+
+        <Button
+            android:id="@+id/buttonOpenDialer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/action_open_dialer"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonCallPermissions" />
+
+        <TextView
+            android:id="@+id/textCallSyncState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/buttonOpenDialer" />
+
         <!-- ============ Advanced ============ -->
         <View
             android:id="@+id/dividerAdvanced"
@@ -481,7 +555,7 @@
             android:background="#33888888"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/textImportState" />
+            app:layout_constraintTop_toBottomOf="@id/textCallSyncState" />
 
         <TextView
             android:id="@+id/textSectionAdvanced"

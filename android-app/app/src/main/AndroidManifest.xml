@@ -23,6 +23,31 @@
     <!-- Needed to list the active SIMs (dual SIM). -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
 
+    <!-- Calls: the call log and the dialpad, and - once the app holds
+         ROLE_DIALER - the incoming call itself. The log is a runtime
+         permission group of its own; the phone asks for it in the
+         "Calls" card of the setup screen. CALL_PHONE and
+         ANSWER_PHONE_CALLS are also what Android checks before it
+         grants the dialer role. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.WRITE_CALL_LOG" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+
+    <!-- The in-call notification. The screen is the primary path; this
+         notification is the fallback when the platform refuses to start
+         the activity (a locked work profile, a vendor background-start
+         block), so the call must still be answerable. Without the
+         permission Android 13+ drops it silently, which would leave the
+         call reachable only from the server. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- A ringing call wants to take over the screen. Android 14 turns
+         this into a user-granted permission; a default dialer is allowed
+         by default, and the service checks the answer before it uses it
+         and keeps the notification buttons either way. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
     <!-- The contact list is uploaded so the bot can show contact names
          instead of numbers. The user grants this at runtime. -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
@@ -42,6 +67,37 @@
         <intent>
             <action android:name="android.provider.Telephony.SMS_DELIVER" />
         </intent>
+        <!-- Package visibility (API 30+): without these, the "call via"
+             row of the dialpad cannot see whether WhatsApp, Viber, Skype,
+             FaceTime or a browser is installed, and would hide every
+             entry on a modern phone. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="tel" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="viber" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="skype" />
+        </intent>
+        <!-- Telegram is reached through its own scheme: `https://t.me/+…`
+             is an invite-link shape, not a phone lookup, so the app must
+             be visible for `tg://resolve?phone=…` instead. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="tg" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="facetime" />
+        </intent>
     </queries>
 
     <uses-feature
@@ -59,19 +115,117 @@
 
         <activity
             android:name=".ui.MainActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <!-- The home of the app: the Messages list of the phone's own SMS
+             store. It is the launcher, and it is the one place the setup
+             screen, the dialpad and the thread screen are reached from.
+             Material 3 and no action bar: the screen draws its own
+             toolbar, so `Theme.SmsRelay` (and with it the setup screen)
+             does not change. -->
+        <activity
+            android:name=".ui.ShellActivity"
             android:exported="true"
-            android:label="@string/app_name">
+            android:label="@string/app_name"
+            android:theme="@style/Theme.SmsRelay.Messages">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
+        <!-- One conversation, with a composer for one to one SMS. It is
+             reached from the list and from the contact picker, never from
+             outside the app, so it stays unexported. `adjustResize` lets
+             the composer ride above the keyboard. -->
+        <activity
+            android:name=".ui.ThreadActivity"
+            android:exported="false"
+            android:label="@string/messages_title"
+            android:parentActivityName=".ui.ShellActivity"
+            android:theme="@style/Theme.SmsRelay.Messages"
+            android:windowSoftInputMode="adjustResize" />
+
         <activity
             android:name=".ui.HistoryActivity"
             android:exported="false"
             android:label="@string/title_history"
             android:parentActivityName=".ui.MainActivity" />
+
+        <!-- The Phone home: Favorites, Recents, Contacts, Voicemail, with
+             the dialpad one tap away.
+
+             It is reached from the Messages home's menu and from its own
+             FAB, never from another app, and it never handles `tel:` or
+             `ACTION_DIAL`: that stays on the dialpad below, which is the
+             one screen that knows how to route an emergency call. So this
+             activity is unexported and has no intent filter, and it keeps
+             the Material 3 theme of the Messages screens so the two homes
+             look like one app. -->
+        <activity
+            android:name=".ui.DialerHomeActivity"
+            android:exported="false"
+            android:label="@string/dialer_title"
+            android:parentActivityName=".ui.ShellActivity"
+            android:theme="@style/Theme.SmsRelay.Messages" />
+
+        <!-- The dialpad and the handler of tel: links.
+
+             It keeps its ACTION_DIAL and tel: filters, because the
+             default-dialer role needs them, but it is no longer the
+             launcher: the Messages home is. The Phone home reaches this
+             screen from its FAB and its menu, and every call log row and
+             contact opens it with `tel:` in the field. The setup screen
+             is reached from the menus of both homes. -->
+        <activity
+            android:name=".calls.DialerActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tel" />
+            </intent-filter>
+        </activity>
+
+        <!-- The in-call UI. Full-screen over the lock screen, because a
+             ringing call is exactly the moment the user needs it.
+             singleTask keeps one instance: a second call must not stack
+             a second window. The theme has no action bar: this is a call,
+             not a screen of the app. -->
+        <activity
+            android:name=".calls.CallActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.SmsRelay.Call"
+            android:turnScreenOn="true" />
+
+        <!-- The InCallService of a default dialer. Android only binds it
+             while this app holds ROLE_DIALER; the metadata tells the
+             platform that this app draws the in-call UI and its own
+             ringing screen, which is what makes the role picker offer it. -->
+        <service
+            android:name=".calls.CallService"
+            android:exported="true"
+            android:permission="android.permission.BIND_INCALL_SERVICE">
+            <meta-data
+                android:name="android.telecom.IN_CALL_SERVICE_UI"
+                android:value="true" />
+            <meta-data
+                android:name="android.telecom.IN_CALL_SERVICE_RINGING"
+                android:value="true" />
+            <intent-filter>
+                <action android:name="android.telecom.InCallService" />
+            </intent-filter>
+        </service>
 
         <!-- Required by the default-SMS-app role: handles sms:/smsto:/
              mms:/mmsto: "send to" intents. -->

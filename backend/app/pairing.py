@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 import app.db as db
 from app import rev
+from app.calls import live_call_shape
 from app.miniapp_auth import require_miniapp
 from app.security import RateLimiter
 
@@ -168,6 +169,11 @@ def _device_summary(conn, row: dict) -> dict:
         db.pending_commands(conn, row["id"], limit=100))
     summary["default"] = row.get("id") == db.settings_get(
         conn, "default_device_id")
+    # The live call card and the missed badge of the device list. The
+    # session is shaped exactly like the live endpoint, so the Mini App
+    # renders both from one function.
+    summary["call"] = live_call_shape(conn, row["id"])
+    summary["missed"] = db.count_missed_calls(conn, row["id"])
     return summary
 
 

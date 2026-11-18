@@ -1,4 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.SmsRelay" parent="Theme.MaterialComponents.DayNight.DarkActionBar" />
+
+    <!-- The Messages home and the thread screen.
+         Material 3, no action bar: both screens draw their own
+         `MaterialToolbar`, so `setSupportActionBar` is never called and
+         the two screens keep the Material 3 surface and color roles
+         without changing the setup screen or the dialer. -->
+    <style name="Theme.SmsRelay.Messages" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="windowActionModeOverlay">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+
+    <!-- The in-call screen of the dialer.
+         A call is a full-window surface: an action bar would steal the
+         top of the screen, show an unrelated title and, on a locked
+         phone, look like a half-opened app instead of an incoming call.
+         `NoActionBar` also means AppCompatActivity never installs one,
+         so `setSupportActionBar` has nothing to attach to and is not
+         called. The window flags keep the content under the status bar
+         and behind a system action mode without a second title bar. -->
+    <style name="Theme.SmsRelay.Call" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="windowActionModeOverlay">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
 </resources>

@@ -78,6 +78,59 @@ sealed class ImportResult {
 }
 
 /**
+ * One row of the phone's call log on its way to the server.
+ *
+ * The property names map one to one to the wire names of
+ * `POST /calls/sync` (`provider_id`, `cached_name`, `raw_type`,
+ * `started_at`, `duration_s`, `sub_id`, `phone_account`, `is_read`,
+ * `content_hash`). [startedAt] is in epoch seconds, the same unit the
+ * SMS import uses.
+ */
+data class CallSyncItem(
+    val providerId: Long,
+    val number: String,
+    val cachedName: String?,
+    val kind: String,
+    val rawType: Int,
+    val startedAt: Long,
+    val durationS: Int,
+    val subId: Int,
+    val phoneAccount: String?,
+    val isRead: Boolean,
+    val contentHash: String
+)
+
+/** Outcome of one call-log batch. */
+sealed class CallSyncResult {
+    data class Accepted(
+        val inserted: Int,
+        val updated: Int,
+        val unchanged: Int,
+        val skipped: Int
+    ) : CallSyncResult()
+
+    object Unauthorized : CallSyncResult()
+    data class Rejected(val code: Int) : CallSyncResult()
+    data class Retryable(val code: Int) : CallSyncResult()
+    data class Unreachable(val reason: String) : CallSyncResult()
+}
+
+/**
+ * One action the server put in the queue of this device, as returned by
+ * `GET /calls/actions`.
+ *
+ * [callRef] is a phone-generated id that only names the call it was
+ * created for; a stale ref must never be applied to the next call.
+ */
+data class CallAction(
+    val id: String,
+    val callRef: String,
+    val action: String,
+    val payload: String?,
+    val expiresAt: Long
+)
+
+/**
  * Thin HTTP client for the relay backend. It never logs message bodies;
  * failures are reported as categories only.
  *
@@ -373,6 +426,195 @@ class RelayClient(
         }
     }
 
+    /**
+     * The call-log rows the phone collected, newest batch last.
+     *
+     * The server computes the id of a row from the device and the
+     * provider id, so a replayed batch is a no-op: a lost response only
+     * costs one duplicate request. Up to 200 items per request.
+     */
+    fun syncCalls(items: List<CallSyncItem>): CallSyncResult {
+        if (!authorized) return CallSyncResult.Unreachable(REASON_NO_TOKEN)
+        val array = JSONArray()
+        for (item in items) {
+            array.put(
+                JSONObject().apply {
+                    if (item.providerId > 0) put("provider_id", item.providerId)
+                    put("number", item.number)
+                    // A name that the phone does not know stays null: the
+                    // server falls back to its own contact list.
+                    put("cached_name", item.cachedName ?: JSONObject.NULL)
+                    put("kind", item.kind)
+                    put("raw_type", item.rawType)
+                    put("started_at", item.startedAt)
+                    put("duration_s", item.durationS)
+                    put("sub_id", item.subId)
+                    put("phone_account", item.phoneAccount ?: JSONObject.NULL)
+                    put("is_read", if (item.isRead) 1 else 0)
+                    put("content_hash", item.contentHash)
+                }
+            )
+        }
+        val payload = JSONObject().apply { put("items", array) }
+        return try {
+            val request = Request.Builder()
+                .url(endpoint("calls/sync"))
+                .addHeader("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody(JSON))
+                .build()
+            client.newCall(request).execute().use { response ->
+                val text = response.body?.string().orEmpty()
+                when {
+                    response.code == 401 || response.code == 403 -> {
+                        onUnauthorized?.invoke()
+                        CallSyncResult.Unauthorized
+                    }
+                    response.isSuccessful -> {
+                        val json = runCatching { JSONObject(text) }.getOrNull()
+                        CallSyncResult.Accepted(
+                            inserted = json?.optInt("inserted", 0) ?: 0,
+                            updated = json?.optInt("updated", 0) ?: 0,
+                            unchanged = json?.optInt("unchanged", 0) ?: 0,
+                            skipped = json?.optInt("skipped", 0) ?: 0
+                        )
+                    }
+                    response.code == 429 || response.code >= 500 ->
+                        CallSyncResult.Retryable(response.code)
+                    else -> CallSyncResult.Rejected(response.code)
+                }
+            }
+        } catch (e: IOException) {
+            CallSyncResult.Unreachable(e.javaClass.simpleName)
+        } catch (e: RuntimeException) {
+            CallSyncResult.Unreachable(e.javaClass.simpleName)
+        }
+    }
+
+    /**
+     * Reports one state change of a call (ringing, active, disconnected).
+     *
+     * The number and the SIM label are optional and only carry the
+     * minimum: the server resolves the thread key itself, and nothing
+     * here is ever logged.
+     */
+    fun postCallEvent(
+        callRef: String,
+        state: String,
+        direction: String?,
+        number: String?,
+        simLabel: String?,
+        muted: Boolean?,
+        speaker: Boolean?,
+        startedAt: Long?,
+        endedAt: Long?
+    ): Boolean {
+        if (!authorized) return false
+        val payload = JSONObject().apply {
+            put("call_ref", callRef)
+            put("state", state)
+            if (!direction.isNullOrBlank()) put("direction", direction)
+            if (!number.isNullOrBlank()) put("number", number)
+            if (!simLabel.isNullOrBlank()) put("sim_label", simLabel)
+            if (muted != null) put("muted", if (muted) 1 else 0)
+            if (speaker != null) put("speaker", if (speaker) 1 else 0)
+            if (startedAt != null && startedAt > 0) put("started_at", startedAt)
+            if (endedAt != null && endedAt > 0) put("ended_at", endedAt)
+        }
+        return try {
+            val request = Request.Builder()
+                .url(endpoint("calls/events"))
+                .addHeader("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody(JSON))
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
+                response.isSuccessful
+            }
+        } catch (e: IOException) {
+            false
+        } catch (e: RuntimeException) {
+            false
+        }
+    }
+
+    /**
+     * The actions the server has for this device.
+     *
+     * [waitSeconds] is the long-poll window (0..25): the server answers
+     * at once with an empty list when it has nothing. Rows that are
+     * returned are marked `delivered` by the server in the same
+     * transaction, so two consumers never run one action.
+     *
+     * An empty list means "nothing to do" as well as "the server could
+     * not be reached"; the caller must not act on either.
+     */
+    fun pollCallActions(waitSeconds: Int = 0): List<CallAction> {
+        if (!authorized) return emptyList()
+        val wait = waitSeconds.coerceIn(0, MAX_CALL_ACTION_WAIT_S)
+        return try {
+            val request = Request.Builder()
+                .url(endpoint("calls/actions") + "?wait=" + wait)
+                .addHeader("Authorization", "Bearer $token")
+                .get()
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
+                if (!response.isSuccessful) return emptyList()
+                val text = response.body?.string().orEmpty()
+                val json = runCatching { JSONObject(text) }.getOrNull() ?: return emptyList()
+                val array = json.optJSONArray("actions") ?: return emptyList()
+                val actions = mutableListOf<CallAction>()
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
+                    actions.add(
+                        CallAction(
+                            id = id,
+                            callRef = item.optString("call_ref"),
+                            action = item.optString("action"),
+                            payload = item.optString("payload").takeUnless { it.isBlank() },
+                            expiresAt = item.optLong("expires_at")
+                        )
+                    )
+                }
+                actions
+            }
+        } catch (e: IOException) {
+            emptyList()
+        } catch (e: RuntimeException) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Reports how an action ended. The server only accepts this once, so
+     * a lost report costs a repeated request, never a repeated call.
+     */
+    fun reportCallAction(id: String, status: String, detail: String?): Boolean {
+        if (!authorized) return false
+        val payload = JSONObject().apply {
+            put("status", status)
+            if (!detail.isNullOrBlank()) put("detail", detail)
+        }
+        return try {
+            val request = Request.Builder()
+                .url(endpoint("calls/actions/$id/result"))
+                .addHeader("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody(JSON))
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (response.code == 401 || response.code == 403) onUnauthorized?.invoke()
+                response.isSuccessful
+            }
+        } catch (e: IOException) {
+            false
+        } catch (e: RuntimeException) {
+            // A malformed id would break the URL: the action is reported
+            // as "not delivered" instead of crashing the worker.
+            false
+        }
+    }
+
     private fun execute(request: Request): ApiResult = try {
         client.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
@@ -419,6 +661,13 @@ class RelayClient(
 
         /** Why a request was not made at all. */
         const val REASON_NO_TOKEN = "no token"
+
+        /**
+         * The longest long-poll the call-action route offers. The design
+         * contract caps it at 25 s; a longer value is refused by the
+         * server, so the client clamps instead of asking.
+         */
+        const val MAX_CALL_ACTION_WAIT_S = 25
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)

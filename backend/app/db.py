@@ -3,6 +3,7 @@ import hmac
 import sqlite3
 import threading
 import time
+import uuid
 
 import app.phones as phones
 
@@ -15,6 +16,27 @@ _COMMAND_TRANSITIONS = {
     "sent": ("delivered", "failed"),
     "delivered": (),
     "failed": (),
+    "rejected": (),
+}
+# The call-log kinds the phone may upload. They mirror the Android type
+# mapping and the columns of ``call_log``.
+CALL_KINDS = ("incoming", "outgoing", "missed", "rejected", "blocked",
+              "voicemail", "unknown")
+# Live call states and the actions an action row may carry.
+CALL_STATES = ("ringing", "dialing", "active", "held", "disconnected")
+CALL_DIRECTIONS = ("incoming", "outgoing")
+CALL_ACTIONS = ("answer", "reject", "hangup", "mute", "unmute", "speaker_on",
+                "speaker_off", "hold", "unhold", "dtmf", "dial")
+CALL_ACTION_STATUSES = ("pending", "delivered", "done", "failed", "expired",
+                        "rejected")
+# Only a pending or a delivered action may still reach a terminal state: a
+# phone reports once, and a late report never reopens an action.
+_CALL_ACTION_TRANSITIONS = {
+    "pending": ("done", "failed", "rejected"),
+    "delivered": ("done", "failed", "rejected"),
+    "done": (),
+    "failed": (),
+    "expired": (),
     "rejected": (),
 }
 # The archived device that holds everything from before the device split.
@@ -185,6 +207,67 @@ _SCHEMA = [
     " ON messages(device_id, thread_key, received_at DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS idx_commands_device_thread"
     " ON sms_commands(device_id, thread_key, created_at DESC, id DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS call_log (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        provider_id TEXT,
+        number TEXT NOT NULL DEFAULT '',
+        number_key TEXT,
+        cached_name TEXT,
+        kind TEXT NOT NULL,
+        raw_type INTEGER,
+        started_at INTEGER NOT NULL,
+        duration_s INTEGER NOT NULL DEFAULT 0,
+        sub_id INTEGER NOT NULL DEFAULT 0,
+        phone_account TEXT,
+        is_read INTEGER NOT NULL DEFAULT 0,
+        content_hash TEXT,
+        present INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_call_log_device_time"
+    " ON call_log(device_id, started_at DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_call_log_device_key"
+    " ON call_log(device_id, number_key, started_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS call_sessions (
+        device_id TEXT PRIMARY KEY,
+        call_ref TEXT NOT NULL,
+        number TEXT NOT NULL DEFAULT '',
+        number_key TEXT,
+        direction TEXT NOT NULL,
+        state TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        answered_at INTEGER,
+        ended_at INTEGER,
+        muted INTEGER NOT NULL DEFAULT 0,
+        speaker INTEGER NOT NULL DEFAULT 0,
+        sim_label TEXT,
+        updated_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS call_actions (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        call_ref TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL,
+        payload TEXT,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        client_ref TEXT,
+        result TEXT,
+        finished_at INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_call_actions_device_status"
+    " ON call_actions(device_id, status, created_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_call_actions_client_ref"
+    " ON call_actions(client_ref) WHERE client_ref IS NOT NULL",
 ]
 
 # Indexes may reference columns that only exist after _ensure_column() has
@@ -1400,7 +1483,9 @@ def thread_timeline(conn: sqlite3.Connection, device_id: str,
     sql = (
         "SELECT 'msg:' || id AS id, 'in' AS direction, received_at AS ts,"
         "       body, sender_name, NULL AS status, NULL AS result,"
-        "       NULL AS client_ref, NULL AS sub_id"
+        "       NULL AS client_ref, NULL AS sub_id,"
+        "       NULL AS kind, NULL AS call_kind, NULL AS duration_s,"
+        "       NULL AS number"
         "  FROM messages"
         " WHERE device_id = ?"
         "   AND thread_key = ?"
@@ -1408,24 +1493,41 @@ def thread_timeline(conn: sqlite3.Connection, device_id: str,
         "        OR (received_at = ? AND 'msg:' || id < ?))"
         " UNION ALL"
         " SELECT 'cmd:' || id, 'out', created_at, body, NULL, status, result,"
-        "        client_ref, sub_id"
+        "        client_ref, sub_id, NULL, NULL, NULL, NULL"
         "   FROM sms_commands"
         "  WHERE device_id = ?"
         "    AND thread_key = ?"
         "    AND (? IS NULL OR created_at < ?"
         "         OR (created_at = ? AND 'cmd:' || id < ?))"
+        " UNION ALL"
+        " SELECT 'call:' || id,"
+        "        CASE WHEN kind = 'outgoing' THEN 'out' ELSE 'in' END,"
+        "        started_at, NULL, NULL, NULL, NULL, NULL, NULL,"
+        "        'call', kind, duration_s, number"
+        "   FROM call_log"
+        "  WHERE device_id = ?"
+        "    AND number_key = ?"
+        "    AND present = 1"
+        "    AND (? IS NULL OR started_at < ?"
+        "         OR (started_at = ? AND 'call:' || id < ?))"
         " ORDER BY ts DESC, id DESC LIMIT ?"
     )
     with _WRITE_LOCK:
         rows = conn.execute(
             sql, (device_id, thread_key, before_ts, before_ts, before_ts,
                   before_id, device_id, thread_key, before_ts, before_ts,
-                  before_ts, before_id, limit),
+                  before_ts, before_id, device_id, thread_key, before_ts,
+                  before_ts, before_ts, before_id, limit),
         ).fetchall()
     events = []
     for row in rows:
         event = _asdict(row)
         event["thread_key"] = thread_key
+        # A call event also carries the contract key ``event_id``. A message
+        # and a command keep their existing ``id`` only, so no consumer sees
+        # a new field on an old row.
+        if event.get("kind") == "call":
+            event["event_id"] = event["id"]
         events.append(event)
     return events
 
@@ -2381,5 +2483,578 @@ def pairing_cleanup(conn: sqlite3.Connection, now: int,
             (cutoff,),
         )
         return expired + removed
+
+    return _write_tx(conn, fn)
+
+
+# --- calls ----------------------------------------------------------------
+
+# An answer, a reject and a hang up only matter while the phone rings, so
+# their action dies quickly. Everything else (mute, hold, DTMF, dial) may
+# wait for a phone that is in a tunnel for a few minutes.
+CALL_ACTION_TTL_S = {"answer": 20, "reject": 20, "hangup": 20}
+CALL_ACTION_DEFAULT_TTL_S = 300
+MAX_CALL_NUMBER_LEN = 64
+MAX_CALL_NAME_LEN = 96
+MAX_CALL_ACCOUNT_LEN = 64
+MAX_CALL_SIM_LABEL_LEN = 32
+# 2100-01-01 in epoch seconds: far past any real call, and small enough that
+# SQLite can always store the value (a wild stamp is skipped, never a 500).
+MAX_CALL_STARTED_AT = 4102444800
+
+
+def call_log_id(device_id: str, item: dict) -> str | None:
+    """The deterministic id of one call-log row.
+
+    The phone's call-log row id is the strongest identity: a replayed
+    batch yields the same ids, so the upsert is a no-op. A row without a
+    provider id falls back to its number and timestamp, which the call
+    log never reuses for two different calls.
+
+    The device is part of the basis, because two phones may reuse the
+    same provider row id.
+    """
+    provider = item.get("provider_id")
+    basis = None
+    if provider is not None and str(provider).strip() != "":
+        basis = "pid:" + str(provider).strip()
+    else:
+        started_at = item.get("started_at")
+        if started_at is None or isinstance(started_at, bool):
+            return None
+        try:
+            stamp = int(started_at)
+        except (TypeError, ValueError):
+            return None
+        number = str(item.get("number") or "").strip()
+        basis = "n:" + number + "\x00" + str(stamp)
+    digest = hashlib.sha256(
+        "\x00".join((str(device_id or ""), basis)).encode("utf-8")
+    ).hexdigest()[:32]
+    return "call-" + digest
+
+
+def _call_content_equal(existing: sqlite3.Row, item: dict) -> bool:
+    """True when a re-synced call-log row would not change anything.
+
+    ``content_hash`` from the phone wins when it is present: the phone
+    knows its own row better than we can reconstruct it. Without one, the
+    stored fields are compared, so a replayed batch is still a no-op.
+
+    The read marker only ever moves forward, so an already-read row is
+    equal to an unread upload of the same call.
+    """
+    content_hash = item.get("content_hash")
+    if content_hash is not None:
+        return existing["content_hash"] == content_hash
+    stored_read = int(existing["is_read"] or 0)
+    incoming_read = int(item.get("is_read") or 0)
+    if stored_read != max(stored_read, incoming_read):
+        return False
+    for field in ("number", "number_key", "cached_name", "kind", "raw_type",
+                  "started_at", "duration_s", "sub_id", "phone_account"):
+        stored = existing[field] if existing[field] is not None else None
+        if stored != item.get(field):
+            return False
+    return True
+
+
+def _call_row_values(device_id: str, item) -> dict | None:
+    """Normalise one call-log item, or None when it cannot be stored.
+
+    This never raises: the sync endpoint feeds it rows from the phone, and
+    one unusable row must be skipped, not abort the transaction that holds
+    the rest of the batch. Everything that could raise on a hostile value
+    is inside the ``try``, and the caller only touches SQLite with the
+    values returned here.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        kind = item.get("kind")
+        if kind not in CALL_KINDS:
+            return None
+        started_raw = item.get("started_at")
+        if started_raw is None or isinstance(started_raw, bool):
+            return None
+        started_at = int(started_raw)
+        # SQLite cannot store an arbitrary Python int, and no call of this
+        # relay is placed after 2100: a wild stamp is a bad row, not a 500.
+        if started_at < 0 or started_at > MAX_CALL_STARTED_AT:
+            return None
+        call_id = call_log_id(device_id, item)
+        if call_id is None:  # pragma: no cover - guarded above
+            return None
+        number = str(item.get("number") or "").strip()[:MAX_CALL_NUMBER_LEN]
+        number_key = item.get("number_key")
+        if number_key is None:
+            number_key = phones.thread_key(number) or None
+        if not isinstance(number_key, str) or not number_key:
+            number_key = None
+        cached_name = item.get("cached_name")
+        if cached_name is not None:
+            cached_name = str(cached_name).strip()[:MAX_CALL_NAME_LEN] or None
+        raw_type = item.get("raw_type")
+        if raw_type is not None and (isinstance(raw_type, bool)
+                                     or not isinstance(raw_type, int)
+                                     or not 0 <= raw_type <= 2 ** 31 - 1):
+            raw_type = None
+        sub_id = item.get("sub_id")
+        if (isinstance(sub_id, bool) or not isinstance(sub_id, int)
+                or not 0 <= sub_id <= 99):
+            sub_id = 0
+        account = item.get("phone_account")
+        if account is not None:
+            account = str(account).strip()[:MAX_CALL_ACCOUNT_LEN] or None
+        duration = item.get("duration_s")
+        if (isinstance(duration, bool) or not isinstance(duration, int)
+                or not 0 <= duration <= 604800):
+            duration = 0
+        provider_id = item.get("provider_id")
+        if provider_id is not None:
+            provider_id = str(provider_id)[:64]
+        content_hash = item.get("content_hash")
+        if content_hash is not None:
+            content_hash = str(content_hash)[:128]
+        return {
+            "id": call_id, "provider_id": provider_id, "number": number,
+            "number_key": number_key, "cached_name": cached_name,
+            "kind": kind, "raw_type": raw_type, "started_at": started_at,
+            "duration_s": duration, "sub_id": sub_id,
+            "phone_account": account,
+            "is_read": 1 if item.get("is_read") else 0,
+            "content_hash": content_hash,
+        }
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return None
+
+
+def record_call_items(conn: sqlite3.Connection, device_id: str,
+                      items: list[dict]) -> dict:
+    """Upsert a batch of call-log rows of ONE device.
+
+    A row is inserted when its id is unknown and updated only when its
+    ``content_hash`` differs, so a replayed or a rolling re-read batch
+    stays a no-op. The counters tell the caller whether anything changed;
+    this helper never bumps the revision itself.
+
+    The read marker never moves backwards: a Mini App read that the phone
+    has not seen yet must not be undone by the next sync.
+
+    One unusable row (a non-dict, an unknown kind, a value SQLite could
+    not bind) is counted as skipped and the rest of the batch is still
+    committed: ``_call_row_values`` does all normalisation outside SQL.
+    """
+    counts = {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0}
+
+    def fn() -> dict:
+        now = _now()
+        for item in items:
+            row = _call_row_values(device_id, item)
+            if row is None:
+                counts["skipped"] += 1
+                continue
+            call_id = row["id"]
+            existing = conn.execute(
+                "SELECT * FROM call_log WHERE id = ? AND device_id = ?",
+                (call_id, device_id),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO call_log"
+                    " (id, device_id, provider_id, number, number_key,"
+                    "  cached_name, kind, raw_type, started_at, duration_s,"
+                    "  sub_id, phone_account, is_read, content_hash, present,"
+                    "  created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,"
+                    "         ?, ?)",
+                    (call_id, device_id, row["provider_id"], row["number"],
+                     row["number_key"], row["cached_name"], row["kind"],
+                     row["raw_type"], row["started_at"], row["duration_s"],
+                     row["sub_id"], row["phone_account"], row["is_read"],
+                     row["content_hash"], now, now),
+                )
+                counts["inserted"] += 1
+                continue
+            if _call_content_equal(existing, row):
+                counts["unchanged"] += 1
+                continue
+            conn.execute(
+                "UPDATE call_log SET provider_id = ?, number = ?,"
+                " number_key = ?, cached_name = ?, kind = ?, raw_type = ?,"
+                " started_at = ?, duration_s = ?, sub_id = ?,"
+                " phone_account = ?, is_read = MAX(is_read, ?),"
+                " content_hash = ?, present = 1, updated_at = ?"
+                " WHERE id = ?",
+                (row["provider_id"], row["number"], row["number_key"],
+                 row["cached_name"], row["kind"], row["raw_type"],
+                 row["started_at"], row["duration_s"], row["sub_id"],
+                 row["phone_account"], row["is_read"], row["content_hash"],
+                 now, call_id),
+            )
+            counts["updated"] += 1
+        return dict(counts)
+
+    return _write_tx(conn, fn)
+
+
+def page_calls(conn: sqlite3.Connection, device_id: str, limit: int = 100,
+               before_ts: int | None = None, before_id: str | None = None,
+               query: str | None = None) -> list[dict]:
+    """One page of the call log of ONE device, newest first.
+
+    The order is ``started_at DESC, id DESC`` and the cursor has the same
+    two halves as the thread timeline: ``before_ts`` alone is the strict
+    timestamp cursor, while ``before_ts`` plus ``before_id`` continues
+    inside a second, so two calls of the same second are never skipped.
+
+    Names are not resolved here: the caller uses ``call_name_for_key``
+    with the same device, so nothing of another device can leak in.
+    """
+    if not isinstance(device_id, str) or not device_id:
+        return []
+    limit = _clamp_limit(limit, 100, CHAT_MAX_LIMIT)
+    conditions = ["device_id = ?", "present = 1"]
+    params: list = [device_id]
+    if before_ts is not None:
+        if before_id is None:
+            conditions.append("started_at < ?")
+            params.append(int(before_ts))
+        else:
+            conditions.append(
+                "(started_at < ? OR (started_at = ? AND id < ?))")
+            params.extend([int(before_ts), int(before_ts), str(before_id)])
+    if query and query.strip():
+        number_like, local_like, text_like = _search_likes(query)
+        conditions.append(
+            "("
+            " COALESCE(number_key, '') LIKE ? ESCAPE '\\'"
+            " OR COALESCE(number_key, '') LIKE ? ESCAPE '\\'"
+            " OR number LIKE ? ESCAPE '\\'"
+            " OR lower(COALESCE(cached_name, '')) LIKE ? ESCAPE '\\'"
+            " OR EXISTS (SELECT 1 FROM device_contacts d"
+            "            WHERE d.device_id = call_log.device_id"
+            "              AND d.number_key = call_log.number_key"
+            "              AND lower(d.name) LIKE ? ESCAPE '\\')"
+            ")"
+        )
+        params.extend([number_like, local_like, local_like, text_like,
+                       text_like])
+    sql = ("SELECT * FROM call_log WHERE " + " AND ".join(conditions)
+           + " ORDER BY started_at DESC, id DESC LIMIT ?")
+    params.append(limit)
+    with _WRITE_LOCK:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_asdict(row) for row in rows]
+
+
+def call_name_for_key(conn: sqlite3.Connection, device_id: str,
+                      number_key: str | None) -> str | None:
+    """The contact name ONE device knows for a call number key."""
+    if not isinstance(number_key, str) or not number_key:
+        return None
+    if not isinstance(device_id, str) or not device_id:
+        return None
+    with _WRITE_LOCK:
+        row = conn.execute(
+            "SELECT MIN(name) AS name FROM device_contacts"
+            " WHERE device_id = ? AND number_key = ?",
+            (device_id, number_key),
+        ).fetchone()
+    return row["name"] if row is not None else None
+
+
+def count_missed_calls(conn: sqlite3.Connection, device_id: str) -> int:
+    """The unread missed calls of one device."""
+    if not isinstance(device_id, str) or not device_id:
+        return 0
+    with _WRITE_LOCK:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM call_log"
+            " WHERE device_id = ? AND kind = 'missed' AND is_read = 0"
+            "   AND present = 1",
+            (device_id,),
+        ).fetchone()
+    return int(row["n"])
+
+
+def mark_calls_read(conn: sqlite3.Connection, device_id: str,
+                    until_ts: int) -> int:
+    """Mark every call of one device up to ``until_ts`` as read."""
+    if not isinstance(device_id, str) or not device_id:
+        return 0
+
+    def fn() -> int:
+        return conn.execute(
+            "UPDATE call_log SET is_read = 1, updated_at = ?"
+            " WHERE device_id = ? AND is_read = 0 AND present = 1"
+            "   AND started_at <= ?",
+            (_now(), device_id, int(until_ts)),
+        ).rowcount
+
+    return _write_tx(conn, fn)
+
+
+def call_session_get(conn: sqlite3.Connection,
+                     device_id: str) -> dict | None:
+    """The live call of one device, or None when it is idle."""
+    if not isinstance(device_id, str) or not device_id:
+        return None
+    with _WRITE_LOCK:
+        row = conn.execute(
+            "SELECT * FROM call_sessions WHERE device_id = ? LIMIT 1",
+            (device_id,),
+        ).fetchone()
+    return _asdict(row) if row is not None else None
+
+
+def call_session_set(conn: sqlite3.Connection, device_id: str, call_ref: str,
+                     state: str, direction: str | None = None,
+                     number: str | None = None,
+                     number_key: str | None = None,
+                     started_at: int | None = None,
+                     ended_at: int | None = None,
+                     muted: bool | None = None,
+                     speaker: bool | None = None,
+                     sim_label: str | None = None,
+                     now: int | None = None) -> dict:
+    """Upsert the live call of one device.
+
+    A device has one primary call. An event for the same ``call_ref``
+    merges: an omitted field keeps the stored value, so a mute update
+    does not erase the caller. An event for a new ``call_ref`` replaces
+    the row, because the previous call is over by definition.
+
+    ``state='disconnected'`` stamps ``ended_at`` when the phone did not
+    send one.
+    """
+    if state not in CALL_STATES:
+        raise ValueError(f"invalid call state: {state}")
+    if direction is not None and direction not in CALL_DIRECTIONS:
+        raise ValueError(f"invalid call direction: {direction}")
+    stamp = int(now) if now is not None else _now()
+
+    def fn() -> dict:
+        existing = conn.execute(
+            "SELECT * FROM call_sessions WHERE device_id = ? LIMIT 1",
+            (device_id,),
+        ).fetchone()
+        previous = _asdict(existing) if existing is not None else None
+        same_call = (previous is not None
+                     and previous.get("call_ref") == call_ref)
+        if same_call:
+            direction_value = direction or previous["direction"]
+            number_value = (previous["number"] if number is None
+                            else number)
+            key_value = (previous["number_key"] if number is None
+                         else (number_key if number_key is not None
+                               else (phones.thread_key(number) or None)))
+            started_value = (previous["started_at"] if started_at is None
+                             else int(started_at))
+            muted_value = (previous["muted"] if muted is None
+                           else (1 if muted else 0))
+            speaker_value = (previous["speaker"] if speaker is None
+                             else (1 if speaker else 0))
+            label_value = (previous["sim_label"] if sim_label is None
+                           else sim_label)
+            answered_value = previous.get("answered_at")
+            if answered_value is None and state in ("active", "held"):
+                answered_value = stamp
+            ended_value = previous.get("ended_at")
+        else:
+            direction_value = direction or "incoming"
+            number_value = number or ""
+            key_value = (number_key if number_key is not None
+                         else (phones.thread_key(number_value) or None))
+            started_value = int(started_at) if started_at is not None else stamp
+            muted_value = 1 if muted else 0
+            speaker_value = 1 if speaker else 0
+            label_value = sim_label
+            answered_value = stamp if state in ("active", "held") else None
+            ended_value = None
+        if state == "disconnected":
+            ended_value = int(ended_at) if ended_at is not None else stamp
+        elif ended_at is not None:
+            ended_value = int(ended_at)
+        conn.execute(
+            "INSERT INTO call_sessions"
+            " (device_id, call_ref, number, number_key, direction, state,"
+            "  started_at, answered_at, ended_at, muted, speaker, sim_label,"
+            "  updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(device_id) DO UPDATE SET"
+            "  call_ref = excluded.call_ref, number = excluded.number,"
+            "  number_key = excluded.number_key,"
+            "  direction = excluded.direction, state = excluded.state,"
+            "  started_at = excluded.started_at,"
+            "  answered_at = excluded.answered_at,"
+            "  ended_at = excluded.ended_at, muted = excluded.muted,"
+            "  speaker = excluded.speaker,"
+            "  sim_label = excluded.sim_label,"
+            "  updated_at = excluded.updated_at",
+            (device_id, call_ref, number_value, key_value, direction_value,
+             state, started_value, answered_value, ended_value, muted_value,
+             speaker_value, label_value, stamp),
+        )
+        row = conn.execute(
+            "SELECT * FROM call_sessions WHERE device_id = ? LIMIT 1",
+            (device_id,),
+        ).fetchone()
+        return _asdict(row)
+
+    return _write_tx(conn, fn)
+
+
+def call_action_by_client_ref(conn: sqlite3.Connection,
+                              client_ref: str | None) -> dict | None:
+    """The action created for an idempotency key, if any."""
+    if not client_ref:
+        return None
+    with _WRITE_LOCK:
+        row = conn.execute(
+            "SELECT * FROM call_actions WHERE client_ref = ? LIMIT 1",
+            (client_ref,),
+        ).fetchone()
+    return _asdict(row) if row is not None else None
+
+
+def call_action_create(conn: sqlite3.Connection, device_id: str, action: str,
+                       call_ref: str = "", payload: str | None = None,
+                       client_ref: str | None = None,
+                       expires_at: int | None = None,
+                       now: int | None = None) -> dict | None:
+    """Write the guard row of one call action.
+
+    Returns the stored row, or None when the ``client_ref`` already
+    belonged to an action (the partial unique index makes the insert a
+    no-op, and the caller re-reads with ``call_action_by_client_ref``).
+
+    The TTL is decided here so the bot and the Mini App cannot disagree:
+    answer, reject and hang up die in 20 s, everything else in 300 s.
+    """
+    if action not in CALL_ACTIONS:
+        raise ValueError(f"invalid call action: {action}")
+    if not isinstance(device_id, str) or not device_id:
+        raise ValueError("device_id is required")
+    stamp = int(now) if now is not None else _now()
+    ttl = CALL_ACTION_TTL_S.get(action, CALL_ACTION_DEFAULT_TTL_S)
+    expiry = int(expires_at) if expires_at is not None else stamp + ttl
+    action_id = "ca-" + uuid.uuid4().hex
+
+    def fn() -> dict | None:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO call_actions"
+            " (id, device_id, call_ref, action, payload, status, created_at,"
+            "  expires_at, client_ref, result, finished_at)"
+            " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL)",
+            (action_id, device_id, call_ref or "", action, payload, stamp,
+             expiry, client_ref),
+        )
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM call_actions WHERE id = ?", (action_id,)
+        ).fetchone()
+        return _asdict(row) if row is not None else None
+
+    return _write_tx(conn, fn)
+
+
+def claim_call_actions(conn: sqlite3.Connection, device_id: str,
+                       limit: int = 10, now: int | None = None) -> list[dict]:
+    """Hand a device its pending actions and mark them delivered.
+
+    The select and the update happen in ONE transaction, so two
+    consumers (the command poll and the live call poll) can never run the
+    same action twice. Actions whose TTL has passed are marked expired
+    instead of handed out.
+    """
+    if not isinstance(device_id, str) or not device_id:
+        return []
+    limit = max(1, min(int(limit), 50))
+    stamp = int(now) if now is not None else _now()
+
+    def fn() -> list[dict]:
+        conn.execute(
+            "UPDATE call_actions SET status = 'expired', finished_at = ?"
+            " WHERE device_id = ? AND status = 'pending' AND expires_at <= ?",
+            (stamp, device_id, stamp),
+        )
+        rows = conn.execute(
+            "SELECT * FROM call_actions"
+            " WHERE device_id = ? AND status = 'pending' AND expires_at > ?"
+            " ORDER BY created_at, id LIMIT ?",
+            (device_id, stamp, limit),
+        ).fetchall()
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            "UPDATE call_actions SET status = 'delivered'"
+            f" WHERE id IN ({placeholders}) AND status = 'pending'",
+            tuple(ids),
+        )
+        return [_asdict(row) for row in rows]
+
+    return _write_tx(conn, fn)
+
+
+def call_action(conn: sqlite3.Connection, action_id: str) -> dict | None:
+    if not isinstance(action_id, str) or not action_id:
+        return None
+    with _WRITE_LOCK:
+        row = conn.execute(
+            "SELECT * FROM call_actions WHERE id = ?", (action_id,)
+        ).fetchone()
+    return _asdict(row) if row is not None else None
+
+
+def finish_call_action(conn: sqlite3.Connection, action_id: str, status: str,
+                       detail: str | None = None) -> tuple[bool, str | None]:
+    """Apply a phone report to an action and say whether it was accepted.
+
+    Only ``pending`` and ``delivered`` move forward; a duplicate or late
+    report keeps the current status, so the phone stops retrying. An
+    unknown id returns ``(False, None)``.
+    """
+    if status not in ("done", "failed", "rejected"):
+        raise ValueError(f"invalid call action result: {status}")
+
+    def fn() -> tuple[bool, str | None]:
+        row = conn.execute(
+            "SELECT status FROM call_actions WHERE id = ?", (action_id,)
+        ).fetchone()
+        if row is None:
+            return False, None
+        current = row["status"]
+        allowed = _CALL_ACTION_TRANSITIONS.get(current, ())
+        if status not in allowed:
+            return False, current
+        conn.execute(
+            "UPDATE call_actions SET status = ?, result = ?, finished_at = ?"
+            " WHERE id = ?",
+            (status, detail, _now(), action_id),
+        )
+        return True, status
+
+    return _write_tx(conn, fn)
+
+
+def expire_call_actions(conn: sqlite3.Connection, now: int | None = None) -> int:
+    """Mark every pending action whose TTL has passed as expired.
+
+    Only ``pending`` rows expire: a ``delivered`` action is already in the
+    hand of the phone, which reports its outcome. Expired actions are
+    never delivered.
+    """
+    stamp = int(now) if now is not None else _now()
+
+    def fn() -> int:
+        return conn.execute(
+            "UPDATE call_actions SET status = 'expired', finished_at = ?"
+            " WHERE status = 'pending' AND expires_at <= ?",
+            (stamp, stamp),
+        ).rowcount
 
     return _write_tx(conn, fn)

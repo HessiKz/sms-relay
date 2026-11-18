@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sizes of the Messages screens only. The setup screen and the dialer
+     keep their own inline values, so their look does not change. -->
+<resources>
+    <dimen name="messages_avatar_size">48dp</dimen>
+    <dimen name="messages_row_min_height">72dp</dimen>
+    <!-- The extended FAB floats over the list: the last row must still be
+         reachable by scrolling. -->
+    <dimen name="messages_list_bottom_padding">88dp</dimen>
+    <dimen name="thread_avatar_size">36dp</dimen>
+    <dimen name="message_bubble_corner">18dp</dimen>
+
+    <!-- The Phone home. A recents row is a little taller than a
+         conversation row because it carries a type glyph under the
+         name. -->
+    <dimen name="dialer_avatar_size">40dp</dimen>
+    <dimen name="dialer_row_min_height">64dp</dimen>
+    <dimen name="dialer_type_icon_size">16dp</dimen>
+</resources>

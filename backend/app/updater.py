@@ -7,6 +7,8 @@ import time
 import uuid
 
 import app.db as db
+import app.calls as calls
+import app.phones as phones
 from app.flow import (MODE_IDLE, MODE_NUMBER, MODE_SEARCH, MODE_TEXT, Flow)
 from app.delivery import _html_escape
 from app.tg import TGError
@@ -51,6 +53,16 @@ FILTER_KINDS = ("allow", "block", "keyword")
 COMMANDS = frozenset({"start", "help", "status", "pause", "resume",
                       "filters", "fallback", "phoneb", "sms"})
 FILTER_REMOVAL_SUBS = frozenset({"unallow", "unblock", "unkeyword"})
+# The verbs a call button may carry. ``callback`` is the Call back of a
+# missed call, which dials the number of the session the message names.
+CALL_VERBS = frozenset({"answer", "reject", "callback"})
+CALL_ANSWER_TEXT = {"answer": "Answering\u2026", "reject": "Declined",
+                    "callback": "Calling back\u2026"}
+# Telegram only drops an inline keyboard when the edit names an empty one;
+# an omitted ``reply_markup`` keeps the old buttons.
+EMPTY_KEYBOARD = {"inline_keyboard": []}
+STALE_CALL_TEXT = "That call has ended"
+DUPLICATE_CALL_TEXT = "Already handled"
 
 
 def _admin_ids(settings):
@@ -263,6 +275,15 @@ class Updater:
         if not isinstance(data, str):
             return
 
+        if data.startswith("call:"):
+            message_id = (message or {}).get("message_id")
+            message_text = (message or {}).get("text")
+            await self._handle_call_callback(
+                callback, data, chat_id,
+                message_id if isinstance(message_id, int) else None,
+                message_text if isinstance(message_text, str) else None)
+            return
+
         session = self.flow.session(chat_id)
         if data == "cancel":
             self.flow.reset(chat_id)
@@ -420,6 +441,129 @@ class Updater:
                 "Now type the message:",
                 keyboard=keyboard([button("⬅️ Cancel", "cancel")]))
             return
+
+    async def _handle_call_callback(self, callback, data, chat_id,
+                                    message_id, original_text=None) -> None:
+        """A call button was tapped: Answer, Decline or Call back.
+
+        The callback data names the DEVICE, never the call: the live
+        session is resolved now, and only a session that can still take an
+        answer is offered one. That is what keeps a message that sits in
+        the chat for an hour from touching the next call.
+
+        Telegram can deliver one tap twice (a slow tap, a retry), so the
+        action carries ``tg:<callback id>`` as its ``client_ref``: the
+        partial unique index turns the second attempt into "already
+        handled" instead of a second answer.
+        """
+        callback_id = callback.get("id")
+        if not isinstance(callback_id, str) or not callback_id:
+            callback_id = uuid.uuid4().hex
+        parts = data.split(":", 2)
+        verb = parts[1] if len(parts) == 3 else ""
+        device_id = parts[2] if len(parts) == 3 else ""
+        if verb not in CALL_VERBS or not device_id:
+            await self._answer_callback(callback_id, STALE_CALL_TEXT)
+            await self._drop_call_buttons(chat_id, message_id, original_text)
+            return
+
+        session = db.call_session_get(self.db_conn, device_id)
+        # Answer and Decline need a call that can still take them; Call
+        # back needs the ended session the message was about, because the
+        # number comes from the session, never from the message text. A
+        # session that has gone stale (or that a newer call replaced) is
+        # refused rather than dialling whoever is live now.
+        if verb == "callback":
+            usable = (bool(session) and calls.session_is_live(session)
+                      and session.get("state") == "disconnected")
+        else:
+            usable = calls.session_actionable(session)
+        if not usable:
+            await self._answer_callback(callback_id, STALE_CALL_TEXT)
+            await self._drop_call_buttons(chat_id, message_id, original_text)
+            return
+
+        if verb == "callback":
+            raw = (session.get("number") or "").strip()
+            if raw and calls.is_emergency_number(raw):
+                # An emergency call is placed on the phone, by a human,
+                # with the local dialer; the relay never dials one.
+                await self._answer_callback(
+                    callback_id, "Emergency numbers are dialled on the phone")
+                await self._drop_call_buttons(chat_id, message_id,
+                                             original_text)
+                return
+            target = phones.normalize_target(raw) if raw else None
+            if target is None:
+                await self._answer_callback(callback_id,
+                                            "No number to call back")
+                await self._drop_call_buttons(chat_id, message_id,
+                                             original_text)
+                return
+            action, call_ref, payload = "dial", "", target
+            outcome, label = CALL_ANSWER_TEXT["callback"], "Calling back"
+        else:
+            call_ref = session.get("call_ref") or ""
+            if not call_ref:  # pragma: no cover - the column is non-empty
+                await self._answer_callback(callback_id, STALE_CALL_TEXT)
+                await self._drop_call_buttons(chat_id, message_id,
+                                             original_text)
+                return
+            action, payload = verb, None
+            outcome = CALL_ANSWER_TEXT[verb]
+            label = "Answered" if verb == "answer" else "Declined"
+
+        row = db.call_action_create(self.db_conn, device_id, action,
+                                    call_ref=call_ref, payload=payload,
+                                    client_ref="tg:" + callback_id)
+        if row is None:
+            # This tap was already turned into an action.
+            await self._answer_callback(callback_id, DUPLICATE_CALL_TEXT)
+            return
+
+        self._notify_change(device_id, None)
+        await self._answer_callback(callback_id, outcome)
+        await self._edit_call_outcome(chat_id, message_id, label,
+                                      original_text)
+
+    async def _answer_callback(self, callback_id: str, text: str) -> None:
+        """Answer a tap; a lost answer is not an error worth raising."""
+        try:
+            await self.telegram.answer_callback_query(callback_id, text=text)
+        except Exception as exc:
+            kind = getattr(exc, "kind", None) or type(exc).__name__
+            log.info("sms-relay call callback answer skipped kind=%s", kind)
+
+    async def _edit_call_outcome(self, chat_id, message_id, label,
+                                 original_text=None) -> None:
+        """Keep the call visible and replace the buttons with the outcome.
+
+        ``original_text`` is already the HTML Telegram sent, so appending
+        one escaped line is safe and keeps the caller on screen. A message
+        with no text starts from the outcome alone; an old message that
+        Telegram refuses to edit is simply left alone.
+        """
+        suffix = f"\n\n<b>{_html_escape(label)}</b>"
+        text = (original_text + suffix) if original_text else suffix.strip()
+        await self._edit_call_message(chat_id, message_id, text)
+
+    async def _drop_call_buttons(self, chat_id, message_id,
+                                 original_text=None) -> None:
+        """Remove the buttons of a call message that can no longer act."""
+        line = f"\n\n<b>{_html_escape(STALE_CALL_TEXT)}</b>"
+        text = (original_text + line) if original_text else line.strip()
+        await self._edit_call_message(chat_id, message_id, text)
+
+    async def _edit_call_message(self, chat_id, message_id, text) -> None:
+        if not isinstance(message_id, int) or chat_id is None:
+            return
+        try:
+            await self.telegram.edit_message_text(
+                chat_id, message_id, text,
+                keyboard=EMPTY_KEYBOARD, parse_mode="HTML")
+        except Exception as exc:
+            kind = getattr(exc, "kind", None) or type(exc).__name__
+            log.info("sms-relay call message edit skipped kind=%s", kind)
 
     def _notify_change(self, device_id: str | None = None,
                        thread_key: str | None = None) -> None:

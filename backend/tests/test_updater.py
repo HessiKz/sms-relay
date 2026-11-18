@@ -397,3 +397,291 @@ async def test_run_terminates_cleanly_on_stop(conn, settings):
     assert "paused: no" in fake.sent[0][1]
     assert fake.sent[0][0] == CHAT_ID
     assert len(fake.sent) == 1
+
+
+# --- the call buttons -----------------------------------------------------
+
+CALL_DEVICE = "device-a"
+CALL_REF = "ref-live-1"
+CALL_NUMBER = "09121234567"
+
+
+class CallTelegram(FakeTelegram):
+    """FakeTelegram with the callback and edit calls of the call buttons."""
+
+    def __init__(self, script=None):
+        super().__init__(script)
+        self.answered = []
+        self.edits = []
+        self._edit_error = None
+
+    async def answer_callback_query(self, callback_query_id, text=None):
+        self.answered.append((callback_query_id, text))
+
+    async def edit_message_text(self, chat_id, message_id, text, *,
+                                keyboard=None, parse_mode=None):
+        self.edits.append((chat_id, message_id, text, keyboard,
+                           parse_mode))
+        if self._edit_error is not None:
+            raise self._edit_error
+        return {"ok": True, "message_id": message_id}
+
+
+def _callback(data, *, callback_id="cb-1", user=ADMIN_ID,
+              chat_type="private", message_id=10,
+              text="\U0001F4DE <b>Incoming call</b>"):
+    return {"update_id": 1,
+            "callback_query": {
+                "id": callback_id,
+                "from": {"id": user},
+                "data": data,
+                "message": {"message_id": message_id,
+                            "text": text,
+                            "chat": {"id": CHAT_ID, "type": chat_type}},
+            }}
+
+
+def _session(conn, *, state="ringing", number=CALL_NUMBER,
+             call_ref=CALL_REF, direction="incoming", device_id=CALL_DEVICE,
+             started_at=None):
+    return db.call_session_set(
+        conn, device_id, call_ref, state, direction=direction,
+        number=number, started_at=int(time.time()) - 10 if started_at is None
+        else started_at)
+
+
+async def _press(conn, settings, data, **kwargs):
+    fake = CallTelegram()
+    updater = _updater(fake, conn, settings)
+    # ``_process_callback`` takes the ``callback_query`` object, exactly
+    # what ``_process`` hands it after the update is unwrapped.
+    await updater._process_callback(
+        _callback(data, **kwargs)["callback_query"])
+    return fake
+
+
+def _actions(conn, device_id=CALL_DEVICE):
+    return db._write_tx(conn, lambda: [
+        dict(row) for row in conn.execute(
+            "SELECT * FROM call_actions WHERE device_id = ?"
+            " ORDER BY created_at, id", (device_id,)).fetchall()])
+
+
+@pytest.mark.anyio
+async def test_call_answer_button_creates_an_answer_for_the_live_call(conn,
+                                                                     settings):
+    _session(conn)
+
+    fake = await _press(conn, settings, f"call:answer:{CALL_DEVICE}")
+
+    actions = _actions(conn)
+    assert len(actions) == 1
+    assert actions[0]["action"] == "answer"
+    assert actions[0]["status"] == "pending"
+    assert actions[0]["call_ref"] == CALL_REF
+    assert actions[0]["client_ref"] == "tg:cb-1"
+    assert fake.answered == [("cb-1", "Answering\u2026")]
+    # The keyboard is gone, the outcome is visible and the call stays.
+    assert fake.edits and fake.edits[0][3] == {"inline_keyboard": []}
+    assert "Incoming call" in fake.edits[0][2]
+    assert "Answered" in fake.edits[0][2]
+
+
+@pytest.mark.anyio
+async def test_call_reject_button_creates_a_reject(conn, settings):
+    _session(conn)
+
+    fake = await _press(conn, settings, f"call:reject:{CALL_DEVICE}",
+                        callback_id="cb-2")
+
+    actions = _actions(conn)
+    assert [row["action"] for row in actions] == ["reject"]
+    assert actions[0]["call_ref"] == CALL_REF
+    assert fake.answered == [("cb-2", "Declined")]
+
+
+@pytest.mark.anyio
+async def test_call_back_button_dials_the_normalised_number(conn, settings):
+    _session(conn, state="disconnected", call_ref="ref-missed")
+
+    fake = await _press(conn, settings, f"call:callback:{CALL_DEVICE}",
+                        callback_id="cb-3")
+
+    actions = _actions(conn)
+    assert len(actions) == 1
+    assert actions[0]["action"] == "dial"
+    assert actions[0]["payload"] == "989121234567"
+    # A dial has no call yet.
+    assert actions[0]["call_ref"] == ""
+    assert fake.answered == [("cb-3", "Calling back\u2026")]
+
+
+@pytest.mark.anyio
+async def test_call_back_refuses_an_unusable_number(conn, settings):
+    _session(conn, state="disconnected", number="")
+
+    fake = await _press(conn, settings, f"call:callback:{CALL_DEVICE}")
+
+    assert _actions(conn) == []
+    assert fake.answered[0][1] == "No number to call back"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("number", ["112", "0112", "911", "999", "000"])
+async def test_call_back_never_dials_an_emergency_number(conn, settings,
+                                                         number):
+    _session(conn, state="disconnected", number=number)
+
+    fake = await _press(conn, settings, f"call:callback:{CALL_DEVICE}")
+
+    assert _actions(conn) == []
+    assert "Emergency" in fake.answered[0][1]
+
+
+@pytest.mark.anyio
+async def test_call_back_is_refused_once_a_new_call_is_live(conn, settings):
+    """The missed-call button names the device; a new ring replaces the
+    session, so tapping the old button must not dial the new caller."""
+    _session(conn, state="disconnected", call_ref="ref-missed")
+    _session(conn, state="ringing", call_ref="ref-next")
+
+    fake = await _press(conn, settings, f"call:callback:{CALL_DEVICE}")
+
+    assert _actions(conn) == []
+    assert fake.answered == [("cb-1", "That call has ended")]
+
+
+@pytest.mark.anyio
+async def test_an_absent_session_creates_nothing_and_says_the_call_ended(
+        conn, settings):
+    fake = await _press(conn, settings, f"call:answer:{CALL_DEVICE}")
+
+    assert _actions(conn) == []
+    assert fake.answered == [("cb-1", "That call has ended")]
+    assert fake.edits[0][3] == {"inline_keyboard": []}
+
+
+@pytest.mark.anyio
+async def test_a_stale_ringing_session_is_refused(conn, settings):
+    _session(conn, started_at=int(time.time()) - 600)
+    db._write_tx(conn, lambda: conn.execute(
+        "UPDATE call_sessions SET updated_at = ? WHERE device_id = ?",
+        (int(time.time()) - 121, CALL_DEVICE)))
+
+    fake = await _press(conn, settings, f"call:answer:{CALL_DEVICE}")
+
+    assert _actions(conn) == []
+    assert fake.answered == [("cb-1", "That call has ended")]
+
+
+@pytest.mark.anyio
+async def test_a_disconnected_session_cannot_be_answered(conn, settings):
+    _session(conn, state="disconnected")
+
+    fake = await _press(conn, settings, f"call:answer:{CALL_DEVICE}")
+
+    assert _actions(conn) == []
+    assert fake.answered == [("cb-1", "That call has ended")]
+
+
+@pytest.mark.anyio
+async def test_a_second_tap_of_the_same_callback_creates_nothing_new(
+        conn, settings):
+    _session(conn)
+    first = await _press(conn, settings, f"call:answer:{CALL_DEVICE}")
+
+    second = await _press(conn, settings, f"call:answer:{CALL_DEVICE}")
+
+    assert len(_actions(conn)) == 1
+    assert first.answered == [("cb-1", "Answering\u2026")]
+    assert second.answered == [("cb-1", "Already handled")]
+    # The second tap does not rewrite the message a second time.
+    assert second.edits == []
+
+
+@pytest.mark.anyio
+async def test_a_callback_from_a_non_admin_is_ignored(conn, settings):
+    _session(conn)
+
+    fake = await _press(conn, settings, f"call:answer:{CALL_DEVICE}",
+                        user=999)
+
+    assert _actions(conn) == []
+    assert fake.answered == []
+    assert fake.edits == []
+
+
+@pytest.mark.anyio
+async def test_a_callback_outside_a_private_chat_is_ignored(conn, settings):
+    _session(conn)
+
+    fake = await _press(conn, settings, f"call:answer:{CALL_DEVICE}",
+                        chat_type="group")
+
+    assert _actions(conn) == []
+    assert fake.answered == []
+
+
+@pytest.mark.anyio
+async def test_an_unpaired_device_still_gets_its_action(conn, settings):
+    """A phone with no token is not an error here: it claims the action
+    when it polls, and a lost action would be worse than a delayed one."""
+    _session(conn, device_id="device-never-paired")
+
+    fake = await _press(conn, settings,
+                        "call:answer:device-never-paired")
+
+    actions = _actions(conn, device_id="device-never-paired")
+    assert [row["action"] for row in actions] == ["answer"]
+    assert fake.answered == [("cb-1", "Answering\u2026")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("data", ["call:", "call:answer",
+                                  "call:shout:device-a", "call:answer:"])
+async def test_a_malformed_call_callback_creates_nothing(conn, settings, data):
+    _session(conn)
+
+    fake = await _press(conn, settings, data)
+
+    assert _actions(conn) == []
+    assert fake.answered == [("cb-1", "That call has ended")]
+
+
+@pytest.mark.anyio
+async def test_the_action_bumps_the_revision_for_the_device(conn, settings):
+    from types import SimpleNamespace
+    from app import rev
+
+    _session(conn)
+    app = SimpleNamespace(state=SimpleNamespace(rev=0, rev_event=None,
+                                                rev_scopes=None))
+    rev.init_rev(app)
+    before = app.state.rev
+    fake = CallTelegram()
+    # The production wiring: the updater's change callback is rev.bump_rev.
+    updater = Updater(conn, settings, fake,
+                      on_change=lambda device_id=None, thread_key=None:
+                      rev.bump_rev(app, device_id, thread_key))
+
+    await updater._process_callback(
+        _callback(f"call:answer:{CALL_DEVICE}")["callback_query"])
+
+    assert app.state.rev > before
+    assert rev.changed_threads(app, before) == [
+        {"device_id": CALL_DEVICE, "thread_key": None}]
+
+
+@pytest.mark.anyio
+async def test_an_old_message_that_cannot_be_edited_is_not_an_error(conn,
+                                                                   settings):
+    _session(conn)
+    fake = CallTelegram()
+    fake._edit_error = TGError("bad_request")
+    updater = _updater(fake, conn, settings)
+
+    await updater._process_callback(
+        _callback(f"call:answer:{CALL_DEVICE}")["callback_query"])
+
+    assert len(_actions(conn)) == 1
+    assert fake.answered == [("cb-1", "Answering\u2026")]

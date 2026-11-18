@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- An original paper-plane glyph drawn for this app; no stock asset.
+     A single silhouette: the nose points right, the tail is notched so
+     the fold reads at 24dp. The colour comes from the view's tint. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2.6,20.6 L21.4,12.0 L2.6,3.4 L2.6,9.8 L15.2,12.0 L2.6,14.2 Z" />
+</vector>

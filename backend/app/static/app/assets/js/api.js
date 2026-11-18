@@ -2,7 +2,7 @@
 // The initData credential is sent only through the request header, never
 // in a URL, a cache key or a log line.
 
-import { initData } from "./telegram.js?v=20261116-pair";
+import { initData } from "./telegram.js?v=20261117-calls";
 
 const API_ROOT = "api/";
 const AUTH_HEADER = "X-Telegram-Init-Data";
@@ -112,4 +112,55 @@ export function apiPost(path, body) {
 
 export function apiPatch(path, body) {
   return request("PATCH", path, { body });
+}
+
+// --- calls ------------------------------------------------------------
+
+// The call log of ONE device, newest first. The cursor has two halves
+// (`before_ts` and `before_id`), exactly like the thread timeline, so two
+// calls of the same second are never skipped or repeated.
+export function getCalls(deviceId, options) {
+  const opts = options || {};
+  const params = { limit: opts.limit };
+  if (opts.beforeTs !== undefined && opts.beforeTs !== null) {
+    params.before_ts = opts.beforeTs;
+  }
+  if (opts.beforeKey !== undefined && opts.beforeKey !== null) {
+    params.before_id = opts.beforeKey;
+  }
+  if (opts.q) params.q = opts.q;
+  return apiGet(
+    "devices/" + encodeURIComponent(String(deviceId || "")) + "/calls",
+    params);
+}
+
+// The current call of the device, or a null call when it is idle.
+export function getLiveCall(deviceId) {
+  return apiGet(
+    "devices/" + encodeURIComponent(String(deviceId || "")) + "/calls/live");
+}
+
+// Ask the phone to answer, decline, mute, dial, ... The client_ref makes
+// the request idempotent: a retry with the same one is not a second call.
+export function sendCallAction(deviceId, options) {
+  const opts = options || {};
+  const body = {
+    call_ref: String(opts.callRef || ""),
+    action: String(opts.action || ""),
+    client_ref: String(opts.clientRef || ""),
+  };
+  if (opts.payload !== undefined && opts.payload !== null) {
+    body.payload = opts.payload;
+  }
+  return apiPost(
+    "devices/" + encodeURIComponent(String(deviceId || ""))
+    + "/calls/actions",
+    body);
+}
+
+// Clear the unread missed badge of ONE device up to a timestamp.
+export function markCallsRead(deviceId, untilTs) {
+  return apiPost(
+    "devices/" + encodeURIComponent(String(deviceId || "")) + "/calls/read",
+    { until_ts: Math.floor(Number(untilTs) || 0) });
 }

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Original vector path in the Material Symbols style (open font,
+     Apache 2.0): an arrow entering from the top right, the missed call
+     of a log row. Tinted from the theme so it follows dark mode. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M20,15.59 L6.41,2 L5,3.41 L18.59,17 H12 v2 h10 V9 h-2 Z" />
+</vector>

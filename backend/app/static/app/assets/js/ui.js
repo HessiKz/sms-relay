@@ -444,6 +444,8 @@ export function setDevicesStatus(text) {
 }
 
 export function renderChatsHeader(device) {
+  ensureCallsSurface();
+  renderCallsTabBadge(device);
   if (!device) {
     if (chatsDeviceNameEl) chatsDeviceNameEl.textContent = "Conversations";
     if (chatsDeviceStatusEl) chatsDeviceStatusEl.textContent = "";
@@ -604,9 +606,863 @@ export function renderChatList(chats, options) {
   prune(chatNodes, live);
 }
 
+// --- calls -------------------------------------------------------------
+
+// The numbers the backend refuses to dial remotely. They are never shown
+// in the "Call via…" sheet and never sent as a dial action: an emergency
+// call is placed on the phone itself.
+const EMERGENCY_NUMBERS = ["110", "112", "115", "125", "911", "999", "000"];
+
+let tabBarEl = null;
+let tabChatsEl = null;
+let tabCallsEl = null;
+let liveCardEl = null;
+let liveNodes = null;
+let callsSectionEl = null;
+let callListEl = null;
+let callsStatusEl = null;
+let activeDeviceTab = "chats";
+let liveTimer = null;
+let currentLiveCall = null;
+let liveCallError = "";
+const callNodes = new Map();   // call id -> row
+let emptyCallsRow = null;
+let emptyCallsKey = null;
+let loadMoreCallsRow = null;
+
+let callSheetEl = null;
+let callSheetParts = null;
+let callSheetCall = null;
+let viaSheetEl = null;
+let viaListEl = null;
+let viaSubEl = null;
+let keypadEl = null;
+
+export function isEmergencyNumber(number) {
+  const digits = String(number || "").replace(/[^0-9]/g, "");
+  if (!digits) return false;
+  if (EMERGENCY_NUMBERS.indexOf(digits) !== -1) return true;
+  const stripped = digits.replace(/^0+/, "");
+  return Boolean(stripped) && EMERGENCY_NUMBERS.indexOf(stripped) !== -1;
+}
+
+function callKindLabel(kind) {
+  switch (kind) {
+    case "incoming":
+      return "Incoming call";
+    case "outgoing":
+      return "Outgoing call";
+    case "missed":
+      return "Missed call";
+    case "rejected":
+      return "Declined call";
+    case "blocked":
+      return "Blocked call";
+    case "voicemail":
+      return "Voicemail";
+    default:
+      return "Call";
+  }
+}
+
+// A text glyph, never an image: the CSP only allows 'self' assets and the
+// row has to work without any download.
+function callGlyph(kind) {
+  switch (kind) {
+    case "outgoing":
+      return "↗";
+    case "missed":
+      return "✖";
+    case "rejected":
+      return "⊘";
+    case "blocked":
+      return "⊗";
+    case "voicemail":
+      return "▣";
+    case "incoming":
+    case "unknown":
+      return "↙";
+    default:
+      return "•";
+  }
+}
+
+function callStateLabel(state) {
+  switch (state) {
+    case "ringing":
+      return "Ringing";
+    case "dialing":
+      return "Dialing";
+    case "active":
+      return "On call";
+    case "held":
+      return "Held";
+    case "disconnected":
+      return "Call ended";
+    default:
+      return "Call";
+  }
+}
+
+function formatClock(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  if (hours > 0) return hours + ":" + pad(minutes) + ":" + pad(secs);
+  return pad(minutes) + ":" + pad(secs);
+}
+
+// The phone sends a phone account label that is often already human text
+// ("SIM 1", or the carrier name). Add the prefix only when it is missing.
+function simText(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return /^sim\b/i.test(text) ? text : "SIM " + text;
+}
+
+function callTitle(call) {
+  return String(call.name || call.display || call.number || "Unknown number");
+}
+
+// --- the tab header of the device screen -------------------------------
+
+// The calls surface is built here, not in the shell: index.html only
+// carries the version query. The nodes are created once and then reused,
+// so switching tabs never rebuilds the list.
+function ensureCallsSurface() {
+  if (tabBarEl || !chatListEl) return Boolean(tabBarEl);
+  const pane = chatListEl.parentNode;
+  if (!pane) return false;
+
+  liveNodes = buildLiveCard();
+  liveCardEl = liveNodes.card;
+
+  tabBarEl = create("div", "tab-bar");
+  tabBarEl.id = "tab-bar";
+  tabBarEl.setAttribute("role", "tablist");
+  tabBarEl.setAttribute("aria-label", "Device sections");
+  tabChatsEl = create("button", "tab-button active", "Chats");
+  tabChatsEl.type = "button";
+  tabChatsEl.id = "tab-chats";
+  tabChatsEl.dataset.tab = "chats";
+  tabChatsEl.setAttribute("role", "tab");
+  tabChatsEl.setAttribute("aria-selected", "true");
+  tabChatsEl.setAttribute("aria-controls", "chat-list");
+  tabCallsEl = create("button", "tab-button", "Calls");
+  tabCallsEl.type = "button";
+  tabCallsEl.id = "tab-calls";
+  tabCallsEl.dataset.tab = "calls";
+  tabCallsEl.setAttribute("role", "tab");
+  tabCallsEl.setAttribute("aria-selected", "false");
+  tabCallsEl.setAttribute("aria-controls", "call-list");
+  tabBarEl.append(tabChatsEl, tabCallsEl);
+
+  callsSectionEl = create("div", "calls-section");
+  callsSectionEl.id = "calls-section";
+  callsSectionEl.hidden = true;
+  callsStatusEl = create("p", "status-line");
+  callsStatusEl.id = "calls-status";
+  callsStatusEl.setAttribute("role", "status");
+  callsStatusEl.setAttribute("aria-live", "polite");
+  callListEl = create("ul", "call-list");
+  callListEl.id = "call-list";
+  callListEl.setAttribute("aria-label", "Call history");
+  callsSectionEl.append(callsStatusEl, callListEl);
+
+  // The header keeps the device, then the live card, the tabs, the chat
+  // list and the call list of the same device.
+  pane.insertBefore(tabBarEl, listStatusEl || chatListEl);
+  pane.insertBefore(liveCardEl, tabBarEl);
+  pane.insertBefore(callsSectionEl, chatListEl.nextSibling);
+  return true;
+}
+
+// The missed count of the device summary is the badge of the Calls tab.
+function renderCallsTabBadge(device) {
+  if (!tabCallsEl) return;
+  let badge = tabCallsEl.querySelector(".tab-badge");
+  const count = device ? Number(device.missed) || 0 : 0;
+  if (count <= 0) {
+    if (badge) badge.remove();
+    return;
+  }
+  if (!badge) {
+    badge = create("span", "tab-badge");
+    tabCallsEl.append(badge);
+  }
+  const text = count > 99 ? "99+" : String(count);
+  if (badge.textContent !== text) badge.textContent = text;
+  const label = String(count) + " missed calls";
+  if (badge.getAttribute("aria-label") !== label) {
+    badge.setAttribute("aria-label", label);
+  }
+}
+
+// Switch the visible tab of the device screen. The route owns the value,
+// so a back/forward gesture always shows the matching tab.
+export function setDeviceTab(name) {
+  ensureCallsSurface();
+  if (!tabBarEl) return;
+  const tab = name === "calls" ? "calls" : "chats";
+  activeDeviceTab = tab;
+  const selected = tab === "calls";
+  tabChatsEl.setAttribute("aria-selected", selected ? "false" : "true");
+  tabCallsEl.setAttribute("aria-selected", selected ? "true" : "false");
+  tabChatsEl.classList.toggle("active", !selected);
+  tabCallsEl.classList.toggle("active", selected);
+  if (chatListEl) chatListEl.hidden = selected;
+  if (listStatusEl) listStatusEl.hidden = selected;
+  if (callsSectionEl) callsSectionEl.hidden = !selected;
+  const newChat = document.getElementById("new-chat-button");
+  if (newChat) newChat.hidden = selected;
+  const input = document.getElementById("search");
+  if (input) {
+    input.placeholder = selected ? "Search calls" : "Search this device";
+    input.setAttribute("aria-label",
+      selected ? "Search calls" : "Search conversations");
+  }
+}
+
+export function deviceTab() {
+  return activeDeviceTab;
+}
+
+// --- the call list -----------------------------------------------------
+
+function buildCallRow(call) {
+  const row = create("li", "call-row");
+  const button = create("button", "call-item");
+  button.type = "button";
+  const wrap = create("span", "call-icon-wrap");
+  const icon = create("span", "call-icon");
+  icon.setAttribute("aria-hidden", "true");
+  const dot = create("span", "call-dot");
+  dot.setAttribute("aria-hidden", "true");
+  wrap.append(icon, dot);
+  const main = create("span", "call-main");
+  const title = create("span", "call-title");
+  const meta = create("span", "call-meta");
+  main.append(title, meta);
+  const side = create("span", "call-side");
+  const when = create("span", "call-time");
+  side.append(when);
+  button.append(wrap, main, side);
+  const more = create("button", "call-more", "⋯");
+  more.type = "button";
+  more.setAttribute("aria-label", "Call options");
+  row.append(button, more);
+  row.parts = {
+    button,
+    icon,
+    dot,
+    title,
+    meta,
+    time: when,
+    more,
+  };
+  return row;
+}
+
+function updateCallRow(node, call) {
+  const parts = node.parts;
+  if (!parts) return;
+  const kind = String(call.kind || "unknown");
+  const title = callTitle(call);
+  if (parts.title.textContent !== title) parts.title.textContent = title;
+  const iconClass = "call-icon dir-" + kind;
+  if (parts.icon.className !== iconClass) parts.icon.className = iconClass;
+  const glyph = callGlyph(kind);
+  if (parts.icon.textContent !== glyph) parts.icon.textContent = glyph;
+  const metaParts = [callKindLabel(kind)];
+  const number = String(call.number || "");
+  const display = String(call.display || "");
+  if (number && number !== title && display !== title) metaParts.push(number);
+  const duration = Number(call.duration_s) || 0;
+  if (duration > 0) metaParts.push(formatClock(duration));
+  // The log row carries `phone_account`; a live session carries
+  // `sim_label`. Either one names the line that handled the call.
+  const simLine = simText(call.sim_label) || simText(call.phone_account);
+  if (simLine) metaParts.push(simLine);
+  const meta = metaParts.filter(Boolean).join(" · ");
+  if (parts.meta.textContent !== meta) parts.meta.textContent = meta;
+  const when = formatRelative(call.started_at);
+  if (parts.time.textContent !== when) parts.time.textContent = when;
+  const unread = kind === "missed" && !call.is_read;
+  parts.dot.hidden = !unread;
+  parts.button.classList.toggle("has-unread", unread);
+  const label = [callKindLabel(kind), title, when].filter(Boolean).join(", ");
+  if (parts.button.getAttribute("aria-label") !== label) {
+    parts.button.setAttribute("aria-label", label);
+  }
+  parts.button.dataset.callId = String(call.id || "");
+  const threadKey = call.thread_key ? String(call.thread_key) : "";
+  if (threadKey) parts.button.dataset.threadKey = threadKey;
+  else delete parts.button.dataset.threadKey;
+  parts.more.dataset.callMenu = String(call.id || "");
+  parts.more.setAttribute("aria-label", "Options for " + title);
+}
+
+function callRow(call) {
+  const key = String(call.id);
+  let node = callNodes.get(key);
+  if (!node) {
+    node = buildCallRow(call);
+    callNodes.set(key, node);
+  }
+  updateCallRow(node, call);
+  return node;
+}
+
+function loadMoreCallsButton() {
+  if (!loadMoreCallsRow) {
+    loadMoreCallsRow = create("li", "load-row");
+    const button = create("button", "load-older", "Load more calls");
+    button.type = "button";
+    button.id = "load-more-calls";
+    loadMoreCallsRow.append(button);
+  }
+  return loadMoreCallsRow;
+}
+
+function emptyCallsNode(key) {
+  if (!emptyCallsRow || emptyCallsKey !== key) {
+    let text = "No calls yet";
+    if (key === "search") text = "No calls match your search.";
+    if (key === "unavailable") {
+      text = "Calls are not available on this device yet";
+    }
+    emptyCallsRow = create("li", "empty-row", text);
+    emptyCallsKey = key;
+  }
+  return emptyCallsRow;
+}
+
+export function renderCalls(calls, options) {
+  ensureCallsSurface();
+  if (!callListEl) return;
+  const opts = options || {};
+  const list = Array.isArray(calls) ? calls : [];
+  const desired = [];
+  const live = new Set();
+  if (opts.available === false) {
+    desired.push(emptyCallsNode("unavailable"));
+  } else if (!list.length) {
+    desired.push(emptyCallsNode(opts.query ? "search" : "plain"));
+  } else {
+    for (const call of list) {
+      if (!call || !call.id) continue;
+      live.add(String(call.id));
+      desired.push(callRow(call));
+    }
+    if (opts.hasMore) desired.push(loadMoreCallsButton());
+  }
+  reconcile(callListEl, desired);
+  prune(callNodes, live);
+}
+
+export function setCallsStatus(text) {
+  ensureCallsSurface();
+  if (callsStatusEl) callsStatusEl.textContent = text ? String(text) : "";
+}
+
+// --- the live call card ------------------------------------------------
+
+function buildLiveCard() {
+  const card = create("section", "live-call");
+  card.id = "live-call-card";
+  card.setAttribute("aria-live", "polite");
+  card.hidden = true;
+  const top = create("div", "live-top");
+  const icon = create("span", "live-icon");
+  icon.setAttribute("aria-hidden", "true");
+  const main = create("div", "live-main");
+  const title = create("p", "live-title");
+  const stateLine = create("p", "live-state");
+  main.append(title, stateLine);
+  const elapsed = create("p", "live-elapsed");
+  top.append(icon, main, elapsed);
+  const error = create("p", "live-error");
+  error.setAttribute("role", "alert");
+  error.hidden = true;
+  const actions = create("div", "live-actions");
+  const definitions = [
+    ["answer", "Answer"],
+    ["reject", "Decline"],
+    ["hangup", "Hang up"],
+    ["mute", "Mute"],
+    ["speaker_on", "Speaker on"],
+    ["dtmf", "Keypad"],
+    ["hold", "Hold"],
+  ];
+  const byAction = {};
+  for (const definition of definitions) {
+    const button = create("button", "live-button action-" + definition[0],
+      definition[1]);
+    button.type = "button";
+    button.dataset.callAction = definition[0];
+    actions.append(button);
+    byAction[definition[0]] = button;
+  }
+  card.append(top, error, actions);
+  return {
+    card,
+    icon,
+    title,
+    stateLine,
+    elapsed,
+    error,
+    actions,
+    byAction,
+  };
+}
+
+function setLiveToggle(button, action, label) {
+  if (!button) return;
+  button.dataset.callAction = action;
+  if (button.textContent !== label) button.textContent = label;
+}
+
+function liveElapsedSeconds(call) {
+  const start = Number(call && call.started_at) || 0;
+  if (!start) return 0;
+  return Math.max(0, Math.floor(Date.now() / 1000) - start);
+}
+
+function updateLiveElapsed() {
+  if (!liveNodes) return;
+  const call = currentLiveCall;
+  const state = call ? String(call.state || "") : "";
+  const show = state === "active" || state === "held";
+  const text = show ? formatClock(liveElapsedSeconds(call)) : "";
+  if (liveNodes.elapsed.textContent !== text) {
+    liveNodes.elapsed.textContent = text;
+  }
+}
+
+function liveTimerWanted() {
+  if (!currentLiveCall) return false;
+  if (document.hidden) return false;
+  const route = appEl ? String(appEl.dataset.route || "") : "";
+  if (route !== "chats" && route !== "calls") return false;
+  const state = String(currentLiveCall.state || "");
+  return state === "active" || state === "held";
+}
+
+function syncLiveTimer() {
+  if (liveTimerWanted()) {
+    if (!liveTimer) liveTimer = setInterval(updateLiveElapsed, 1000);
+    updateLiveElapsed();
+    return;
+  }
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
+}
+
+export function stopLiveTimer() {
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
+}
+
+export function renderLiveCall(call) {
+  ensureCallsSurface();
+  currentLiveCall = call && call.call_ref ? call : null;
+  if (!liveCardEl || !liveNodes) {
+    syncLiveTimer();
+    return;
+  }
+  if (!currentLiveCall) {
+    liveCardEl.hidden = true;
+    liveNodes.error.hidden = true;
+    liveNodes.error.textContent = "";
+    liveCallError = "";
+    syncLiveTimer();
+    return;
+  }
+  const live = currentLiveCall;
+  liveCardEl.hidden = false;
+  const state = String(live.state || "");
+  const outgoing = live.direction === "outgoing";
+  const kind = outgoing ? "outgoing" : "incoming";
+  const iconClass = "live-icon dir-" + kind;
+  if (liveNodes.icon.className !== iconClass) liveNodes.icon.className = iconClass;
+  const glyph = callGlyph(kind);
+  if (liveNodes.icon.textContent !== glyph) liveNodes.icon.textContent = glyph;
+
+  const title = callTitle(live);
+  if (liveNodes.title.textContent !== title) liveNodes.title.textContent = title;
+
+  const parts = [callStateLabel(state), outgoing ? "outgoing" : "incoming"];
+  const sim = simText(live.sim_label);
+  if (sim) parts.push(sim);
+  const number = String(live.display || live.number || "");
+  if (number && number !== title) parts.push(number);
+  const stateText = parts.filter(Boolean).join(" · ");
+  if (liveNodes.stateLine.textContent !== stateText) {
+    liveNodes.stateLine.textContent = stateText;
+  }
+
+  const ringing = state === "ringing";
+  const onCall = state === "active" || state === "held";
+  liveNodes.byAction.answer.hidden = !(ringing && !outgoing);
+  liveNodes.byAction.reject.hidden = !ringing;
+  liveNodes.byAction.hangup.hidden = !(onCall || state === "dialing");
+  liveNodes.byAction.mute.hidden = !onCall;
+  liveNodes.byAction.speaker_on.hidden = !onCall;
+  liveNodes.byAction.hold.hidden = !onCall;
+  liveNodes.byAction.dtmf.hidden = !onCall;
+  setLiveToggle(liveNodes.byAction.mute,
+    live.muted ? "unmute" : "mute", live.muted ? "Unmute" : "Mute");
+  setLiveToggle(liveNodes.byAction.speaker_on,
+    live.speaker ? "speaker_off" : "speaker_on",
+    live.speaker ? "Speaker off" : "Speaker on");
+  setLiveToggle(liveNodes.byAction.hold,
+    state === "held" ? "unhold" : "hold",
+    state === "held" ? "Unhold" : "Hold");
+
+  const message = liveCallError;
+  liveNodes.error.textContent = message;
+  liveNodes.error.hidden = !message;
+  updateLiveElapsed();
+  syncLiveTimer();
+}
+
+// Only the buttons that send an action are disabled; the Close/Cancel
+// buttons of the sheets stay usable so a slow answer never traps the
+// reader.
+export function setCallActionsBusy(busy) {
+  const value = Boolean(busy);
+  for (const root of [liveCardEl, keypadEl]) {
+    if (!root) continue;
+    for (const button of root.querySelectorAll("button")) {
+      button.disabled = value;
+    }
+  }
+}
+
+export function setCallError(text) {
+  liveCallError = text ? String(text) : "";
+  if (!liveNodes || liveCardEl.hidden) return;
+  liveNodes.error.textContent = liveCallError;
+  liveNodes.error.hidden = !liveCallError;
+}
+
+// --- the call sheets ---------------------------------------------------
+
+// The three sheets are built once, lazily, and appended to the app root:
+// the same pattern as the live card, so the shell stays markup-only.
+function ensureSheets() {
+  if (callSheetEl && viaSheetEl && keypadEl) return;
+  const root = appEl || document.body;
+
+  if (!callSheetEl) {
+    callSheetEl = create("div", "dialog-backdrop");
+    callSheetEl.id = "call-sheet";
+    callSheetEl.hidden = true;
+    const card = create("div", "dialog-card");
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-modal", "true");
+    card.setAttribute("aria-labelledby", "call-sheet-title");
+    const title = create("h2", "dialog-title");
+    title.id = "call-sheet-title";
+    const sub = create("p", "muted");
+    sub.id = "call-sheet-sub";
+    const note = create("p", "dialog-error");
+    note.id = "call-sheet-note";
+    note.setAttribute("role", "alert");
+    note.hidden = true;
+    const actions = create("div", "dialog-form");
+    const callback = create("button", "secondary-button", "Call back");
+    callback.type = "button";
+    callback.id = "call-sheet-callback";
+    const via = create("button", "secondary-button", "Call via…");
+    via.type = "button";
+    via.id = "call-sheet-via";
+    actions.append(callback, via);
+    const footer = create("div", "dialog-actions");
+    const cancel = create("button", "secondary-button", "Cancel");
+    cancel.type = "button";
+    cancel.id = "call-sheet-cancel";
+    footer.append(cancel);
+    card.append(title, sub, note, actions, footer);
+    callSheetEl.append(card);
+    root.append(callSheetEl);
+    callSheetParts = { title, sub, note, callback, via, cancel };
+  }
+
+  if (!viaSheetEl) {
+    viaSheetEl = create("div", "dialog-backdrop");
+    viaSheetEl.id = "call-via-sheet";
+    viaSheetEl.hidden = true;
+    const card = create("div", "dialog-card");
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-modal", "true");
+    card.setAttribute("aria-labelledby", "call-via-title");
+    const title = create("h2", "dialog-title", "Call via…");
+    title.id = "call-via-title";
+    viaSubEl = create("p", "muted");
+    viaSubEl.id = "call-via-sub";
+    viaListEl = create("div", "call-via-list");
+    viaListEl.id = "call-via-list";
+    const footer = create("div", "dialog-actions");
+    const cancel = create("button", "secondary-button", "Cancel");
+    cancel.type = "button";
+    cancel.id = "call-via-cancel";
+    footer.append(cancel);
+    card.append(title, viaSubEl, viaListEl, footer);
+    viaSheetEl.append(card);
+    root.append(viaSheetEl);
+  }
+
+  if (!keypadEl) {
+    keypadEl = create("div", "dialog-backdrop");
+    keypadEl.id = "keypad-sheet";
+    keypadEl.hidden = true;
+    const card = create("div", "dialog-card");
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-modal", "true");
+    card.setAttribute("aria-labelledby", "keypad-title");
+    const title = create("h2", "dialog-title", "Keypad");
+    title.id = "keypad-title";
+    const grid = create("div", "keypad-grid");
+    grid.id = "keypad-grid";
+    const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9",
+      "*", "0", "#"];
+    for (const key of keys) {
+      const button = create("button", "keypad-key", key);
+      button.type = "button";
+      button.dataset.dtmf = key;
+      grid.append(button);
+    }
+    const footer = create("div", "dialog-actions");
+    const close = create("button", "secondary-button", "Close");
+    close.type = "button";
+    close.id = "keypad-close";
+    footer.append(close);
+    card.append(title, grid, footer);
+    keypadEl.append(card);
+    root.append(keypadEl);
+  }
+}
+
+export function openCallSheet(call) {
+  ensureSheets();
+  if (!callSheetEl) return;
+  callSheetCall = call || {};
+  const number = String(callSheetCall.number || "");
+  const title = callTitle(callSheetCall);
+  callSheetParts.title.textContent = title;
+  const meta = [];
+  const display = String(callSheetCall.display || "");
+  if (display && display !== title) meta.push(display);
+  const kind = String(callSheetCall.kind || "");
+  if (kind) meta.push(callKindLabel(kind));
+  const when = formatRelative(callSheetCall.started_at);
+  if (when) meta.push(when);
+  callSheetParts.sub.textContent = meta.filter(Boolean).join(" · ");
+  const emergency = isEmergencyNumber(number);
+  callSheetParts.callback.hidden = !number || emergency;
+  callSheetParts.via.hidden = !number || emergency;
+  callSheetParts.note.hidden = !emergency;
+  callSheetParts.note.textContent = emergency
+    ? "Emergency numbers can only be dialled on the phone itself."
+    : "";
+  callSheetEl.hidden = false;
+}
+
+export function closeCallSheet() {
+  if (callSheetEl) callSheetEl.hidden = true;
+}
+
+export function callSheetNumber() {
+  return String((callSheetCall && callSheetCall.number) || "");
+}
+
+function e164Digits(number) {
+  const digits = String(number || "").replace(/[^0-9]/g, "");
+  return digits.length >= 5 ? digits : "";
+}
+
+// Every place a number can be opened. The `https` ones are the reliable
+// path; `tel`, `viber`, `skype` and `facetime` are best effort and only
+// work when the client has an app for them.
+function callViaEntries(number) {
+  const entries = [{
+    key: "tel",
+    label: "Phone (SIM)",
+    hint: "the phone places the call",
+    url: "",
+  }];
+  const digits = e164Digits(number);
+  if (digits) {
+    entries.push({
+      key: "whatsapp",
+      label: "WhatsApp",
+      hint: "",
+      url: "https://wa.me/" + digits,
+    });
+    entries.push({
+      key: "telegram",
+      label: "Telegram",
+      hint: "",
+      url: "https://t.me/+" + digits,
+    });
+    entries.push({
+      key: "signal",
+      label: "Signal",
+      hint: "",
+      url: "https://signal.me/#p/+" + digits,
+    });
+    entries.push({
+      key: "viber",
+      label: "Viber",
+      hint: "",
+      url: "viber://chat?number=%2B" + digits,
+    });
+    entries.push({
+      key: "skype",
+      label: "Skype",
+      hint: "",
+      url: "skype:" + digits + "?call",
+    });
+    entries.push({
+      key: "facetime",
+      label: "FaceTime",
+      hint: "iOS only",
+      url: "facetime://+" + digits,
+    });
+  }
+  entries.push({ key: "bale", label: "Bale", hint: "", url: "https://ble.ir/" });
+  entries.push({
+    key: "rubika",
+    label: "Rubika",
+    hint: "",
+    url: "https://rubika.ir/",
+  });
+  return entries;
+}
+
+export function openCallViaSheet(options) {
+  ensureSheets();
+  if (!viaSheetEl) return;
+  const data = options || {};
+  const call = callSheetCall || {};
+  const number = String(data.number || call.number || "");
+  // An emergency number never reaches this sheet: the local dialer is
+  // the only place that may place it.
+  if (!number || isEmergencyNumber(number)) {
+    closeCallVia();
+    return;
+  }
+  const name = String(data.name || call.name || call.display || "");
+  viaSubEl.textContent = [name, number].filter(Boolean).join(" · ");
+  const desired = [];
+  for (const entry of callViaEntries(number)) {
+    const button = create("button", "call-via-item");
+    button.type = "button";
+    button.dataset.callVia = entry.key;
+    if (entry.url) button.dataset.callViaUrl = entry.url;
+    const label = create("span", "call-via-label", entry.label);
+    button.append(label);
+    if (entry.hint) {
+      button.append(create("span", "call-via-hint", entry.hint));
+    }
+    desired.push(button);
+  }
+  viaListEl.replaceChildren();
+  for (const button of desired) viaListEl.append(button);
+  // One dialog at a time; the call of the sheet is kept so "Call back"
+  // and the tel entry still know the number.
+  if (callSheetEl) callSheetEl.hidden = true;
+  viaSheetEl.hidden = false;
+}
+
+export function closeCallVia() {
+  if (viaSheetEl) viaSheetEl.hidden = true;
+}
+
+export function openKeypad() {
+  ensureSheets();
+  if (keypadEl) keypadEl.hidden = false;
+}
+
+export function closeKeypad() {
+  if (keypadEl) keypadEl.hidden = true;
+}
+
 // --- the timeline -------------------------------------------------------
 
+function eventKey(event) {
+  if (!event) return "";
+  const id = event.id !== undefined && event.id !== null
+    ? event.id : event.event_id;
+  return id === undefined || id === null ? "" : String(id);
+}
+
+function isOutboundDirection(direction) {
+  const value = String(direction || "");
+  return value === "out" || value === "outgoing";
+}
+
+function buildCallBubble(event) {
+  const outbound = isOutboundDirection(event.direction);
+  const row = create("li", outbound ? "row out" : "row in");
+  const bubble = create("div", "bubble bubble-call");
+  const head = create("p", "bubble-call-head");
+  const icon = create("span", "call-icon");
+  icon.setAttribute("aria-hidden", "true");
+  const text = create("span", "bubble-call-text");
+  head.append(icon, text);
+  const metaRow = create("p", "bubble-meta");
+  const time = create("span", "bubble-time", formatTime(event.ts));
+  metaRow.append(time);
+  const callback = create("button", "bubble-call-back", "Call back");
+  callback.type = "button";
+  bubble.append(head, metaRow, callback);
+  row.append(bubble);
+  row.parts = { icon, text, time, callback };
+  return row;
+}
+
+function callEventText(event) {
+  const kind = String(event.call_kind || "unknown");
+  const duration = Number(event.duration_s) || 0;
+  const parts = [callKindLabel(kind)];
+  if (duration > 0) parts.push(formatClock(duration));
+  return parts.join(" · ");
+}
+
+function updateCallBubble(node, event) {
+  const parts = node.parts;
+  if (!parts) return;
+  const kind = String(event.call_kind || "unknown");
+  const iconClass = "call-icon dir-" + kind;
+  if (parts.icon.className !== iconClass) parts.icon.className = iconClass;
+  const glyph = callGlyph(kind);
+  if (parts.icon.textContent !== glyph) parts.icon.textContent = glyph;
+  const text = callEventText(event);
+  if (parts.text.textContent !== text) parts.text.textContent = text;
+  const when = formatTime(event.ts);
+  if (parts.time.textContent !== when) parts.time.textContent = when;
+  const number = String(event.number || "");
+  // The attribute is the hook of the delegated listener in app.js; the
+  // element itself never carries the number as markup.
+  parts.callback.setAttribute("data-call-back", number);
+  const title = String(event.number || "");
+  const label = "Call back" + (title ? " " + title : "");
+  if (parts.callback.getAttribute("aria-label") !== label) {
+    parts.callback.setAttribute("aria-label", label);
+  }
+  parts.callback.hidden = !number || isEmergencyNumber(number);
+}
+
 function buildEventRow(event) {
+  if (event.kind === "call") return buildCallBubble(event);
   const outbound = event.direction === "out";
   const row = create("li", outbound ? "row out" : "row in");
   if (event.local && event.id) row.dataset.localId = String(event.id);
@@ -635,6 +1491,10 @@ function buildEventRow(event) {
 function updateEventRow(node, event) {
   const parts = node.parts;
   if (!parts) return;
+  if (event.kind === "call") {
+    updateCallBubble(node, event);
+    return;
+  }
   const text = String(event.body === undefined || event.body === null
     ? "" : event.body);
   if (parts.body.textContent !== text) parts.body.textContent = text;
@@ -650,7 +1510,7 @@ function updateEventRow(node, event) {
 }
 
 function eventRow(event) {
-  const key = String(event.id);
+  const key = eventKey(event);
   let node = threadNodes.get(key);
   if (!node) {
     node = buildEventRow(event);
@@ -779,11 +1639,18 @@ export function resetScope() {
   chatNodes.clear();
   threadNodes.clear();
   dayNodes.clear();
+  callNodes.clear();
   renderedScope = null;
+  currentLiveCall = null;
+  liveCallError = "";
+  stopLiveTimer();
   if (chatListEl) chatListEl.replaceChildren();
   if (timelineEl) timelineEl.replaceChildren();
+  if (callListEl) callListEl.replaceChildren();
+  if (liveCardEl) liveCardEl.hidden = true;
   if (listStatusEl) listStatusEl.textContent = "";
   if (threadStatusEl) threadStatusEl.textContent = "";
+  if (callsStatusEl) callsStatusEl.textContent = "";
 }
 
 export function renderMe(me) {
@@ -815,12 +1682,18 @@ export function hideSplash() {
   if (splashEl) splashEl.hidden = true;
 }
 
-// The route of the shell: devices, chats or thread. The CSS decides
-// which pane is visible.
+// The route of the shell: devices, chats, calls or thread. The CSS
+// decides which pane is visible.
 export function setRoute(name) {
   if (!appEl) return;
-  const route = name === "chats" || name === "thread" ? name : "devices";
-  appEl.dataset.route = route;
+  const route = name === "chats" || name === "thread" || name === "calls"
+    ? name : "devices";
+  // The "calls" route reuses the chats pane: same header, same tab bar.
+  appEl.dataset.route = route === "calls" ? "chats" : route;
+  // The route owns the tab, so back/forward always restores it. Any other
+  // route (the device list, a thread) returns the pane to Chats.
+  setDeviceTab(route === "calls" ? "calls" : "chats");
+  syncLiveTimer();
 }
 
 export function renderPausedState(paused) {

@@ -272,6 +272,44 @@ class SettingsStore(context: Context) {
         set(value) = prefs.edit().putInt(KEY_CONTACTS_COUNT, value).apply()
 
     /**
+     * The highest call-log row id that was synced. The worker resumes
+     * from here, so an interrupted sync never starts over.
+     *
+     * The unit is the `_ID` of `content://call_log/calls`, exactly like
+     * [importCursor] for the SMS store.
+     */
+    var callLogCursor: Long
+        get() = prefs.getLong(KEY_CALL_LOG_CURSOR, 0L)
+        set(value) = prefs.edit().putLong(KEY_CALL_LOG_CURSOR, value).apply()
+
+    /**
+     * Layout of the cursor in [callLogCursor].
+     *
+     * Version 0 is an install that never synced calls; version 1 is the
+     * `_ID` cursor of this build. A mismatch makes the worker restart
+     * from the first row once per install, so an older or half-written
+     * cursor can never skip history. The server upserts by content hash,
+     * so replayed rows are counted as duplicates, not stored twice.
+     */
+    var callLogCursorFormat: Int
+        get() = prefs.getInt(KEY_CALL_LOG_CURSOR_FORMAT, 0)
+        set(value) = prefs.edit().putInt(KEY_CALL_LOG_CURSOR_FORMAT, value).apply()
+
+    /**
+     * The newest `DATE` that the rolling recent window has already
+     * looked at (epoch seconds). The window re-reads the last seven days
+     * on every run; this value only lets the screen say how far it got.
+     */
+    var callLogRecentCursor: Long
+        get() = prefs.getLong(KEY_CALL_LOG_RECENT_CURSOR, 0L)
+        set(value) = prefs.edit().putLong(KEY_CALL_LOG_RECENT_CURSOR, value).apply()
+
+    /** Epoch millis of the last successful call-log sync. */
+    var lastCallSyncAt: Long
+        get() = prefs.getLong(KEY_LAST_CALL_SYNC, 0L)
+        set(value) = prefs.edit().putLong(KEY_LAST_CALL_SYNC, value).apply()
+
+    /**
      * Random id of this installation, used only to recognise the phone in
      * the heartbeat of the server and to pair it again. It is not a
      * credential: the device token is still the only thing that
@@ -320,6 +358,10 @@ class SettingsStore(context: Context) {
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_IMPORT_CURSOR = "import_cursor"
         const val KEY_IMPORT_CURSOR_FORMAT = "import_cursor_format"
+        const val KEY_CALL_LOG_CURSOR = "call_log_cursor"
+        const val KEY_CALL_LOG_CURSOR_FORMAT = "call_log_cursor_format"
+        const val KEY_CALL_LOG_RECENT_CURSOR = "call_log_recent_cursor"
+        const val KEY_LAST_CALL_SYNC = "last_call_sync_at"
         const val KEY_DEVICE_NAME = "device_name"
         const val KEY_PAIRED_NAME = "paired_device_name"
         const val KEY_PAIRED_BASE_URI = "paired_base_uri"

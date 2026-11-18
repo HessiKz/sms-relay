@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 
 import app.db as db
-from app import api, config, importer, ingest, miniapp, pairing, rev, security
+from app import api, calls, config, importer, ingest, miniapp, pairing, rev, security
 from app.delivery import DeliveryWorker, NotificationReaper
 from app.tg import TelegramClient
 from app.updater import Updater
@@ -313,7 +313,9 @@ def create_app(settings, *, run_workers=True) -> FastAPI:
         dependencies=[Depends(security.require_device(settings))],
     )
     app.include_router(api.build_router(settings))
+    app.include_router(calls.build_router(settings))
     app.include_router(miniapp.build_router(settings))
+    app.include_router(calls.build_miniapp_router(settings))
     # The pairing endpoints are public: the phone has no token yet.
     app.include_router(pairing.build_router(settings))
     app.include_router(pairing.build_miniapp_router(settings))

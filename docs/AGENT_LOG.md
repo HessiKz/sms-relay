@@ -965,7 +965,13 @@ names.
   and the phone renders whatever it is given, so no APK update is needed.
 - **Commit:** see the pushed commit on `main` for this entry.
 
-## 2026-11-16 — Duplicate inbound SMS: diagnosis, Android 1.3.3 receiver guard
+## 2026-11-16 — Duplicate inbound SMS: diagnosis, Android 1.3.3 guard, and the notification-only Telegram redesign
+
+This task delivered two related changes: the Android duplicate-capture fix
+(1.3.3) and the backend notification redesign that stops sending SMS bodies
+to Telegram. They are logged under separate headings below.
+
+### Duplicate inbound SMS: diagnosis and the 1.3.3 receiver guard
 
 - **Agent:** DeepSeek V4.1 Flash (OpenCode subagent).
 - **Task:** Inbound SMS appeared twice in Telegram and in the Mini App. Two
@@ -1005,7 +1011,7 @@ names.
   operation on the live database (not performed here) and needs its own
   backup and confirmation.
 
-## 2026-11-16 — Notification-only Telegram delivery with a deletion reaper
+### Notification-only Telegram delivery with a deletion reaper
 
 - **Agent:** DeepSeek V4.1 Flash (OpenCode subagent).
 - **Task:** Every forwarded SMS put the whole message body into the Telegram
@@ -1076,3 +1082,619 @@ names.
   traffic to confirm the default 24 h deadline deletes cleanly, and verify
   the bot keeps the delete right in the admin chat.
 - **Commit:** see the pushed commit on `main` for this entry.
+
+## 2026-11-17 — Dialer wave 1: call-log sync and the dialpad
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode), lead/worker delegation.
+- **Task:** Add wave 1 of the dialer feature to the Android app: capture the
+  phone's call log, sync it to the new backend `/calls/*` routes, and give the
+  app a working dialpad plus `tel:` / `ACTION_DIAL` handling — **without**
+  declaring an `InCallService` and **without** requesting `ROLE_DIALER`, so the
+  platform dialer keeps the in-call UI and the app stays uninstallable.
+- **Files:** `android-app/app/src/main/AndroidManifest.xml`;
+  `.../java/dev/smsrelay/SettingsStore.kt`, `RelayApp.kt`,
+  `net/RelayClient.kt`, `ui/MainActivity.kt`, `util/RoleState.kt`,
+  `work/Schedule.kt`; new `.../java/dev/smsrelay/calls/` package
+  (`CallLogEntity.kt`, `CallLogDao.kt`, `CallLogDatabase.kt`,
+  `CallLogReader.kt`, `CallLogWorker.kt`, `DialerActivity.kt`,
+  `CallDeepLinks.kt`); new `res/layout/activity_dialer.xml`;
+  `res/layout/activity_main.xml`; `res/values/strings.xml`. Backend routes in
+  `backend/app/calls.py` (+ `backend/app/main.py` wiring) are from the
+  companion backend task, not this one.
+- **Changed:** four permissions (`READ_CALL_LOG`, `WRITE_CALL_LOG`,
+  `CALL_PHONE`, `ANSWER_PHONE_CALLS`); `DialerActivity` exported with
+  `ACTION_DIAL`+`DEFAULT` and `VIEW`+`tel` filters and **no** `ACTION_MAIN`;
+  a `<queries>` block for the call-via schemes; `RoleState.isDialerRoleAvailable`
+  / `isDialerRoleHeld` (read-only, never requests the role). A separate
+  `CallLogDatabase` (version 1, no destructive migration) holds the upload
+  queue. `CallLogWorker` forwards `_ID` above the stored cursor in batches of
+  100 up to `LIMIT 100`, then re-reads a rolling 7-day `DATE` window
+  (`LIMIT 200`) and upserts by `contentHash`; 401 queues and retries, any other
+  4xx marks the row failed and still advances the cursor, and 429/5xx/network
+  stop without advancing. `MainActivity` gained the "Calls" card, the runtime
+  permission launcher and the sync state renderer; `Schedule` runs the sync
+  every 15 minutes with `KEEP`. The dialpad works fully offline and sends
+  `110/112/115/125/911/999/000` straight through with no SIM picker and no
+  backend call.
+- **Verification:** `python3` XML parse of the manifest, both edited layouts
+  and `strings.xml` → OK; a cross-check script confirmed every `R.id` used by
+  `DialerActivity` exists in `activity_dialer.xml` and every `R.string`
+  reference in the new package and `MainActivity` resolves (the single hit,
+  `R.string.cancel` in `MainActivity`, is a false positive: the line is
+  `android.R.string.cancel`); `git diff --check` clean; `fallbackToDestructiveMigration`
+  absent from the tree; backend contract tests
+  `/tmp/opencode/venv311/bin/python -m pytest tests/test_calls.py
+  tests/test_call_actions.py -q` → **41 passed**. **The Android app was not
+  compiled**: this host has no JDK or Gradle, so no APK exists. Nothing was
+  committed, pushed, deployed or restarted.
+- **Decisions / risks:** `CallLogEntity.id` is the placeholder
+  `local-<providerId>`, not a hash, so a provider-rewritten row keeps its
+  identity across the recent window; `contentHash` is indexed but **not**
+  unique and identity lookups go through `findByProvider`. The recent window
+  re-queues a changed row unless it was already `FAILED`, which stays failed
+  to avoid re-spending requests. `openSystemDialer()` names
+  `TelecomManager.defaultDialerPackage` explicitly so the app cannot loop back
+  into `DialerActivity`, and it returns false when this app already is the
+  default dialer. `postCallEvent` and the sync map `is_read`/`muted`/`speaker`
+  to `1`/`0`, while the backend model declares them `bool | None` — pydantic
+  coerces `0`/`1` fine, but a stricter reader would reject it. The dialpad
+  hides every call-via entry on API 30+ unless the `<queries>` block is
+  present. Wave 1 is client-side only if the backend routes are not deployed.
+- **Follow-ups:** the APK must be built by the `android-build` GitHub Actions
+  workflow, which publishes `sms-relay-debug.apk` on the `android-latest`
+  release; no download URL is valid until that workflow runs. Wave 2 must add
+  the `InCallService` subclass and its `BIND_INCALL_SERVICE` manifest entry,
+  the `ACTION_MAIN` launcher activity that makes the app role-eligible, the
+  `RoleManager.createRequestRoleIntent(ROLE_DIALER)` flow, and the
+  `CallService`/`CallActivity`/`CallController` wiring that drives
+  `postCallEvent`, `pollCallActions` and `reportCallAction`. Exchange rate and
+  `contentHash` collisions on the recent window deserve a real-device test.
+
+## 2026-11-17 — Dialer wave 1: the Mini App calls surface
+- **Agent:** DeepSeek V4.1 Flash (OpenCode), lead/worker delegation.
+- **Task:** Add the device-scoped Calls surface to the Telegram Mini App —
+  call history tab, live call card with actions, per-call sheet, call-via
+  sheet, keypad, and call events in the thread timeline — coded against
+  `docs/CALLS_DESIGN.md` while the backend `/calls/*` routes land in parallel.
+- **Files:** `backend/app/static/app/assets/js/api.js`, `store.js`, `ui.js`,
+  `app.js`; `backend/app/static/app/assets/app.css`;
+  `backend/app/static/app/index.html` (version query only);
+  `backend/tests/test_miniapp_frontend_static.py`; `docs/AGENT_GUIDE.md`
+  (calls surface section and the new route row). The backend module
+  `backend/app/calls.py`, `backend/app/db.py` and the Android call-log client
+  come from the companion tasks, not this one.
+- **Changed:** `api.js` gained `getCalls`, `getLiveCall`, `sendCallAction` and
+  `markCallsRead` over the device routes `/calls`, `/calls/live`,
+  `/calls/actions`, `/calls/read`. `store.js` owns the call state (list,
+  cursor, query, `callsAvailable`, `liveCall`, `callActionPending`) plus
+  `loadCalls`/`loadMoreCalls`/`loadLiveCall`/`sendCallAction`/
+  `markCallsRead`/`adoptSummaryCall`, resets it in `selectDevice`, and
+  refreshes the live call from the revision poll even when the history was
+  never opened. `ui.js` builds the tab bar, live card, call list, call sheet,
+  call-via sheet and keypad lazily in `ensureCallsSurface()` (no new markup in
+  `index.html`), renders every server string with `textContent`, and adds a
+  call bubble to the thread timeline. `app.js` adds the
+  `#/d/<device>/calls` route, `callsHash()`, `openCalls`/`loadCallsScreen`,
+  the delegated `onCallsClick` handler, `runLiveAction`, `sendDtmf`,
+  `dialNumber`, `openCallVia` and a tab-scoped search. Emergency numbers are
+  never dialled remotely and never open the call-via sheet.
+- **Verification:** `cd backend && /tmp/opencode/venv311/bin/python -m pytest
+  tests/test_miniapp_frontend_static.py tests/test_miniapp_shell.py -q` →
+  **56 passed, 1 warning**. `node --input-type=module --check` on `api.js`,
+  `store.js`, `ui.js`, `app.js` and `assets/app.js` → all OK. A throwaway DOM
+  shim (`/tmp/opencode/domshim.mjs`, not repo files) executed the real modules
+  against a stubbed `fetch`: 33 checks pass — tab bar and `aria-selected`,
+  both call rows with title/kind/duration/SIM/unread dot and
+  `data-thread-key`, the live card and its action visibility per state, the
+  posted `client_ref`, `409 stale_call` hiding the card and clearing the
+  pending guard, emergency detection, the call sheet note, all nine call-via
+  entries with the `wa.me` URL, the call bubble beside an SMS bubble, and the
+  `404` → "not available" and empty-history states. A second run confirmed a
+  retry reuses the failed action's `client_ref` while a new action gets a new
+  one, and that `#/d/<id>/calls` selects the Calls tab and back returns to
+  Chats. Full suite: **696 passed, 3 failed, 1 error** — exactly the four
+  known pre-existing failures (`test_commands` contact search ×2, `test_db`
+  chat search, and the prompt-shutdown timing test). Nothing was committed,
+  pushed, deployed or restarted.
+- **Decisions / risks:** `index.html` stays a version bump
+  (`v=20261117-calls`) because the repo forbids new server-rendered strings
+  there; every node is created in `ui.js` and reconciled, so a device switch
+  reuses the rows. The `calls` route reuses the chats pane so the header,
+  composer and back gesture keep working unchanged. A missing `/calls`
+  endpoint is treated as "this device has no calls", not an error; a missing
+  `/calls/live` only hides the card. Call ids are normalised in the store
+  because the server sends `event_id` for calls and `id` elsewhere. The
+  action guard is module-level rather than in `state`, so a failed request
+  can never strand a pending flag. `phone_account` is shown as-is with a
+  conditional `SIM ` prefix, because Android already reports "SIM 1" or a
+  carrier name. The surface is inert against a backend that has not deployed
+  `/calls/*` yet — it degrades to the empty state, which is the intended
+  Wave 1 behaviour.
+- **Follow-ups:** Wave 2 must drive the live card from real `call_state`
+  revisions rather than the polling fallback, add the in-call keypad tones
+  through the `dtmf` action once the backend accepts a `dtmf` payload, and
+  cover the "call via WhatsApp/Telegram/Signal/Bale/Rubika" URLs on a real
+  device, since only `tel:` can be checked here. The Android APK must still
+  be built by the `android-build` workflow and published as
+  `sms-relay-debug.apk` on the `android-latest` release before any download
+  URL is handed out.
+
+---
+
+## 2026-11-17 — UI design for a local SMS client and dialer
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode, subagent)
+- **Task:** Produce a screen-by-screen design/implementation plan
+  (`docs/UI_DESIGN.md`) to turn SMS Relay into a Google Messages-style local
+  SMS client plus a Google Dialer-style dialer. Design document only; no
+  Kotlin/XML/backend/Mini App changes, no commit or push.
+- **Files:** created `docs/UI_DESIGN.md`; appended this entry to
+  `docs/AGENT_LOG.md` (binding log rule). No other file touched.
+- **Changed:** a concrete design covering: current UI inventory and gaps
+  (setup, Room delivery history, `ACTION_SENDTO` stub, dialpad, in-call);
+  target IA with routes and empty/loading/error/offline states for Messages
+  home, chat thread, new conversation, dialer tabs, in-call and settings;
+  a provider-based data plan (`content://sms`, `mms-sms/conversations`,
+  `canonical-addresses`, read/draft writes, `ContentObserver`, additive Room
+  mirror, relay consistency and MMS boundary); Material 3 component inventory;
+  S/M/L phases with device-free tests; risks. Original "SMS Relay" identity,
+  no copied assets, SMS only (RCS impossible).
+- **Verification:** design was read against source — `AGENTS.md`,
+  `docs/CALLS_DESIGN.md`, AGENT_GUIDE section 6, the `ui/`/`calls/`
+  activities, all layouts, `AndroidManifest.xml`, and the `data/`, `sms/`,
+  `work/` packages. `docs/UI_DESIGN.md` is 194 lines (target <220). No build,
+  tests or visual verification: this host has no JDK/Gradle/emulator. No
+  application code changed, so no `android-build` workflow run was required.
+- **Decisions / risks:** single `ShellActivity` + fragment bottom nav chosen
+  over adding a Navigation dependency, matching the existing XML/AppCompat
+  style; provider is the display source of truth while Room stays the upload
+  queue. Biggest risks: no local/visual verification; MMS excluded (RCS
+  impossible); OEM/provider and default-role variance; visual voicemail and
+  Google spam/screening have no public API; keep the "exact replica" boundary
+  to layout/flow only.
+- **Follow-ups:** implement phases in `docs/UI_DESIGN.md` order via
+  DeepSeek V4.1 Flash subagents; any Android change must be built by the
+  `android-build` workflow and published as `sms-relay-debug.apk` on
+  `android-latest`, with a real-device telephony matrix before release.
+
+---
+
+## 2026-11-18 — Messages home and read-only thread screen (phase 1)
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** Add a Google Messages-style conversation list as the app's
+  launcher screen and a read-only thread screen, both reading the phone's
+  real SMS store. No composer and no send path: that is phase 2. Operator
+  asked for no commit, no push, no deploy, no restart, and no edits outside
+  `android-app/` apart from this log entry.
+- **Files:** created
+  `java/dev/smsrelay/messages/{SmsThread,SmsMessage,SmsRepository,SmsObserver}.kt`,
+  `java/dev/smsrelay/ui/{ShellActivity,ThreadActivity}.kt`,
+  `java/dev/smsrelay/ui/messages/{AvatarDrawable,MessageDates,MessagesBanner,ConversationAdapter,ThreadAdapter}.kt`,
+  `res/layout/{activity_shell,activity_thread,item_conversation,item_message_in,item_message_out,item_day_header}.xml`,
+  `res/menu/menu_shell.xml`, `res/values/dimens.xml`,
+  `res/drawable/{bg_pill,bg_unread_dot,ic_back,ic_call,ic_search,ic_start_chat}.xml`;
+  modified `res/values/themes.xml` (new `Theme.SmsRelay.Messages`),
+  `res/values/strings.xml` (messages/thread strings), `AndroidManifest.xml`
+  (launcher moved to `ShellActivity`, `ThreadActivity` added, `DialerActivity`
+  keeps `ACTION_DIAL` + `tel:` but loses MAIN/LAUNCHER). `calls/`,
+  `MainActivity`, `SmsReceiver`, `SmsProviderWriter`, `UploadWorker`,
+  `backend/`, Mini App and other docs untouched.
+- **Changed:** read-only local SMS client over
+  `content://mms-sms/conversations?simple=true` (`_id, date, recipient_ids,
+  snippet`, `date DESC`) with `recipient_ids` resolved through
+  `content://mms-sms/canonical-addresses/<id>` (`address`), and
+  `content://sms` (`_id, thread_id, address, body, date, type, read, seen,
+  status, subscription_id`, `thread_id = ?`, `date DESC, _id DESC LIMIT
+  n+1`). Conversation list: toolbar with `SearchView` and an overflow menu
+  (Dialer, Setup), extended FAB "Start chat" over
+  `CommonDataKinds.Phone.CONTENT_URI`, avatar with initials, relative dates,
+  unread dot with a counter only when more than one, in-memory search,
+  role/relay banners, loading/empty/"No results"/unreadable states, refresh
+  on `onResume` and from a 300 ms debounced `ContentObserver`. Thread screen:
+  toolbar with back, avatar, name and an `ACTION_DIAL` call button, day
+  separators, in/out bubbles, failure and pending notes, a SIM note only
+  when the card is still reported, "Load older messages" paging, mark-read
+  on open, and a footer saying sending is the next update.
+- **Verification:** no JDK/Gradle/emulator on this host, so nothing was
+  compiled or run and no APK was produced. Static checks only: all 25 XML
+  files under `res/` parse; every `R.id`/`R.string`/`R.layout`/`R.dimen`/
+  `R.drawable`/`R.menu` reference in the new Kotlin resolves against the
+  layouts and values; no duplicate string names; no `android:text="` with a
+  literal in the new layouts; no unused imports or unused private fields in
+  the new files; no unclosed brace or paren; exactly one MAIN/LAUNCHER pair
+  (on `ShellActivity`), `ThreadActivity` unexported with
+  `parentActivityName`, `tel:` filters still on `DialerActivity`; no
+  `setSupportActionBar` call anywhere; `git diff --check` clean for
+  `android-app/`.
+- **Decisions / risks:** the relay's Room queue is never rendered — the
+  provider is the display source of truth. Read-marking only runs when the
+  page really holds unread inbox rows, otherwise the write would wake the
+  observer in a loop. "Load older" pages by `date` plus `_id` because two
+  messages can share a second. The contact picker opens the setup screen
+  instead of asking for `READ_CONTACTS` out of context. The thread screen
+  deliberately has no composer. Dynamic colour is applied on API 31+ only;
+  `java.time` is safe at minSdk 26. Nothing was built, so a compile error
+  remains possible until CI runs.
+- **Follow-ups:** the `android-build` workflow must build this and publish
+  `sms-relay-debug.apk` on the `android-latest` release; verify the list and
+  thread on a real phone with the default-SMS role granted and revoked, on
+  dual SIM, and in dark mode. Phase 2 adds the composer and the send path
+  through the relay mirror.
+
+---
+
+## 2026-11-18 — Messages UI follow-up: groups, contact cache, MMS placeholder
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** Review fixes on the phase-1 Messages screens: stop labelling a
+  group SMS thread as a private chat with its first member, stop reading the
+  whole contact list on every refresh, and stop presenting an MMS-only thread
+  as an empty conversation. Scope stayed the same: `messages/`,
+  `ui/ShellActivity`, `ui/ThreadActivity`, `ui/messages`, the new
+  layouts/strings/themes/manifest. (The repo's binding rule requires this
+  entry even though the request asked for no doc edits; nothing else under
+  `docs/` was touched.)
+- **Files:** modified
+  `java/dev/smsrelay/messages/{SmsThread,SmsRepository}.kt`,
+  `java/dev/smsrelay/ui/{ShellActivity,ThreadActivity}.kt`,
+  `java/dev/smsrelay/ui/messages/ConversationAdapter.kt`,
+  `res/layout/activity_thread.xml`, `res/values/strings.xml`; created
+  `java/dev/smsrelay/ui/messages/ThreadLabels.kt`.
+- **Changed:** `resolveAddress` became `resolveRecipients`, which resolves
+  every id of `RECIPIENT_IDS` into a de-duplicated `List<String>` with the
+  per-call cache kept. `SmsThread` now carries `recipients`,
+  `recipientNames`, a derived `isGroup`/`recipientCount`/`avatarKey`, and
+  `address` is empty for a group. Group labels come from the new
+  `ThreadLabels` helper ("A, B +N", else "Group (n)"); no member's number is
+  ever used as a group label, and `threadIdForAddress` now skips any thread
+  whose resolved recipient count is not one. `ThreadActivity` takes
+  `EXTRA_IS_GROUP`/`EXTRA_LABEL`/`EXTRA_GROUP_COUNT`/`EXTRA_SNIPPET`, re-reads
+  the conversation row through the new `SmsRepository.threadFor` on every
+  load (so a restored screen and a changed membership are right), hides the
+  call button and refuses `dial()` for a group, and shows
+  `messages_mms_unsupported` when the SMS page is empty but the conversation
+  snippet is not, plus the optional `messages_mms_partial` note when the
+  snippet is not the newest SMS body. Contacts are cached in `SmsRepository`
+  for 60 s behind a single `@Volatile` holder, keyed off
+  `SystemClock.elapsedRealtime()`, cleared when `READ_CONTACTS` is missing.
+  `ShellActivity` search now matches group members and the group label.
+- **Verification:** no compiler, no emulator, no APK. Static only: all 25
+  `res/` XML files parse; every `R.*` reference in the new Kotlin resolves;
+  no duplicate string names; every owned string is defined and used; no
+  hardcoded `android:text`; no unused imports; brace/paren/bracket balance
+  zero in all 12 new or touched Kotlin files; no leftover `resolveAddress`,
+  `thread.label` or `isFailed` call sites; all three `SmsThread(` construction
+  sites pass the new fields; one MAIN/LAUNCHER, two `tel:` filters,
+  `ThreadActivity` exported=false; `git diff --check` clean for
+  `android-app/`.
+- **Decisions / risks:** a group is identified by recipient count, not by an
+  MMS type, because the conversations provider does not say whether the last
+  message was MMS; the snippet comparison is the cheapest honest signal for
+  the mixed case and is deliberately prefix-tolerant against provider
+  truncation. `threadFor` is an extra query per thread open, but it is one
+  row and it removes the "trust the extras" failure mode. Marking read is
+  unchanged. Nothing was compiled, so a build error is still possible.
+- **Follow-ups:** the `android-build` workflow must build this and publish
+  `sms-relay-debug.apk` on `android-latest`; check a real group thread, an
+  MMS-only thread and a mixed thread on a device with the default-SMS role.
+## 2026-11-18 — Messages composer and local send path (phase 2)
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** Add the composer to `ThreadActivity` and make a one-to-one SMS
+  leave through the SIM, land in the phone's SMS provider and be mirrored to
+  the relay as outbound history. A group or an MMS-only thread must stay
+  read-only with a clear hint. Backend, Mini App, `calls/`, the relay
+  workers, `SmsReceiver`, `SmsSender`, `SmsProviderWriter` and `RelayClient`
+  were to stay untouched.
+- **Files:** modified
+  `java/dev/smsrelay/ui/ThreadActivity.kt`,
+  `java/dev/smsrelay/messages/SmsRepository.kt` (new `insertSent` +
+  `StoredSms` + `threadIdOfRow`), `res/layout/activity_thread.xml`,
+  `res/values/strings.xml`, `AndroidManifest.xml` (only
+  `windowSoftInputMode` on `ThreadActivity`); created
+  `res/drawable/ic_send.xml`; this log entry (the repo rule requires one even
+  though the request said no doc edits; nothing else under `docs/` changed).
+- **Changed:** the phase-1 footer hint is gone. `ThreadActivity` now has a
+  bottom composer bar: a multiline `EditText` inside a `MaterialCardView`
+  with `?attr/colorSurfaceVariant` and 22dp corners, and a 48dp circular
+  send `ImageButton` on a `MaterialCardView` in `?attr/colorPrimary`, using
+  the new original 24dp paper-plane vector `ic_send.xml` tinted with
+  `?attr/colorOnPrimary`, plus a determinate-free `ProgressBar` spinner that
+  replaces the plane while a send is in flight. The bar is padded with
+  `max(systemBars.bottom, ime.bottom)` through `ViewInsetsCompat`, and the
+  list is scrolled to the newest rows when the IME opens, when the field
+  gains focus, and after a send (a one-shot `scrollToEndNext` flag, so the
+  provider observer's own reload cannot win the race and leave the new
+  bubble below the fold). `ThreadActivity` is `adjustResize` in the
+  manifest. Send sequence: `SmsSender.isValidTarget` on the resolved
+  `address`, then on `Dispatchers.IO` one hop that reads
+  `SmsSender.resolveSubscriptionId` (for the mirror only) and calls
+  `SmsSender.send(..., subscriptionId = null)`; on `Outcome.Sent`
+  `SmsRepository.insertSent` writes `ADDRESS, BODY, DATE, DATE_SENT,
+  TYPE=MESSAGE_TYPE_SENT, READ=1, SEEN=1, SUBSCRIPTION_ID (only when > 0)`
+  into `content://sms` and reads the new row's `thread_id` back; the
+  composer is cleared only after the store answers, `threadId` comes from
+  the inserted row when known, and the relay mirror runs afterwards via
+  `RelayClient.importBatch(ImportMessage(providerId, target, body,
+  DATE/1000, subId, DIRECTION_OUT))`. A failed mirror logs a category only
+  and never changes the local result; `/sms` is never called. Groups
+  (`isGroup`), MMS-only threads (blank `address`, or an empty page with a
+  non-blank snippet once a page has been read) and a failed read replace the
+  bar with `messages_group_send_unsupported`,
+  `messages_mms_send_unsupported` or `messages_error_read` in the same
+  slot, and the app-wide `sendingEnabled` switch is enforced at the tap with
+  `hint_sending_disabled`. A send whose provider insert fails shows
+  `composer_sent_not_stored`; a refused send restores the draft and focus
+  and maps the `SmsSender` reason to the existing `reason_*` strings.
+  Double-send is blocked by one `sending` flag.
+- **Verification:** no compiler, no emulator, no APK. Static only: all 26
+  `res/` XML files parse; every `R.id`/`R.string`/`R.layout`/`R.drawable`
+  reference in `ThreadActivity` resolves and every id it uses exists in
+  `activity_thread.xml` (16 ids, no unused ones); no duplicate string names;
+  no hardcoded `android:text` in any layout; no newline inside a string; no
+  unused imports; brace/paren/bracket balance zero in `ThreadActivity.kt`
+  and `SmsRepository.kt`; the only log lines are the two category strings for
+  a skipped mirror; `git diff --check -- android-app/` clean; one
+  MAIN/LAUNCHER in the manifest and `windowSoftInputMode` present once;
+  `SmsSender.kt`, `SmsProviderWriter.kt`, `SmsReceiver.kt`,
+  `ImportWorker.kt`, `backend/` and `docs/` were not modified by this task.
+- **Decisions / risks:** the local row is written only after the radio
+  accepts, so there is no optimistic bubble — the reload draws the real one.
+  The mirror is best effort with no durable outbound queue yet, so a dropped
+  mirror is missing history but never a lost message. The card sent to the
+  mirror is the one `resolveSubscriptionId` reports, while the radio picks
+  the card itself, so on a dual-SIM phone that changes mid-send the note may
+  name a different card than the one used; a single `subscriptionId` would
+  fix that in a later phase. `settings.sendingEnabled` is off by default, so
+  a fresh install sees the field and a Snackbar explaining why nothing
+  leaves. Nothing was compiled, so a build error is still possible.
+- **Follow-ups:** the `android-build` workflow must build this and publish
+  `sms-relay-debug.apk` on `android-latest`. On a device: send in a one-to-one
+  thread with the relay paired and unpaired, kill the radio (no SIM) to see
+  the failure path keep the draft, deny the SMS role to see the read notice,
+  and confirm the bubble appears without a manual refresh.
+## 2026-11-18 — Composer follow-up: local consent and blank-address guard
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** Two corrections to the phase-2 composer in `ThreadActivity`.
+  First, `SettingsStore.sendingEnabled` must not gate a local human send: the
+  flag exists so a remote command (Telegram, the Mini App) cannot make the
+  phone send without its owner, while typing here and tapping Send is consent.
+  With the default `false`, a fresh install had a composer that could never
+  send. Second, a one-to-one thread with a blank/unresolved `address` could
+  still show an enabled composer whose send then failed with `invalid_target`.
+- **Files:** modified
+  `java/dev/smsrelay/ui/ThreadActivity.kt`,
+  `res/values/strings.xml`; this log entry. No other file was touched, and
+  `CommandWorker`, `SmsSender`, `SettingsStore` and every remote path are
+  unchanged.
+- **Changed:** the `if (!settings.sendingEnabled)` early return and its
+  Snackbar were removed from `sendComposer()`, replaced by a comment saying
+  the check is deliberately absent and why. `hint_sending_disabled` stays
+  defined and is still used four times by `MainActivity`. `isMmsOnly()` no
+  longer treats a blank address as MMS; instead `renderComposer()` gained an
+  explicit `address.isBlank()` branch, ordered before the MMS case, which
+  replaces the bar with the new `messages_no_address` sentence ("This
+  conversation has no number to send to."). `canSend()` already required
+  `address.isNotBlank()`, so no enabled send button is ever shown for such a
+  thread. The remaining gates are the conversation shape (group, MMS-only,
+  unreadable) and, at the tap, `SmsSender.isValidTarget` plus the radio.
+- **Verification:** no compiler, no emulator, no APK. Static only:
+  `grep -n 'sendingEnabled' ThreadActivity.kt` returns exactly one hit, the
+  explanatory comment; `canSend`/`address.isBlank`/`composer_failed` greps
+  show the blank-address branch and the failure mapping intact; all 26 `res/`
+  XML files parse; no missing `R.*` reference in `ThreadActivity`; no
+  duplicate string names; `messages_no_address` is defined once and used
+  once; no unused imports; brace/paren/bracket balance zero in
+  `ThreadActivity.kt` and `SmsRepository.kt`; `git diff --check --
+  android-app/` clean.
+- **Decisions / risks:** the local composer now sends regardless of the
+  remote-send toggle, so the product statement becomes "the switch controls
+  remote sends only". A user who wants no sending at all must keep the SMS
+  permission withdrawn; the read-failure notice then replaces the bar. A
+  blank-address thread is reported as "no number" rather than as MMS, which
+  is the honest cause. Nothing was compiled, so a build error is still
+  possible.
+- **Follow-ups:** the `android-build` workflow must build this and publish
+  `sms-relay-debug.apk` on `android-latest`. On a device: fresh install with
+  the switch off must still send from a one-to-one thread, and a thread whose
+  canonical address does not resolve must show the "no number" notice with no
+  send button.
+## 2026-11-18 — Phone home: Favorites / Recents / Contacts / Voicemail
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** UI phase 3 of the local SMS-client work: a Google-Dialer-style
+  Phone home that reads the phone's real call log and contacts, with search,
+  four tabs and a dialpad FAB, without rewriting the in-call screen, the
+  default-dialer role or the dialpad.
+- **Files:** created
+  `java/dev/smsrelay/ui/DialerHomeActivity.kt`,
+  `java/dev/smsrelay/ui/dialer/{DialerRepository,DialerTabs,RecentsAdapter,ContactsAdapter,FavoritesAdapter}.kt`,
+  `res/layout/{activity_dialer_home,item_recent_call,item_dialer_contact,item_dialer_favorite}.xml`,
+  `res/drawable/{ic_call_made,ic_call_missed,ic_call_received,ic_voicemail,ic_star,ic_person,ic_dialpad_fab}.xml`;
+  modified `res/values/strings.xml`, `res/values/dimens.xml`,
+  `AndroidManifest.xml`, `java/dev/smsrelay/ui/ShellActivity.kt` (menu entry
+  only); this log entry. `calls/CallService.kt`, `CallActivity.kt`,
+  `CallExecutor.kt`, `DialerActivity.kt`, the backend, the Mini App and every
+  worker are untouched.
+- **Changed:** the Messages menu's "Dialer" entry now opens the Phone home
+  instead of the dialpad; the dialpad stays one tap away on the home's FAB
+  and its own menu entry, and keeps the only `ACTION_DIAL` and `tel:`
+  filters. Recents reads `CallLog.Calls.CONTENT_URI` with `_ID, NUMBER,
+  CACHED_NAME, DATE, DURATION, TYPE, SUBSCRIPTION_ID, PHONE_ACCOUNT_ID,
+  IS_READ`, ordered `DATE DESC LIMIT 200`, maps INCOMING / OUTGOING /
+  MISSED / REJECTED / BLOCKED / VOICEMAIL / ANSWERED_EXTERNALLY (as
+  incoming) and leaves an unknown vendor type generic; the row shows a 40dp
+  initial circle or a person glyph, a type glyph (red and bold for an unread
+  missed call), the name or the formatted number, the kind, the duration for
+  a connected call, the SIM label only on a multi-SIM phone, and the
+  Today/Yesterday/date stamp. Contacts read `CommonDataKinds.Phone` with
+  `DISPLAY_NAME, NUMBER, CONTACT_ID, LOOKUP_KEY`, sorted by name, collapsed
+  by `PhoneNumbers.normalize`, starred via one extra `Contacts` id query;
+  search is an in-memory case-insensitive name/number filter. Favorites read
+  `Contacts` with `STARRED = 1 AND HAS_PHONE_NUMBER = 1` (`_ID,
+  DISPLAY_NAME`) plus one bounded `IN (...)` phone query for the first
+  number of each. Voicemail is a placeholder sentence and a
+  `TelecomManager.getVoiceMailNumber()` button; there is no PDU or voicemail
+  provider code. A tap on any row is `ACTION_DIAL` with `tel:`, never a
+  call, so the dialpad keeps the emergency path. Long press opens a sheet:
+  Call / SMS (`ThreadActivity.intentForAddress`) / Copy number / Delete from
+  call log (needs `WRITE_CALL_LOG`, one toast on refusal). All reads run on
+  `Dispatchers.IO`, report permission, failure and empty as three separate
+  states, and never log a number or a name.
+- **Verification:** no compiler, no emulator, no APK. Static only: all 38
+  `res/` XML files and the manifest parse; every `R.id`/`R.string`/
+  `R.layout`/`R.drawable`/`R.dimen`/`R.menu` reference in the new and changed
+  sources resolves; every id the activity and the three adapters ask for
+  exists in its layout; no duplicate string names; no unused new string and
+  no unused import; brace/paren/bracket balance zero in all seven files;
+  `git diff --check -- android-app/` clean. Manifest: `DialerHomeActivity` is
+  `exported=false`, has no intent filter, parent `ShellActivity`, theme
+  `Theme.SmsRelay.Messages`; `calls.DialerActivity` is still the only
+  `ACTION_DIAL` and `tel:` handler; `ShellActivity` is still the only
+  MAIN/LAUNCHER; `CallService` unchanged.
+- **Decisions / risks:** nothing in this screen places a call, so an
+  emergency number in a log row cannot be dialled by a single touch; the
+  dialpad applies its own routing. A private number keeps a row (with the
+  existing "Private number" sentence) but offers no call/SMS/copy actions.
+  Deleting a call needs `WRITE_CALL_LOG`; when the read is granted and the
+  write is not, one quiet card says so instead of failing silently. The
+  FAB is always visible, including on Voicemail, because it is the whole
+  screen's one fixed action. Nothing was compiled, so a build error is still
+  possible.
+- **Follow-ups:** the `android-build` workflow must build this and publish
+  `sms-relay-debug.apk` on `android-latest`. On a device: tab survives
+  rotation, permission grant reloads the tab, a missed call shows red,
+  long-press delete works with `WRITE_CALL_LOG`, and voicemail dials the
+  carrier number when the phone has one.
+## 2026-11-18 — Phone home follow-up: permission answer, contact key, avatar lettering
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** Self-review of the Phone home above, before it is built: make the
+  permission answer redraw the tab, use the documented contacts lookup
+  column, and drop a redundant avatar expression.
+- **Files:** modified
+  `java/dev/smsrelay/ui/DialerHomeActivity.kt`,
+  `java/dev/smsrelay/ui/dialer/DialerRepository.kt`,
+  `java/dev/smsrelay/ui/dialer/RecentsAdapter.kt`,
+  `res/layout/activity_dialer_home.xml`, `res/values/strings.xml`; this entry.
+- **Changed:** (1) the `RequestPermission` callback no longer branches on the
+  grant: it clears the pending flag, redraws the note and re-reads the tab,
+  because both paths already ask the system what is granted, so a refusal
+  and a grant for the other tab are drawn correctly. (2) `LOOKUP_KEY` is
+  read through `ContactsContract.Contacts.LOOKUP_KEY` instead of the
+  `Phone.LOOKUP_KEY` alias, which is the constant the contacts table
+  documents. (3) The Recents avatar letters `label` directly instead of a
+  one-use `lettering` copy. Also added `dialer_permission_settings` for the
+  toast that a settings page could not be opened, so `dialer_permission_grant`
+  ("Allow") is no longer used as a message.
+- **Verification:** same static set as the entry above, re-run after the
+  edits: 38 `res/` XML files and the manifest parse; all `R.*` references
+  resolve; every id the activity asks for exists in its layout; no duplicate
+  string or dimen name; no unused `dialer_*` string; no unused import; all
+  seven files at brace/paren/bracket balance zero with no line over 100
+  columns; `git diff --check -- android-app/` clean; manifest unchanged in
+  shape (`DialerHomeActivity` unexported and without filters,
+  `calls.DialerActivity` the only `ACTION_DIAL` and `tel:` owner,
+  `ShellActivity` the only launcher). Not compiled, not built.
+- **Decisions / risks:** still static only. The approval dialog is asked from
+  the screen; a permanent refusal routes the same tap to the app's settings
+  page instead of repeating a dialog Android will not show.
+- **Follow-ups:** build through the `android-build` workflow; device check of
+  the permission flow, the delete action and the voicemail button.
+## 2026-11-18 — Phone home hardening: security exceptions, string escaping
+
+- **Agent:** DeepSeek V4.1 Flash Free (OpenCode)
+- **Task:** Close the remaining ways this screen could crash or build badly
+  before it is handed to the build workflow.
+- **Files:** modified
+  `java/dev/smsrelay/ui/dialer/DialerRepository.kt`,
+  `java/dev/smsrelay/ui/DialerHomeActivity.kt`,
+  `res/values/strings.xml`, `res/layout/activity_dialer_home.xml`; this entry.
+- **Changed:** (1) each of the three reads now inspects the failure instead of
+  swallowing it: a `SecurityException` from the provider (a grant revoked
+  between the check and the query, or a work-profile policy) is reported as
+  `denied` so the screen draws the permission state, while anything else stays
+  `failed` and draws the read-error sentence. (2) Two new strings used a
+  literal apostrophe, which aapt rejects without an escape; both are escaped
+  the same way the existing `capture_none` and `hint_permissions` do it.
+  (3) The clipboard label of "Copy number" is `app_name` instead of the
+  unrelated `dialer_call` sentence. (4) The FAB tint moved to `app:tint`,
+  which is the attribute the Material FAB reads.
+- **Verification:** 38 `res/` XML files and the manifest parse; all `R.*`
+  references resolve; balance zero in all seven Kotlin files; no unused
+  import; no duplicate string name; no unescaped apostrophe left in any
+  string; no unused `dialer_*` string; `git diff --check -- android-app/`
+  clean. Not compiled, not built.
+- **Decisions / risks:** still static only, so a type or resource error is
+  possible. The `denied` path is deliberately the same state as the
+  pre-check, so a revocation mid-read never blanks the tab into "No calls
+  yet".
+- **Follow-ups:** build with the `android-build` workflow and publish
+  `sms-relay-debug.apk`; on device, verify that revoking the call log
+  permission in Settings and returning to the tab shows the permission card
+  rather than an empty list.
+
+## 2026-11-18 — Calls, default dialer and local Messages client (lead summary)
+
+- **Agent:** DeepSeek V4.1 Flash and Hy4 flash (OpenCode), lead/worker
+  delegation. The lead planned, reviewed every diff and owns this entry; the
+  implementation, tests and docs were delegated to subagents.
+- **Task:** Turn the relay phone into a daily-driver SMS client and a real
+  Android dialer, without breaking the relay or the Mini App:
+  call log + live call + remote actions; Telegram Answer/Decline/Call back;
+  `ROLE_DIALER` with `InCallService` and an in-call UI; a local Messages home,
+  thread and composer over the phone's real SMS store; a Google-Dialer-style
+  home with Favorites / Recents / Contacts / Voicemail.
+- **Files:** backend `app/calls.py`, `app/db.py`, `app/main.py`,
+  `app/pairing.py`, `app/updater.py`, tests `test_calls.py`,
+  `test_call_actions.py`, `test_updater.py`, `test_db.py`;
+  Mini App `static/app/assets/js/{api,store,ui,app}.js`, `app.css`,
+  `index.html`, `test_miniapp_frontend_static.py`;
+  Android `calls/` (`CallLog*`, `DialerActivity`, `CallService`,
+  `CallActivity`, `CallExecutor`, `CallActionGuard`, `CallSession`,
+  `CallDeepLinks`), `messages/`, `ui/ShellActivity`, `ui/ThreadActivity`,
+  `ui/DialerHomeActivity`, `ui/messages/`, `ui/dialer/`, manifest, themes,
+  layouts, strings; `README.md`, `docs/AGENT_GUIDE.md`,
+  `docs/CALLS_DESIGN.md`, `docs/UI_DESIGN.md`.
+- **Changed:** new call tables (`call_log`, `call_sessions`,
+  `call_actions`) with a single freshness rule (2 min ringing, 12 h active,
+  60 s ended), tolerant per-item `/calls/sync`, atomic action claim and
+  at-most-once guards, stale-`call_ref` refusal, emergency numbers never
+  remote-dialled, no remote audio. Telegram now mirrors ringing/missed calls
+  with Answer / Decline / Call back; callback data carries the device only,
+  and the send is capped at 2 s. Android gained the default-dialer service
+  and full-screen in-call UI, the call-log queue, the dialpad, and the local
+  Messages + dialer homes. A local send goes SIM → `content://sms/sent` →
+  best-effort `/import` with `direction=out`; a failed mirror never undoes the
+  local SMS. Group and MMS-only threads are read-only with explicit
+  placeholders; RCS remains out of scope. The working-tree README/GUIDE had
+  been accidentally reverted to the old "forwards the body" text; they were
+  restored from HEAD before the calls/UI documentation was merged.
+- **Verification:** backend suite `738 collected — 734 passed, 3 failed,
+  1 error`; the four failures are the known pre-existing ones
+  (`test_commands` contact search ×2, `test_db` chat search,
+  `test_app_assembly` shutdown timing). Mini App static tests and all JS
+  syntax checks pass. **The APK was not built**: this host has no JDK, Gradle
+  or emulator, so the ~3,000 lines of new Android code are static-reviewed
+  only. No device test was run.
+- **Decisions / risks:** audio never leaves the phone; emergency calls are
+  local and offline; `SettingsStore.sendingEnabled` gates remote commands only,
+  never the local composer; a group is never represented by one member's
+  number; a provider row inserted after the radio accepts can still fail to
+  store; the outbound relay mirror is best effort. Android API traps found in
+  review and fixed: `Call.Details.getState()` is API 31 (use `Call.state`),
+  the in-call theme needed `NoActionBar`, the full-screen intent needs
+  `USE_FULL_SCREEN_INTENT`, and a non-`dial` action claimed while idle is now
+  reported `rejected` / `no live call` instead of being stranded.
+- **Follow-ups:** commit to a feature branch and run `android-build` with
+  `workflow_dispatch` (the release step only runs on a `main` push, so the
+  rolling APK is not overwritten); fix compiler errors before any merge.
+  Then a real-device matrix (default SMS/dialer roles, incoming call while
+  locked with and without the full-screen grant, answer/reject from screen and
+  notification, mute/speaker/hold/DTMF, dual-SIM, emergency with the relay
+  offline, service rebind, vendor provider quirks, notifications). Still to
+  build: durable outbound mirror queue, group send, MMS, visual parity pass,
+  and the final APK release. No secrets, numbers, names or message bodies were
+  added to this log.

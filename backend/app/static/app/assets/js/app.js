@@ -5,12 +5,13 @@
 //
 //   #/                              the devices
 //   #/d/<device_id>                 the conversations of that device
+//   #/d/<device_id>/calls           the calls of that device
 //   #/d/<device_id>/t/<thread_key>  a thread of that device
 
-import * as tg from "./telegram.js?v=20261116-pair";
-import * as store from "./store.js";
-import * as ui from "./ui.js";
-import { AuthError, NetworkError } from "./api.js";
+import * as tg from "./telegram.js?v=20261117-calls";
+import * as store from "./store.js?v=20261117-calls";
+import * as ui from "./ui.js?v=20261117-calls";
+import { AuthError, NetworkError } from "./api.js?v=20261117-calls";
 
 const searchForm = document.getElementById("search-form");
 const searchInput = document.getElementById("search");
@@ -48,6 +49,9 @@ let dialogDraft = null;
 let dialogSending = false;
 let pairDraft = null;
 let deviceTimer = null;
+// The tab a thread was opened from: back returns there instead of always
+// landing on the chats tab.
+let lastDeviceHash = "";
 
 // --- the routes ---------------------------------------------------------
 
@@ -71,11 +75,16 @@ function parseRoute() {
     const threadKey = decodePart(parts.slice(3).join("/"));
     if (threadKey) return { name: "thread", deviceId, threadKey };
   }
+  if (parts[2] === "calls") return { name: "calls", deviceId };
   return { name: "chats", deviceId };
 }
 
 function deviceHash(deviceId) {
   return "#/d/" + encodeURIComponent(String(deviceId || ""));
+}
+
+function callsHash(deviceId) {
+  return deviceHash(deviceId) + "/calls";
 }
 
 function threadHash(deviceId, threadKey) {
@@ -154,6 +163,7 @@ async function openDevices() {
 async function openChats(deviceId) {
   const target = String(deviceId || "");
   const device = store.deviceById(target);
+  lastDeviceHash = deviceHash(target);
   ui.setRoute("chats");
   ui.renderChatsHeader(device);
   tg.setBackButton(() => navigate("#/"));
@@ -161,12 +171,12 @@ async function openChats(deviceId) {
   if (changed) {
     store.selectDevice(target);
     if (searchInput) searchInput.value = "";
-    try {
-      await store.loadChats(target, "");
-    } catch (err) {
-      handleError(err);
-    }
-  } else if (!store.state.chatsLoaded) {
+  } else if (searchInput) {
+    // Each tab keeps its own search text; the box follows the tab.
+    searchInput.value = store.state.query;
+  }
+  refreshComposer();
+  if (!store.state.chatsLoaded) {
     // A deep link can open a thread without ever loading the
     // conversations of that device.
     try {
@@ -181,15 +191,80 @@ async function openChats(deviceId) {
       hasMore: store.state.chatsHasMore,
     });
   }
-  refreshComposer();
+  void loadLiveCallQuietly(target);
 }
+
+// The calls tab is the same screen, only the list and the search scope
+// change. Both tabs are in the hash, so back and forward work.
+async function openCalls(deviceId) {
+  const target = String(deviceId || "");
+  const device = store.deviceById(target);
+  lastDeviceHash = callsHash(target);
+  ui.setRoute("calls");
+  ui.renderChatsHeader(device);
+  tg.setBackButton(() => navigate("#/"));
+  const changed = store.state.deviceId !== target;
+  if (changed) {
+    store.selectDevice(target);
+    if (searchInput) searchInput.value = "";
+  } else if (searchInput) {
+    searchInput.value = store.state.callsQuery;
+  }
+  refreshComposer();
+  await loadCallsScreen(target);
+  void loadLiveCallQuietly(target);
+  try {
+    // The store reads the newest loaded call as the read marker, so the
+    // tab does not need to repeat the cursor arithmetic here.
+    await store.markCallsRead(target);
+  } catch (err) {
+    if (err instanceof AuthError) throw err;
+    // A failed read receipt must not hide the list.
+  }
+}
+
+// The call list only. The conversation list of the device is loaded when
+// it is needed (an unknown thread from a deep link), never for a tab
+// switch that only flips the visible list.
+async function loadCallsScreen(deviceId) {
+  const target = String(deviceId || "");
+  try {
+    await store.loadCalls(target, { query: store.state.callsQuery });
+  } catch (err) {
+    if (err instanceof AuthError) {
+      handleError(err);
+      return;
+    }
+    if (err instanceof NetworkError) {
+      ui.setCallsStatus("Connection problem. Retrying…");
+      return;
+    }
+    // A failed call list is not a reason to leave the device screen: the
+    // conversations of the same device are still usable.
+    ui.setCallsStatus("Could not load the calls.");
+  }
+}
+
+async function loadLiveCallQuietly(deviceId) {
+  try {
+    await store.loadLiveCall(deviceId);
+  } catch (err) {
+    if (err instanceof AuthError) throw err;
+    // A missing calls feature is not an error of the screen.
+  }
+}
+
 
 async function openThread(deviceId, threadKey) {
   const target = String(deviceId || "");
   const key = String(threadKey || "");
   ui.setRoute("thread");
   ui.renderThreadContext(store.deviceById(target));
-  tg.setBackButton(() => navigate(deviceHash(target)));
+  // Back returns to the tab the thread was opened from (chats or calls)
+  // when that tab belongs to this device; otherwise to the chats tab.
+  const origin = lastDeviceHash && lastDeviceHash.indexOf(
+    deviceHash(target)) === 0 ? lastDeviceHash : deviceHash(target);
+  tg.setBackButton(() => navigate(origin));
   composerDraft = null;
   if (composerBody) composerBody.value = "";
   try {
@@ -219,6 +294,8 @@ async function applyRoute() {
   try {
     if (target.name === "thread") {
       await openThread(target.deviceId, target.threadKey);
+    } else if (target.name === "calls") {
+      await openCalls(target.deviceId);
     } else if (target.name === "chats") {
       await openChats(target.deviceId);
     } else {
@@ -809,7 +886,267 @@ async function approvePairing() {
   }
 }
 
-// --- the device context --------------------------------------------------
+// --- the calls -----------------------------------------------------------
+
+// One action of the live card. The ref comes from the card, so an action
+// always targets the call it was rendered for.
+async function runLiveAction(action) {
+  const deviceId = store.state.deviceId;
+  const call = store.state.liveCall;
+  if (!deviceId || !call || !action) return;
+  if (store.state.callActionPending) return;
+  tg.impact("light");
+  try {
+    await store.sendCallAction(deviceId, action, {
+      callRef: String(call.call_ref || ""),
+    });
+    await loadLiveCallQuietly(deviceId);
+  } catch (err) {
+    if (err instanceof AuthError) {
+      handleError(err);
+      return;
+    }
+    tg.notify("error");
+    // The card already shows the reason; a stale call refreshes itself.
+  }
+}
+
+async function sendDtmf(key) {
+  const deviceId = store.state.deviceId;
+  const call = store.state.liveCall;
+  if (!deviceId || !call || !key) return;
+  if (store.state.callActionPending) return;
+  tg.impact("light");
+  try {
+    await store.sendCallAction(deviceId, "dtmf", {
+      callRef: String(call.call_ref || ""),
+      payload: String(key),
+    });
+  } catch (err) {
+    if (err instanceof AuthError) throw err;
+  }
+}
+
+// The status line of the open tab: the calls tab has its own, or a dial
+// error would be printed in a hidden element.
+function setTabStatus(text) {
+  if (ui.deviceTab() === "calls") {
+    ui.setCallsStatus(text);
+    ui.setListStatus("");
+    return;
+  }
+  ui.setListStatus(text);
+  ui.setCallsStatus("");
+}
+
+// Place a call from the Mini App. The payload is the number as the user
+// sees it; an emergency number is refused by the backend and hidden by
+// the sheets here.
+async function dialNumber(number) {
+  const deviceId = store.state.deviceId;
+  const value = String(number || "").trim();
+  if (!deviceId || !value) return false;
+  if (ui.isEmergencyNumber(value)) {
+    setTabStatus("Emergency numbers can only be dialled on the phone.");
+    tg.notify("error");
+    return false;
+  }
+  if (store.state.callActionPending) return false;
+  ui.closeCallSheet();
+  ui.closeCallVia();
+  tg.impact("heavy");
+  try {
+    await store.sendCallAction(deviceId, "dial", {
+      callRef: "",
+      payload: value,
+    });
+    await loadLiveCallQuietly(deviceId);
+    return true;
+  } catch (err) {
+    if (err instanceof AuthError) {
+      handleError(err);
+      return false;
+    }
+    tg.notify("error");
+    setTabStatus(
+      err && err.status === 422
+        ? "This number cannot be dialled from here."
+        : "The call could not be placed.");
+    return false;
+  }
+}
+
+function findCall(callId) {
+  const target = String(callId || "");
+  for (const call of store.state.calls) {
+    if (call && String(call.id) === target) return call;
+  }
+  return null;
+}
+
+function openCallsTab() {
+  const deviceId = store.state.deviceId;
+  if (!deviceId) return;
+  navigate(callsHash(deviceId));
+}
+
+// One delegated listener for every call surface. The tab bar, the call
+// list and the live card live in the chats pane; the sheets live in the
+// shell root. Both report through the same handler.
+const appRoot = document.getElementById("app");
+
+function onCallsClick(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) return;
+
+  const tab = target.closest("[data-tab]");
+  if (tab) {
+    const name = tab.getAttribute("data-tab");
+    const deviceId = store.state.deviceId;
+    if (!deviceId) return;
+    if (name === "calls") navigate(callsHash(deviceId));
+    else navigate(deviceHash(deviceId));
+    return;
+  }
+
+  const action = target.closest("[data-call-action]");
+  if (action) {
+    const name = action.getAttribute("data-call-action");
+    if (name === "dtmf") ui.openKeypad();
+    else void runLiveAction(name);
+    return;
+  }
+
+  const dtmf = target.closest("[data-dtmf]");
+  if (dtmf) {
+    void sendDtmf(dtmf.getAttribute("data-dtmf")).catch(handleError);
+    return;
+  }
+
+  if (target.closest("#keypad-close")) {
+    ui.closeKeypad();
+    return;
+  }
+  if (target.closest("#call-sheet-cancel")) {
+    ui.closeCallSheet();
+    return;
+  }
+  if (target.closest("#call-sheet-callback")) {
+    void dialNumber(ui.callSheetNumber());
+    return;
+  }
+  if (target.closest("#call-sheet-via")) {
+    // The sheet keeps the call it was opened for, so the name survives.
+    ui.openCallViaSheet({});
+    return;
+  }
+  if (target.closest("#call-via-cancel")) {
+    ui.closeCallVia();
+    return;
+  }
+  const via = target.closest("[data-call-via]");
+  if (via) {
+    openCallVia(via.getAttribute("data-call-via"),
+      via.getAttribute("data-call-via-url") || "");
+    return;
+  }
+
+  const more = target.closest("[data-call-menu]");
+  if (more) {
+    const call = findCall(more.getAttribute("data-call-menu"));
+    if (call) ui.openCallSheet(call);
+    return;
+  }
+  const loadMore = target.closest("#load-more-calls");
+  if (loadMore) {
+    void store.loadMoreCalls(store.state.deviceId).catch(handleError);
+    return;
+  }
+  const row = target.closest("[data-call-id]");
+  if (row) {
+    const call = findCall(row.getAttribute("data-call-id"));
+    const threadKey = call && call.thread_key ? String(call.thread_key) : "";
+    if (threadKey && store.state.deviceId) {
+      navigate(threadHash(store.state.deviceId, threadKey));
+    }
+  }
+}
+
+if (appRoot) appRoot.addEventListener("click", onCallsClick);
+
+// A long press on a call row opens the same sheet as the ⋯ button: on a
+// phone the context menu is what a long press raises.
+if (appRoot) {
+  appRoot.addEventListener("contextmenu", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const row = target ? target.closest("[data-call-id]") : null;
+    if (!row) return;
+    const call = findCall(row.getAttribute("data-call-id"));
+    if (!call) return;
+    event.preventDefault();
+    ui.openCallSheet(call);
+  });
+}
+
+// The Telegram SDK can open a link in the in-app browser. Outside
+// Telegram, or on a client without openLink, a plain window is the
+// fallback. Nothing here throws at the caller.
+function openExternalLink(url) {
+  const target = String(url || "");
+  if (!target) return false;
+  try {
+    if (tg.webApp && typeof tg.webApp.openLink === "function") {
+      tg.webApp.openLink(target);
+      return true;
+    }
+  } catch (err) {
+    // Fall through to the plain navigation.
+  }
+  try {
+    window.open(target, "_blank", "noopener");
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// A custom scheme (tel:, viber:, skype:, facetime:) has no https target
+// and may not exist on this client. It is opened best effort inside a
+// try: a client that refuses the scheme must not break the sheet.
+function openCallVia(key, url) {
+  const tool = String(key || "");
+  const target = String(url || "");
+  ui.closeCallVia();
+  ui.closeCallSheet();
+  if (tool === "tel") {
+    void dialNumber(ui.callSheetNumber());
+    return;
+  }
+  if (!target) return;
+  // The https entries go through the Telegram in-app browser; a custom
+  // scheme is handed to the OS, which is allowed to ignore it.
+  if (target.indexOf("https://") === 0) {
+    openExternalLink(target);
+    return;
+  }
+  try {
+    window.location.href = target;
+  } catch (err) {
+    // Best effort: the number is still on screen.
+  }
+}
+
+if (timeline) {
+  timeline.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target ? target.closest("[data-call-back]") : null;
+    if (!button) return;
+    event.preventDefault();
+    void dialNumber(button.getAttribute("data-call-back"));
+  });
+}
+
+
 
 function syncDeviceContext() {
   const device = store.currentDevice();
@@ -847,7 +1184,7 @@ if (searchInput) {
       searchTimer = null;
     }
     const first = store.state.chats[0];
-    if (first && store.state.deviceId) {
+    if (ui.deviceTab() === "chats" && first && store.state.deviceId) {
       navigate(threadHash(store.state.deviceId, first.thread_key));
     }
   });
@@ -856,9 +1193,16 @@ if (searchInput) {
 async function runSearch() {
   const deviceId = store.state.deviceId;
   if (!deviceId) return;
+  const text = searchInput ? searchInput.value : "";
   try {
-    // The search never leaves the device of the route.
-    await store.loadChats(deviceId, searchInput ? searchInput.value : "");
+    // The search never leaves the device of the route, and it stays in
+    // the tab that is open: chats search conversations, calls search the
+    // call log.
+    if (ui.deviceTab() === "calls") {
+      await store.loadCalls(deviceId, { query: text });
+    } else {
+      await store.loadChats(deviceId, text);
+    }
   } catch (err) {
     handleError(err);
   }

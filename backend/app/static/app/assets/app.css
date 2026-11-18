@@ -876,6 +876,394 @@ select:focus-visible {
   font-weight: 600;
 }
 
+/* --- calls: the tab header, the live card, the call list, the sheets --- */
+
+.tab-bar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab-button {
+  flex: 1 1 0;
+  padding: 7px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--hint);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.tab-button.active,
+.tab-button[aria-selected="true"] {
+  border-bottom-color: var(--link);
+  color: var(--text);
+}
+
+.tab-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tab-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--danger);
+  color: var(--bg);
+  font-size: 0.68rem;
+  font-weight: 700;
+  vertical-align: middle;
+}
+
+.calls-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.calls-section[hidden] {
+  display: none;
+}
+
+.call-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0 0 12px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  list-style: none;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.call-row {
+  display: flex;
+  align-items: stretch;
+  margin: 0;
+}
+
+.call-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 10px 2px 10px 14px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.call-item:hover {
+  background: var(--panel);
+}
+
+.call-icon-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--panel);
+}
+
+.call-icon {
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--hint);
+}
+
+.call-icon.dir-incoming {
+  color: var(--ok);
+}
+
+.call-icon.dir-outgoing {
+  color: var(--link);
+}
+
+.call-icon.dir-missed,
+.call-icon.dir-rejected {
+  color: var(--danger);
+}
+
+.call-icon.dir-blocked {
+  color: var(--danger);
+  opacity: 0.7;
+}
+
+.call-dot {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.call-dot[hidden] {
+  display: none;
+}
+
+.call-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 1px;
+}
+
+.call-title,
+.call-meta {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.call-title {
+  font-size: 0.93rem;
+  font-weight: 600;
+}
+
+.call-item.has-unread .call-title {
+  font-weight: 700;
+}
+
+.call-meta {
+  color: var(--hint);
+  font-size: 0.78rem;
+}
+
+.call-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.call-time {
+  color: var(--hint);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.call-more {
+  flex: 0 0 auto;
+  width: 38px;
+  border: 0;
+  background: transparent;
+  color: var(--hint);
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+/* The live call card sits above the tab bar, on both device screens. */
+.live-call {
+  margin: 8px 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.live-call[hidden] {
+  display: none;
+}
+
+.live-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.live-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--bg);
+  font-size: 1rem;
+}
+
+.live-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.live-title {
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.live-state {
+  margin: 0;
+  color: var(--hint);
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+}
+
+.live-elapsed {
+  flex: 0 0 auto;
+  margin: 0;
+  color: var(--text);
+  font-size: 0.86rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.live-error {
+  margin: 6px 0 0;
+  color: var(--danger);
+  font-size: 0.78rem;
+}
+
+.live-error[hidden] {
+  display: none;
+}
+
+.live-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.live-button {
+  padding: 6px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.live-button[hidden] {
+  display: none;
+}
+
+.live-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.live-button.action-answer {
+  background: var(--ok);
+  border-color: transparent;
+  color: #05230f;
+}
+
+.live-button.action-reject,
+.live-button.action-hangup {
+  background: var(--danger);
+  border-color: transparent;
+  color: var(--bg);
+}
+
+/* The call bubbles of a thread reuse the message bubble, with a compact
+   head line and a call-back button. */
+.bubble-call .bubble-call-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.bubble-call-text {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.bubble-call-back {
+  margin-top: 4px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.bubble-call-back[hidden] {
+  display: none;
+}
+
+.call-via-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 0;
+}
+
+.call-via-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: inherit;
+  text-align: left;
+}
+
+.call-via-item:hover {
+  background: var(--bg);
+}
+
+.call-via-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.call-via-hint {
+  color: var(--hint);
+  font-size: 0.74rem;
+}
+
+.keypad-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.keypad-key {
+  padding: 13px 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.keypad-key:hover {
+  background: var(--bg);
+}
+
 .splash {
   position: absolute;
   inset: 0;

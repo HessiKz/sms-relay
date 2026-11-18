@@ -6,11 +6,21 @@
 // the device drops the chats, the thread and the pending bubbles of the
 // old one before anything is loaded again.
 
-import { apiGet, apiPost, apiPatch, AuthError } from "./api.js";
-import * as ui from "./ui.js";
+import {
+  apiGet,
+  apiPost,
+  apiPatch,
+  AuthError,
+  getCalls,
+  getLiveCall,
+  sendCallAction as postCallAction,
+  markCallsRead as postCallsRead,
+} from "./api.js?v=20261117-calls";
+import * as ui from "./ui.js?v=20261117-calls";
 
 const PAGE_SIZE = 50;
 const CHAT_LIMIT = 100;
+const CALL_LIMIT = 50;
 const BACKOFF_MS = [1000, 2000, 5000, 15000];
 // A burst of changes (an import, a busy sender) must not turn into a
 // burst of reloads: the refresh waits for the burst to settle.
@@ -33,6 +43,17 @@ export const state = {
   threadMeta: null,
   events: [],
   hasMore: false,
+  // The call log of the open device. `callsAvailable` is false once the
+  // backend answered 404: the UI then shows the "not available" state
+  // instead of an empty history.
+  calls: [],
+  callsHasMore: false,
+  callsCursor: null,
+  callsQuery: "",
+  callsLoaded: false,
+  callsAvailable: null,
+  liveCall: null,
+  callActionPending: null,
   rev: 0,
   // null means "the scope is unknown": everything has to be reloaded.
   // Otherwise a list of {device_id, thread_key}; a null thread_key is a
@@ -43,8 +64,9 @@ export const state = {
   sending: false,
   selectedSubId: 0,
   readMarkedTs: 0,
+  callsReadMarkedTs: 0,
   status: null,
-  loading: { devices: false, chats: false, thread: false },
+  loading: { devices: false, chats: false, thread: false, calls: false },
 };
 
 let pollTimer = null;
@@ -57,6 +79,7 @@ let refreshDirty = false;
 let chatsRequest = 0;
 let threadRequest = 0;
 let devicesRequest = 0;
+let callsRequest = 0;
 
 export async function loadMe() {
   const data = await apiGet("me");
@@ -119,6 +142,21 @@ export async function loadStatus() {
   return data;
 }
 
+// The device summary carries the live call and the missed count already:
+// the card and the tab badge are current before the live endpoint is even
+// asked. The explicit live call still wins once it is loaded.
+function adoptSummaryCall() {
+  const device = currentDevice();
+  if (!device) {
+    if (!state.liveCall) ui.renderLiveCall(null);
+    return;
+  }
+  if (state.liveCall) return;
+  const call = device.call || null;
+  ui.renderLiveCall(call);
+  ui.renderChatsHeader(device);
+}
+
 // The device list is reloaded from several places. The hook lets the
 // shell follow a rename or a revoke without polling for it.
 let devicesChanged = null;
@@ -143,6 +181,7 @@ export async function loadDevices() {
     ui.renderChatsHeader(currentDevice());
     ui.renderThreadContext(currentDevice());
     ui.setDevicesStatus("");
+    adoptSummaryCall();
     if (devicesChanged) devicesChanged(list);
     return list;
   } finally {
@@ -168,7 +207,29 @@ export function selectDevice(deviceId) {
   state.pending = [];
   state.lastFailed = null;
   state.readMarkedTs = 0;
+  state.callsReadMarkedTs = 0;
+  state.calls = [];
+  state.callsHasMore = false;
+  state.callsCursor = null;
+  state.callsQuery = "";
+  state.callsLoaded = false;
+  state.callsAvailable = null;
+  state.liveCall = null;
+  state.callActionPending = null;
+  lastCallAttempt = null;
+  callsRequest += 1;
   ui.resetScope();
+}
+
+// The server names the event id `id` for a message and `event_id` for a
+// call. The store keeps one shape: `id` is the key of the row.
+function normalizeEvent(event) {
+  if (!event) return event;
+  if ((event.id === undefined || event.id === null)
+      && event.event_id !== undefined && event.event_id !== null) {
+    return Object.assign({}, event, { id: String(event.event_id) });
+  }
+  return event;
 }
 
 // The server orders the events of a thread by timestamp and then by the
@@ -371,7 +432,8 @@ export async function loadThread(deviceId, threadKey, options) {
       display: data.display,
       name: data.name,
     };
-    const page = Array.isArray(data.events) ? data.events : [];
+    const page = Array.isArray(data.events)
+      ? data.events.map(normalizeEvent) : [];
     if (switching) {
       state.events = page;
       state.hasMore = Boolean(data.has_more);
@@ -441,6 +503,304 @@ export async function loadContacts(deviceId, query) {
     "devices/" + encodeURIComponent(target) + "/contacts", params);
   if (state.deviceId !== target) return [];
   return Array.isArray(data.contacts) ? data.contacts : [];
+}
+
+// --- calls ------------------------------------------------------------
+
+// One ref per attempt, reused by every retry of the same action so the
+// unique `client_ref` of the backend turns a lost answer into a duplicate
+// instead of a second radio command.
+function newActionRef() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch (err) {
+    // Fall through to the manual random id.
+  }
+  const bytes = new Uint8Array(16);
+  try {
+    window.crypto.getRandomValues(bytes);
+  } catch (err) {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  let value = "";
+  for (const byte of bytes) value += byte.toString(16).padStart(2, "0");
+  return value;
+}
+
+// Newest first by the call time, then by the id: the same order the
+// server pages with, so the merged list stays sorted.
+function compareCalls(a, b) {
+  const left = Number(a && a.started_at) || 0;
+  const right = Number(b && b.started_at) || 0;
+  if (left !== right) return right - left;
+  const leftId = String((a && a.id) || "");
+  const rightId = String((b && b.id) || "");
+  if (leftId === rightId) return 0;
+  return leftId < rightId ? 1 : -1;
+}
+
+function mergeCalls(current, incoming) {  const byId = new Map();
+  for (const call of current) {
+    if (call && call.id) byId.set(String(call.id), call);
+  }
+  for (const call of incoming) {
+    if (!call || !call.id) continue;
+    byId.set(String(call.id), call);
+  }
+  const result = Array.from(byId.values());
+  result.sort(compareCalls);
+  return result;
+}
+
+function renderCallsList() {
+  ui.renderCalls(state.calls, {
+    query: state.callsQuery,
+    hasMore: state.callsHasMore,
+    available: state.callsAvailable !== false,
+  });
+}
+
+function callsUnreadUntil() {
+  let newest = 0;
+  for (const call of state.calls) {
+    const ts = Number(call && call.started_at) || 0;
+    if (ts > newest) newest = ts;
+  }
+  return newest;
+}
+
+// The call log of ONE device. A search starts a new list; a plain load
+// merges the newest page so a refresh never throws away the older pages
+// the reader has already walked to.
+export async function loadCalls(deviceId, options) {
+  const opts = options || {};
+  const target = String(deviceId || state.deviceId || "");
+  if (!target) return state.calls;
+  if (target !== state.deviceId) selectDevice(target);
+  const append = Boolean(opts.append);
+  const text = typeof opts.query === "string" ? opts.query : state.callsQuery;
+  const trimmed = text.trim();
+  const queryChanged = trimmed !== (state.callsQuery || "").trim();
+  if (opts.reset || queryChanged) {
+    state.calls = [];
+    state.callsHasMore = false;
+    state.callsCursor = null;
+  }
+  state.callsQuery = text;
+  const hadCalls = state.calls.length > 0;
+  if (!hadCalls) ui.setCallsStatus("Loading calls…");
+  const request = ++callsRequest;
+  state.loading.calls = true;
+  try {
+    const params = { limit: CALL_LIMIT };
+    if (trimmed) params.q = trimmed;
+    if (append && state.callsCursor) {
+      params.beforeTs = state.callsCursor.ts;
+      params.beforeKey = state.callsCursor.id;
+    }
+    const data = await getCalls(target, params);
+    if (request !== callsRequest) return state.calls;
+    if (state.deviceId !== target) return state.calls;
+    state.callsAvailable = true;
+    const page = Array.isArray(data && data.calls) ? data.calls : [];
+    state.calls = append ? mergeCalls(state.calls, page) : mergeCalls(
+      queryChanged || opts.reset ? [] : state.calls, page);
+    state.callsLoaded = true;
+    if (append || queryChanged || opts.reset || !hadCalls) {
+      state.callsHasMore = Boolean(data && data.has_more);
+    }
+    const oldest = state.calls[state.calls.length - 1];
+    state.callsCursor = oldest
+      ? { ts: oldest.started_at, id: String(oldest.id) }
+      : null;
+    renderCallsList();
+    ui.setCallsStatus("");
+    return state.calls;
+  } catch (err) {
+    if (request !== callsRequest) return state.calls;
+    // A backend without the calls feature answers 404. That is a device
+    // the relay cannot show calls for, not a crash.
+    if (err && err.status === 404) {
+      state.callsAvailable = false;
+      state.calls = [];
+      state.callsHasMore = false;
+      state.callsCursor = null;
+      state.callsLoaded = true;
+      state.liveCall = null;
+      ui.renderLiveCall(null);
+      renderCallsList();
+      ui.setCallsStatus("");
+      return state.calls;
+    }
+    ui.setCallsStatus("Could not load the calls.");
+    throw err;
+  } finally {
+    state.loading.calls = false;
+  }
+}
+
+export async function loadMoreCalls(deviceId) {
+  if (state.loading.calls || !state.callsHasMore) return state.calls;
+  return loadCalls(deviceId || state.deviceId, { append: true });
+}
+
+// The live call of the device. An idle device answers a null call, and a
+// backend without the feature answers 404: both hide the card.
+export async function loadLiveCall(deviceId) {
+  const target = String(deviceId || state.deviceId || "");
+  if (!target) {
+    state.liveCall = null;
+    ui.renderLiveCall(null);
+    return null;
+  }
+  try {
+    const data = await getLiveCall(target);
+    if (state.deviceId !== target) return state.liveCall;
+    const call = data && data.call ? data.call : null;
+    state.liveCall = call;
+    state.callsAvailable = true;
+    ui.renderLiveCall(call);
+    return call;
+  } catch (err) {
+    if (state.deviceId !== target) return state.liveCall;
+    if (err && err.status === 404) {
+      // The live endpoint is missing: only the card is hidden. The log
+      // has its own flag, so a missing live route never turns a working
+      // history into "not available".
+      state.liveCall = null;
+      ui.renderLiveCall(null);
+      return null;
+    }
+    throw err;
+  }
+}
+
+// The closest a call can be answered or hung up: the request is
+// idempotent through the client_ref, so a retry never runs twice.
+// The retry of a failed attempt must reuse the client_ref of that
+// attempt, or the server would create a second action and the phone
+// would run it twice. It is kept apart from the in-flight guard so a
+// different action is never blocked by a failed one.
+let lastCallAttempt = null;
+
+function sameCallAttempt(pending, target, name, callRef, payload) {
+  if (!pending) return false;
+  return pending.deviceId === target && pending.action === name
+    && pending.callRef === callRef
+    && String(pending.payload === null ? "" : pending.payload)
+    === String(payload === null ? "" : payload);
+}
+
+export async function sendCallAction(deviceId, action, options) {
+  const opts = options || {};
+  const target = String(deviceId || state.deviceId || "");
+  const name = String(action || "");
+  if (!target || !name) throw new Error("missing call action");
+  const callRef = String(opts.callRef || "");
+  const payload = opts.payload === undefined ? null : opts.payload;
+  let clientRef = opts.clientRef ? String(opts.clientRef) : "";
+  if (!clientRef) {
+    clientRef = sameCallAttempt(lastCallAttempt, target, name, callRef, payload)
+      ? lastCallAttempt.clientRef : newActionRef();
+  }
+  lastCallAttempt = {
+    deviceId: target,
+    action: name,
+    callRef,
+    payload,
+    clientRef,
+  };
+  state.callActionPending = {
+    deviceId: target,
+    action: name,
+    callRef,
+    payload,
+    clientRef,
+  };
+  ui.setCallActionsBusy(true);
+  ui.setCallError("");
+  try {
+    const data = await postCallAction(target, {
+      callRef,
+      action: name,
+      payload,
+      clientRef,
+    });
+    // The action was accepted: the next tap of the same control is a new
+    // command with a new ref.
+    lastCallAttempt = null;
+    return data;
+  } catch (err) {
+    if (err && err.status === 409) {
+      // The call ended between the tap and the delivery: the ref is
+      // stale and never applies to the next call.
+      lastCallAttempt = null;
+      ui.setCallError("That call has already ended.");
+      await loadLiveCall(target).catch(() => {});
+      throw err;
+    }
+    if (err && err.status === 410) {
+      lastCallAttempt = null;
+      ui.setCallError("This call action expired. Try again.");
+      await loadLiveCall(target).catch(() => {});
+      throw err;
+    }
+    if (err && err.payload && err.payload.detail
+        && err.payload.detail.error === "emergency_number") {
+      lastCallAttempt = null;
+      ui.setCallError("Emergency numbers cannot be dialled remotely.");
+      throw err;
+    }
+    if (err && err.status === 429) {
+      ui.setCallError("Too many call actions. Wait a moment and retry.");
+      throw err;
+    }
+    // A network or server failure keeps the attempt: retrying the same
+    // control reuses its ref and can never run the action twice.
+    throw err;
+  } finally {
+    state.callActionPending = null;
+    ui.setCallActionsBusy(false);
+  }
+}
+
+// Opening the Calls tab clears the missed badge of that device. The
+// newest timestamp already marked is remembered, so re-entering the tab
+// is a no-op instead of a write on every navigation.
+export async function markCallsRead(deviceId, untilTs) {
+  const target = String(deviceId || state.deviceId || "");
+  if (!target) return null;
+  const value = Number(untilTs);
+  const until = Number.isFinite(value) && value > 0
+    ? Math.floor(value) : callsUnreadUntil();
+  if (!until) return null;
+  if (until <= state.callsReadMarkedTs) return null;
+  try {
+    const data = await postCallsRead(target, until);
+    if (state.deviceId !== target) return data;
+    state.callsReadMarkedTs = until;
+    for (const call of state.calls) {
+      if (call && !call.is_read && Number(call.started_at) <= until) {
+        call.is_read = true;
+      }
+    }
+    renderCallsList();
+    const device = currentDevice();
+    if (device && Number(device.missed)) {
+      device.missed = 0;
+      ui.renderChatsHeader(device);
+    }
+    return data;
+  } catch (err) {
+    if (err instanceof AuthError) throw err;
+    // A backend without the calls feature answers 404 here. Nothing to
+    // clear, and the badge of the device is the next refresh's business.
+    return null;
+  }
 }
 
 async function refreshAfterSend() {
@@ -652,6 +1012,14 @@ async function refreshFromChange() {
     if (state.deviceId !== deviceId) return;
     if (deviceId) await loadChats(deviceId, state.query);
     if (state.deviceId !== deviceId) return;
+    if (deviceId) {
+      await loadLiveCall(deviceId).catch(() => {});
+      if (state.deviceId !== deviceId) return;
+      if (state.callsLoaded) {
+        await loadCalls(deviceId, { query: state.callsQuery }).catch(() => {});
+        if (state.deviceId !== deviceId) return;
+      }
+    }
     if (deviceId && threadKey) {
       await loadThread(deviceId, threadKey);
       const newest = state.events[0];
@@ -663,6 +1031,7 @@ async function refreshFromChange() {
   let devicesDirty = false;
   let chatsDirty = false;
   let threadDirty = false;
+  let callsDirty = false;
   for (const item of scope) {
     if (!item) continue;
     const changedDevice = item.device_id ? String(item.device_id) : "";
@@ -672,14 +1041,17 @@ async function refreshFromChange() {
       devicesDirty = true;
       chatsDirty = true;
       threadDirty = true;
+      callsDirty = true;
       break;
     }
     if (changedThread === null) {
-      // A device-wide change: the card of that device changed.
+      // A device-wide change: the card of that device changed, and a
+      // call change has no thread key at all.
       devicesDirty = true;
       if (changedDevice === deviceId) {
         chatsDirty = true;
         threadDirty = true;
+        callsDirty = true;
       }
       continue;
     }
@@ -697,6 +1069,17 @@ async function refreshFromChange() {
   if (devicesDirty) await loadDevices();
   if (state.deviceId !== deviceId) return;
   if (chatsDirty && deviceId) await loadChats(deviceId, state.query);
+  if (state.deviceId !== deviceId) return;
+  if (callsDirty && deviceId) {
+    // The live card is visible on both tabs, so it always refreshes. The
+    // history is only reloaded once it has been opened: a device-wide
+    // change of another feature must not cost a request otherwise.
+    await loadLiveCall(deviceId).catch(() => {});
+    if (state.deviceId !== deviceId) return;
+    if (state.callsLoaded) {
+      await loadCalls(deviceId, { query: state.callsQuery }).catch(() => {});
+    }
+  }
   if (state.deviceId !== deviceId) return;
   if (threadDirty && deviceId && threadKey) {
     await loadThread(deviceId, threadKey);

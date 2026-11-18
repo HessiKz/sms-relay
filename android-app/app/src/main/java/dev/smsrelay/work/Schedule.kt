@@ -9,6 +9,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import dev.smsrelay.calls.CallLogWorker
 import java.util.concurrent.TimeUnit
 
 object Schedule {
@@ -19,6 +20,8 @@ object Schedule {
     const val UNIQUE_COMMANDS_ONCE = "sms-relay-commands-once"
     const val UNIQUE_COMMANDS_NEXT = "sms-relay-commands-next"
     const val UNIQUE_IMPORT = "sms-relay-import"
+    const val UNIQUE_CALL_LOG = "sms-relay-call-log"
+    const val UNIQUE_CALL_LOG_PERIODIC = "sms-relay-call-log-periodic"
 
     /**
      * How often the command queue is polled.
@@ -46,6 +49,49 @@ object Schedule {
             .build()
         WorkManager.getInstance(context)
             .enqueueUniqueWork(UNIQUE_IMPORT, ExistingWorkPolicy.KEEP, request)
+    }
+
+    /**
+     * One user-initiated run of the call-log sync.
+     *
+     * KEEP, not REPLACE: a second tap while a run is going must not start
+     * a second one, and the worker is resumable, so the button can be
+     * pressed again after it finished.
+     */
+    fun enqueueCallLog(context: Context) {
+        val request = OneTimeWorkRequestBuilder<CallLogWorker>()
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
+            .build()
+        WorkManager.getInstance(context)
+            .enqueueUniqueWork(UNIQUE_CALL_LOG, ExistingWorkPolicy.KEEP, request)
+    }
+
+    /**
+     * Periodic call-log sync (15 min), the safety net for the forward
+     * cursor and the rolling recent window.
+     *
+     * WorkManager refuses a shorter interval, and the call log does not
+     * need a tighter cadence: a call row is written when the call ends,
+     * and the Mini App shows the live call through the call session, not
+     * through the log.
+     */
+    fun scheduleCallLog(context: Context) {
+        val request = PeriodicWorkRequestBuilder<CallLogWorker>(15, TimeUnit.MINUTES)
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
+            .build()
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            UNIQUE_CALL_LOG_PERIODIC,
+            ExistingPeriodicWorkPolicy.KEEP,
+            request
+        )
     }
 
     /** Immediate upload attempt, network constrained. */

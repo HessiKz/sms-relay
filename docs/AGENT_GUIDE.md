@@ -13,18 +13,29 @@ already exist.
 A multi-device SMS bridge for a single admin:
 
 - **Phones (devices)** capture SMS, keep a durable Room queue, upload them,
-  poll for outbound commands and send through their own SIM. A phone is not
-  trusted by default: it has to be paired with the backend through a QR
+  poll for outbound commands and send through their own SIM. They are also a
+  real local **Messages client**: the launcher is the phone's own conversation
+  list read from the SMS provider, and a one-to-one composer sends, stores the
+  message in `content://sms` and mirrors it to the relay as outbound history.
+  They also upload
+  their call log, report the one call they are on, and execute remote call
+  actions; the dialer places calls with no pairing and no network. A phone is
+  not trusted by default: it has to be paired with the backend through a QR
   hand-shake before it may talk to it.
 - **Backend (VPS)** receives, stores and filters messages, and posts one short
   notification per inbound SMS to one private Telegram chat: device name,
   sender, UTC time, and an "Open chat" button. The SMS body never goes to
-  Telegram; it lives in SQLite and in the Mini App. Every notification carries the name of the
-  device that captured it. It also runs the admin bot and serves the Mini App.
+  Telegram; it lives in SQLite and in the Mini App. Every notification
+  carries the name of the device that captured it. It mirrors the call log,
+  holds the live call of each device and the queue of remote call actions, and
+  posts one bounded message for a ringing or a missed call. It also runs the
+  admin bot and serves the Mini App.
 - **Mini App** is a Telegram WebApp with a composer. It is device-first: the
-  admin picks a device and sees only that device's conversations. It talks to
-  the backend with Telegram `initData` and creates the same `sms_commands`
-  rows as the Telegram bot.
+  admin picks a device and sees only that device's conversations. It has a
+  `Chats | Calls` tab per device and a live call card with Answer, Decline,
+  Hang up, Mute, Speaker and a keypad. It talks to the backend with Telegram
+  `initData` and creates the same `sms_commands` rows as the Telegram bot; a
+  call action is a `call_actions` row, never a second kind of command.
 
 Three rules shape everything else:
 
@@ -82,8 +93,21 @@ own bearer token.
 8. **A command is executed at most once.** The local `handled_commands` guard
    row is written before the radio call. A lost report may duplicate a status
    message, never an SMS.
-9. **Additive, idempotent migrations.** Do not destroy the message queue.
-10. **Update the documentation and the agent log** as part of the change.
+9. **A call action is at most once, and never lands on the next call.** The
+   server marks an action `delivered` in the same transaction that hands it
+   out; the phone writes the action id to `CallActionGuard` before it touches
+   Telecom. An action names the phone-generated `call_ref` of the live call
+   and a stale or mismatched ref is refused (`409 stale_call`), never applied
+   to the call that follows. One primary call per device: call waiting is out
+   of scope so the ref stays unambiguous.
+10. **Emergency numbers are never remote-controlled, and there is no remote
+    audio.** `110`, `112`, `115`, `125`, `911`, `999`, `000` are refused by
+    the backend, by the bot and by the Mini App; only the phone's own dialer
+    places them, offline. Never request `CAPTURE_AUDIO_OUTPUT` and never
+    promise listening or talking: the relay controls a call, it does not carry
+    it.
+11. **Additive, idempotent migrations.** Do not destroy the message queue.
+12. **Update the documentation and the agent log** as part of the change.
 
 ## 3. Backend map
 
@@ -97,10 +121,11 @@ own bearer token.
 | `backend/app/ingest.py` | `POST /sms` live ingest, filters, dedupe, pause | live-ingest behavior |
 | `backend/app/importer.py` | `POST /import` historical inbox and sent folder | import format, direction, limits, import dedupe |
 | `backend/app/api.py` | device/admin REST API, status, settings, filters | REST contracts or admin controls |
+| `backend/app/calls.py` | device call routes (`/calls/sync`, `/calls/events`, `/calls/actions*`), Mini App call routes, live session shaping and freshness, emergency gate, Telegram call mirrors | call log, live call, remote actions, call messages |
 | `backend/app/pairing.py` | public pairing endpoints (`/pair/start`, `/pair/claim`) and the Mini App pairing/device endpoints | pairing flow, device lifecycle, device list |
 | `backend/app/delivery.py` | delivery worker, notification text, retry policy, Telegram button, `NotificationReaper` | notification behavior, notification deletion |
 | `backend/app/tg.py` | Telegram HTTP client and error taxonomy, including `deleteMessage` (`_interpret_ok`) | Bot API calls, error classification |
-| `backend/app/updater.py` | long-poll loop, bot commands, callbacks, command creation, default-device routing | bot commands and Telegram UX |
+| `backend/app/updater.py` | long-poll loop, bot commands, callbacks, command creation, default-device routing, call callbacks (`call:<verb>:<device>`) | bot commands and Telegram UX |
 | `backend/app/flow.py` | in-memory guided conversation state | button conversation steps |
 | `backend/app/tg_ui.py` | keyboard builders, masking, number normalization | keyboard layout, typed-number parsing |
 | `backend/app/miniapp.py` | `/app/api/*` handlers, send caps, idempotency | Mini App API behavior |
@@ -175,6 +200,62 @@ first 11 characters are kept in `devices.token_prefix` for the UI).
   partial unique index used for Mini App idempotency. Imported sent messages
   also live here, with `source='import'` and terminal `status='sent'`: see
   "Historical import" below.
+- `call_log`: the history of every call the phone's provider knows.
+  - `id` is deterministic: `call-<sha256(device_id, "pid:"+provider_id)>`, or
+    `call-<sha256(device_id, "n:"+number+"\0"+started_at)>` when the phone
+    sent no provider id. A replayed batch therefore upserts to the same rows.
+  - `kind` is one of `db.CALL_KINDS`: `incoming`, `outgoing`, `missed`,
+    `rejected`, `blocked`, `voicemail`, `unknown`. An unknown kind is skipped,
+    never stored.
+  - `number_key` is `phones.thread_key(number)`, the same key the SMS side
+    uses, so a call and an SMS of one conversation share `(device_id,
+    thread_key)`. A private number has `number_key` NULL and is never merged
+    into a thread.
+  - `sub_id` and `phone_account` identify the SIM; `duration_s` is capped at
+    one week per row; `is_read` only ever moves forward (a Mini App read is
+    not undone by a re-sync); `content_hash` from the phone shortcuts the
+    "did anything change?" check.
+  - `present` is reserved for a provider-side deletion and is `1` today; every
+    reader filters on it.
+  - Indexes: `(device_id, started_at DESC, id DESC)` for the history page and
+    `(device_id, number_key, started_at DESC)` for the thread timeline.
+- `call_sessions`: the one primary call of a device, primary key `device_id`.
+  - `call_ref` is the phone-generated UUID and the only handle an action may
+    carry. `state` is one of `db.CALL_STATES`: `ringing`, `dialing`, `active`,
+    `held`, `disconnected`; `direction` is `incoming` or `outgoing`.
+  - An event of the same `call_ref` **merges**: an omitted field keeps the
+    stored value, so a mute update never erases the caller. An event with a
+    new `call_ref` replaces the row, because the previous call is over by
+    definition.
+  - `answered_at` is stamped on the first `active`/`held`; `disconnected`
+    stamps `ended_at` when the phone did not send one.
+  - The row is **ephemeral state, not history**. The finished call reaches
+    `call_log` through the phone's own provider upload.
+  - Freshness is one function, `calls.session_is_live()`: `ringing`/`dialing`
+    die after 2 min without an update, `active`/`held` after 12 h,
+    `disconnected` is *shown* for 60 s but is not actionable. A phone that
+    dies mid-call therefore stops offering Answer/Hang up by itself.
+- `call_actions`: one row per remote control, guard first.
+  - `action` is one of `db.CALL_ACTIONS`: `answer`, `reject`, `hangup`,
+    `mute`, `unmute`, `speaker_on`, `speaker_off`, `hold`, `unhold`, `dtmf`,
+    `dial`.
+  - `status` is one of `pending`, `delivered`, `done`, `failed`, `expired`,
+    `rejected`. Only `pending` and `delivered` move to a terminal state
+    (`db._CALL_ACTION_TRANSITIONS`), so a late report never reopens an action.
+  - `call_ref` is empty **only** for `dial`, which has no call yet; its
+    `payload` is the normalised destination.
+  - TTL lives in `db.CALL_ACTION_TTL_S`: `answer`/`reject`/`hangup` 20 s,
+    everything else `CALL_ACTION_DEFAULT_TTL_S = 300` s. `expires_at` is
+    decided in `db.call_action_create()` so the bot and the Mini App cannot
+    disagree.
+  - `client_ref` has a partial unique index (`WHERE client_ref IS NOT NULL`):
+    the Mini App passes its own idempotency key, the bot passes
+    `tg:<callback id>`, and a second insert returns `None` instead of a second
+    action.
+  - `claim_call_actions()` selects `pending`, marks expired rows, flips the
+    returned rows to `delivered` — all in one transaction, so the idle poll
+    (`CommandWorker`) and the live poll (`CallService`) never run one action
+    twice.
 - `contacts`, `filters`, `settings`, `thread_reads`, `device_status` are
   supporting tables. `contacts`, `thread_reads` and `device_status` are the
   pre-split tables: they are kept for a rollback, but the new readers never
@@ -385,8 +466,62 @@ Global Mini App routes: `GET /app/api/me`, `GET /app/api/status` (the relay
 state plus the device list; it contains no conversation of any device) and
 `GET /app/api/events?rev=N&timeout=25` (the revision long poll).
 
+### Call API
+
+Device surface (per-device token, `require_device`):
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /calls/sync` | `{items:[…]}` 1–200 | `{inserted, updated, unchanged, skipped}` |
+| `POST /calls/events` | `{call_ref, state, direction, number?, sim_label?, muted?, speaker?, started_at?, ended_at?}` | `{ok:true}` |
+| `GET /calls/actions?wait=0..25` | — | `{actions:[…]}`, at most 10 |
+| `POST /calls/actions/{id}/result` | `{status, detail?}` (`done`/`failed`/`rejected`) | `{accepted, status}` |
+
+`call_sync` item: `{provider_id, number, cached_name, kind, raw_type,
+started_at, duration_s, sub_id, phone_account, is_read, content_hash}`.
+`started_at` must be at or after 2000-01-01 and no more than 24 h in the
+future; a row that fails any check is `skipped`, the rest of the batch is
+stored.
+
+Mini App surface (`require_miniapp`, device in the path):
+
+| Route | Purpose |
+|---|---|
+| `GET /app/api/devices/{id}/calls` | history of one device; `limit`, `before_ts` + `before_id`, `q` |
+| `GET /app/api/devices/{id}/calls/live` | the current `call_sessions` row, shaped once by `calls.live_call_shape` |
+| `POST /app/api/devices/{id}/calls/actions` | `{call_ref, action, payload?, client_ref}` |
+| `POST /app/api/devices/{id}/calls/read` | `{until_ts}`; clamps the marker to now, answers `{read, missed}` |
+
+- A read route uses `_known_device` (a revoked device's history stays
+  readable); a write route uses `_active_device`.
+- `POST .../calls/actions` answers `422 emergency_number` for an emergency
+  destination, `422 invalid_destination` for an unusable one, `409
+  stale_call` for a ref that is not the live call, and `409
+  client_ref_conflict` when a `client_ref` is reused for another device,
+  action or ref.
+- `_device_summary` gains `call` (the live session, or null) and `missed`
+  (the unread missed count), so the device list renders the badge and the
+  card from one request.
+- Any call change bumps `rev.bump_rev(app, device_id, None)` — device-wide,
+  because a private number has no thread to name.
+
+Telegram callback data (bot side, `updater._handle_call_callback`):
+
+| Data | Meaning |
+|---|---|
+| `call:answer:<device>` | answer the live call of that device |
+| `call:reject:<device>` | decline it |
+| `call:callback:<device>` | dial the number of the ended session the message was about |
+
+The data names the **device**, never the `call_ref`: Telegram caps
+`callback_data` at 64 bytes and a ref plus a device id can exceed that. The
+bot resolves the live session at tap time, so an old message cannot touch a
+new call. Each tap becomes an action with `client_ref = "tg:<callback id>"`,
+so a callback delivered twice creates one action.
+
 Device surface: `POST /sms`, `POST /import`, `GET /commands`,
-`POST /commands/{id}/result`, `POST /contacts`.
+`POST /commands/{id}/result`, `POST /contacts`, `POST /calls/sync`,
+`POST /calls/events`, `GET /calls/actions`, `POST /calls/actions/{id}/result`.
 Admin surface: `GET /messages`, `GET /contacts`, `POST /admin/pause`,
 `POST /admin/resume`, `GET/PUT /admin/settings`, `GET/PUT /admin/filters`.
 Shared: `GET /sms-state`, `GET /status`.
@@ -449,6 +584,7 @@ Routes are device-first:
 | `#/` | the device list |
 | `#/d/<device_id>` | the conversations of that device |
 | `#/d/<device_id>/t/<thread_key>` | one thread of that device |
+| `#/d/<device_id>/calls` | the call log of that device |
 
 A deep link from the bot carries `?device=<id>&thread=<key>`
 (`delivery.thread_url`); the start parameter may carry the same values as
@@ -491,6 +627,33 @@ renames a device, sets it as the default and revokes it.
 - The long poll answers with the scope of the change. When the open
   conversation is not in it, the thread is not reloaded.
 
+### Mini App calls
+
+- `#/d/<device_id>/calls` is a tab on the device screen (`Chats | Calls`);
+  `app.js` routes `parts[2] === "calls"` and the tab keeps its own search
+  scope and status line.
+- `store.loadCalls()` pages with the same two-half cursor as a thread
+  (`before_ts` + `before_id`), merges by id and renders through
+  `ui.renderCalls()`; `callsAvailable` turns false on a `404`/feature gap and
+  the tab shows "not available" instead of an error.
+- The live card is `ui.renderLiveCall(call)`; it is fed first by the `call`
+  field of the device summary and then by `GET .../calls/live`. The store
+  keeps one timer that refreshes it while a call is up.
+- Action taps go through `store.sendCallAction(deviceId, action, {callRef,
+  payload, clientRef})`. The `client_ref` is generated once per attempt and
+  **reused** by a retry, so a lost answer does not create a second action.
+  `409 stale_call` refreshes the card instead of showing an error.
+- A `dial` passes `callRef: ""`. `ui.isEmergencyNumber()` hides `Call back`
+  and `Call via…` for an emergency number and the backend refuses one anyway
+  (`422 emergency_number`).
+- The `Call via…` sheet (`ui.callViaEntries`) offers the phone (`tel`),
+  `https` links (WhatsApp, Telegram, Signal, Bale, Rubika) and best-effort
+  custom schemes (Viber, Skype, FaceTime). It never places a call itself: it
+  hands a URL to another app.
+- The thread timeline gains `call:<id>` events next to `msg:` and `cmd:`;
+  `db.thread_timeline()` returns them with `kind='call'`, the call `kind`,
+  `duration_s` and `number`, and only for `present = 1` rows.
+
 ## 6. Android map
 
 | Area | Files | Responsibility |
@@ -506,8 +669,15 @@ renames a device, sets it as the default and revokes it.
 | Scheduling | `work/Schedule.kt`, `receiver/BootReceiver.kt`, `RelayApp.kt` | 5 s command chain, 15 min safety net, uploads |
 | Contacts | `contacts/ContactsSync.kt`, `contacts/ContactResolver.kt`, `data/ContactsRepository.kt` | upload and local name resolution |
 | Pairing | `pairing/PairingController.kt`, `pairing/QrCode.kt`, `net/PairingClient.kt`, `TokenStore.kt` | QR hand-shake, claim polling, token storage |
-| Settings | `SettingsStore.kt` | base URL, device id and name, pairing state |
-| UI | `ui/MainActivity.kt`, `ui/HistoryActivity.kt`, `ui/ComposeSmsActivity.kt` | setup, pairing, permissions, history, role stubs |
+| Call log | `calls/CallLogReader.kt`, `calls/CallLogWorker.kt`, `calls/CallLogEntity.kt`, `calls/CallLogDao.kt`, `calls/CallLogDatabase.kt` | provider cursor, type mapping, forward + 7-day re-read upload, durable Room upload queue |
+| Dialer | `calls/DialerActivity.kt`, `calls/CallDeepLinks.kt` | `ACTION_DIAL`/`tel:`, dialpad, SIM choice, `Call via…`, emergency passthrough, default-dialer candidate |
+| In-call | `calls/CallService.kt`, `calls/CallActivity.kt`, `calls/CallSession.kt` | `InCallService`, events, action long poll, controls, `LiveCallRegistry` |
+| Call actions | `calls/CallExecutor.kt`, `calls/CallActionGuard.kt` | apply one action to Telecom, at-most-once guard |
+| Settings | `SettingsStore.kt` | base URL, device id and name, pairing state, call-log cursor |
+| Messages read model | `messages/SmsRepository.kt`, `messages/SmsThread.kt`, `messages/SmsMessage.kt`, `messages/SmsObserver.kt` | provider reads (`content://mms-sms/conversations?simple=true`, `content://mms-sms/canonical-addresses`, `content://sms`), unread scan, sent insert, read marking, content observer |
+| Messages UI | `ui/ShellActivity.kt`, `ui/ThreadActivity.kt`, `ui/messages/ThreadLabels.kt`, `ui/messages/ThreadAdapter.kt`, `ui/messages/ConversationAdapter.kt`, `ui/messages/MessageDates.kt`, `ui/messages/AvatarDrawable.kt`, `ui/messages/MessagesBanner.kt` | the launcher conversation list, one thread with day headers and the composer, group/MMS notices, honest read states |
+| Dialer home | `ui/DialerHomeActivity.kt`, `ui/dialer/DialerRepository.kt`, `ui/dialer/DialerTabs.kt`, `ui/dialer/RecentsAdapter.kt`, `ui/dialer/ContactsAdapter.kt`, `ui/dialer/FavoritesAdapter.kt` | Favorites / Recents / Contacts / Voicemail tabs, search, `ACTION_DIAL` rows, the dialpad FAB |
+| UI | `ui/MainActivity.kt`, `ui/HistoryActivity.kt`, `ui/ComposeSmsActivity.kt` | setup, pairing, permissions, roles, history, compose stub |
 
 Pairing and secrets:
 
@@ -590,6 +760,123 @@ Historical import (`work/ImportWorker.kt`):
 
 The app is **not built on the VPS**: there is no Android toolchain there. Say
 so in the log whenever the Android code changes.
+
+### Messages and dialer UI (wave 2, implemented)
+
+The local client is a second read model over the phone's own store. It is
+deliberately separate from the relay's Room queue:
+
+| Component | Does | Does not |
+|---|---|---|
+| `SmsRepository.conversations()` | reads `content://mms-sms/conversations?simple=true` (`_id, date, recipient_ids, snippet`, `date DESC`), resolves **every** `recipient_ids` entry through `content://mms-sms/canonical-addresses` (per-call cache), merges contact names, unread counts | touch Room, write anything |
+| `SmsRepository.messages()` | `content://sms` where `thread_id = ?`, newest first, `MESSAGE_LIMIT = 500` per page plus one extra row for `hasOlder` | decode MMS |
+| `SmsRepository.insertSent()` | one `content://sms` row: `ADDRESS`, `BODY`, `DATE`, `DATE_SENT`, `TYPE=SENT`, `READ=1`, `SEEN=1`, `SUBSCRIPTION_ID` when known; returns `_id` + `THREAD_ID` | create a thread by hand, write `MmsSms` internals |
+| `SmsRepository.markThreadRead()` | sets `READ=1` for one thread | mark a thread it could not read |
+| `SmsObserver` | content observer on `content://sms` and the conversations URI | upload, refresh the relay |
+| `ShellActivity` | the only `ACTION_MAIN`+`LAUNCHER`: conversation list, search, role/pairing banners, contact-picker FAB, menu to Phone home and setup | send, dial |
+| `ThreadActivity` | one thread: day headers, in/out bubbles, mark read, load older, composer for one-to-one SMS | send to a group, send MMS |
+| `ThreadLabels` | the single source of a conversation label; groups are first names (`+n`) or `Group (n)`, never one member's number | guess a group's number |
+| `DialerHomeActivity` | Favorites / Recents / Contacts / Voicemail, search, `ACTION_DIAL` rows, dialpad FAB, call-log delete with `WRITE_CALL_LOG` | place a call, read visual voicemail |
+| `DialerRepository` | `CallLog.Calls` (200 newest), `ContactsContract` contacts and starred favourites, `TelecomManager` voicemail number; `Load` distinguishes denied / failed / empty | cache rows, log a number or a name |
+
+The local send and mirror flow:
+
+1. `ThreadActivity.sendComposer()` calls
+   `SmsSender.send(context, settings, destination, body, subscriptionId =
+   null)`. Nothing is written before the radio answers `Outcome.Sent`.
+2. `SmsRepository.insertSent(...)` writes the provider row and returns
+   `StoredSms(rowId, threadId)`. A `SecurityException` or a null insert URI
+   becomes `StoredSms(null, -1)`, never an exception.
+3. The screen clears the composer, reloads the thread (`loadOlder` paging
+   stays intact) and scrolls to the end. When `rowId == null` it shows "Sent,
+   but this phone did not store it" and skips the mirror.
+4. `ThreadActivity.mirrorSent()` posts one `ImportMessage(providerId, sender,
+   body, receivedAt = millis / 1000, subId, direction = "out")` through
+   `RelayClient.importBatch`. The backend stores an outbound import as an
+   `sms_commands` row with `source='import'`, `status='sent'`: history only,
+   never pending, never handed to a phone, never forwarded to Telegram.
+5. Failure taxonomy is coarse on purpose: `null` result logs
+   `relay mirror skipped: network`, `Rejected`/`Unauthorized` logs
+   `… : refused`. The local send is already a success and is never undone.
+
+Group, MMS and role handling:
+
+- A thread with two or more resolved recipients is a group: `SmsThread.address`
+  is empty, `avatarKey` is `group:<threadId>`, the label comes from
+  `ThreadLabels`, the header hides the call button and the composer becomes
+  "Group sending is not supported yet."
+- An MMS-only thread has no `content://sms` rows, so `isMmsOnly()` (empty page
+  **and** a non-blank provider snippet) shows the snippet as a placeholder.
+  A mixed thread shows its SMS rows plus `messages_mms_partial`, which
+  `showMmsNote()` raises when the provider's snippet is not the body of the
+  newest visible SMS (prefix-tolerant, so a truncated long SMS does not raise
+  a false note). An unresolved canonical address is reported separately
+  (`messages_no_address`) and is never blamed on MMS.
+- RCS does not exist for this app: no public API, no receiver, no promise.
+- `SettingsStore.sendingEnabled` is **not** consulted by the composer. That
+  switch exists so a remote command cannot make the phone send without its
+  owner present; a person typing on the screen is that consent. Only
+  `CommandWorker`/`FallbackPolicy` read it.
+- `DialerHomeActivity` never calls `ACTION_CALL`. Every row opens
+  `DialerActivity` with `ACTION_DIAL` and `tel:<number>`, so an emergency
+  number in a call log is never one touch away from a placed call. Voicemail
+  is a `TelecomManager` carrier-voicemail call, not visual voicemail.
+- `DialerActivity` and `CallActivity` survive this phase untouched:
+  `DialerActivity` keeps `ACTION_DIAL`/`tel:` and stays the default-dialer
+  candidate, just not the launcher; `CallService`/`ROLE_DIALER` are unchanged.
+
+### Calls on the phone (wave 1 + wave 2 dialer)
+
+The `calls/` package is a fourth stream next to capture, commands and
+contacts. It is deliberately not one big service:
+
+| Component | Does | Does not |
+|---|---|---|
+| `CallLogReader` | reads `content://call_log/calls`, maps `CallLog.Calls.TYPE` to `db.CALL_KINDS`, hashes the row | upload, decide |
+| `CallLogWorker` | forward `_ID` cursor + rolling 7-day `DATE` re-read, `POST /calls/sync`, cursor in `SettingsStore.callLogCursor`/`callLogCursorFormat` | parse numbers into a new key format |
+| `DialerActivity` | `ACTION_DIAL`/`tel:`, dialpad, SIM spinner, `Call via…`, emergency passthrough, default-dialer candidate | report anything to the backend, act as the launcher |
+| `CallService` | `InCallService`: Telecom callbacks, `POST /calls/events`, `GET /calls/actions?wait=10`, the in-call screen and a notification path | keep per-call history, decide policy |
+| `CallActivity` | the full-screen UI: answer, decline, mute, speaker, hold, DTMF, hang up | touch Telecom directly (it goes through `CallService`) |
+| `CallExecutor` | applies one action to the `Call`/`CallAudioState`/`TelecomManager`, `EmergencyNumbers` | fetch actions |
+| `CallActionGuard` | durable id list, written before the radio | store numbers, names or results |
+| `CallSession` / `LiveCallRegistry` | the state contract, and "a call owns the action queue" | persist anything |
+| `CallDeepLinks` | the call-via catalog and URL building | place a call |
+
+The **wave 2 dialer role** is what makes the app the phone's dialer:
+
+- `DialerActivity` is **not** the launcher any more: `ShellActivity` is. It
+  keeps `ACTION_DIAL` and `tel:` and remains the default-dialer candidate, and
+  it needs no `ROLE_DIALER` and no network, so it places a call even when the
+  relay is down or the phone is unpaired. `DialerHomeActivity` opens it from
+  its dialpad FAB with the number already in the field.
+- `MainActivity` is the setup screen, reached from the menus of both homes; it
+  requests the roles through `RoleState` and starts the pairing flow.
+- `CallService` is an `InCallService` with
+  `android.telecom.IN_CALL_SERVICE_UI` and `IN_CALL_SERVICE_RINGING` metadata;
+  Android binds it only while the app holds `ROLE_DIALER`. `MainActivity`
+  offers the role through `RoleState.dialerRoleIntent()` and re-reads
+  `RoleState.isDialer()` afterwards, because a vendor build can refuse without
+  saying so.
+- `CallActivity` is `showWhenLocked`, `turnScreenOn`, `singleTask`: a ringing
+  call must reach the user over the lock screen, and a second call must not
+  stack a second window.
+- The manifest carries `READ_CALL_LOG`, `WRITE_CALL_LOG`, `CALL_PHONE` and
+  `ANSWER_PHONE_CALLS`; `MainActivity`'s `Calls` card asks for the call-log
+  group and starts `Schedule.enqueueCallLog()`. `RelayApp` schedules the 15 min
+  periodic net, because a call row appears when the call ends.
+- Call waiting is ignored on purpose (one primary call), and nothing in this
+  package logs a number, a name or a duration.
+
+Wave 2 (the local SMS client / dialer screens in
+[`UI_DESIGN.md`](UI_DESIGN.md)) is **implemented** as `ShellActivity` (the
+launcher conversation list), `ThreadActivity` (one thread plus the one-to-one
+composer) and `DialerHomeActivity` (the Phone home), with
+`messages/SmsRepository` as the read model. It keeps the relay invariants
+(Room-before-upload, one `getUpdates` consumer, `device_id` isolation) and it
+must never make an emergency call depend on the relay. `DialerActivity` and
+`CallActivity` survive that phase as the dialpad and the in-call screen. There
+is no visual verification: the host has no JDK, Gradle or emulator, so only
+the `android-build` workflow proves the code compiles.
 
 ## 7. Change recipes
 
@@ -680,6 +967,168 @@ so in the log whenever the Android code changes.
    device or the command is refused with a readable error.
 5. Add backend tests for the state transitions and the label.
 
+### Add a Messages screen or a conversation/row field
+
+1. Read the field in `messages/SmsRepository` (projection + cursor index +
+   `SmsThread`/`SmsMessage`) or add a new `suspend` reader there. Every read
+   hops to `Dispatchers.IO` and reports a failure as an empty result plus the
+   `failed`/`denied` flag, never a thrown `SecurityException`.
+2. Decide whether it is a *conversation* field or a *message* field.
+   `SmsThread` comes from `content://mms-sms/conversations?simple=true`; a
+   message field comes from `content://sms`. They are different providers and
+   a new column must be added to the matching `PROJECTION` array and read by
+   index.
+3. Render it in `ui/messages/ConversationAdapter` (list) or
+   `ui/messages/ThreadAdapter` (bubbles), never both with different rules.
+   Labels go through `ThreadLabels.of()`, timestamps through
+   `MessageDates`: do not format a date inline, or the row, the day header and
+   the bubble clock will disagree.
+4. If the field changes the label of a group, change `ThreadLabels` only. A
+   group must never fall back to one member's number.
+5. Keep the search filter in mind: `ShellActivity` and `DialerHomeActivity`
+   filter an already-loaded list, so a new field only becomes searchable when
+   the filter function learns about it.
+6. There is no device-free test for a provider read. State in the log that the
+   screen was not built or visually verified, and keep the layout changes
+   small enough to reason about without a device.
+
+### Change the composer, the local send or the mirror
+
+1. The order is fixed: radio → provider insert → reload → best-effort mirror.
+   `ThreadActivity.sendComposer()` must not write anything before
+   `SmsSender.send(...)` answers `Outcome.Sent`.
+2. The provider row is written by `SmsRepository.insertSent()`; keep the
+   column set (`ADDRESS`, `BODY`, `DATE`, `DATE_SENT`, `TYPE=SENT`, `READ=1`,
+   `SEEN=1`, `SUBSCRIPTION_ID` when known) and `DATE = DATE_SENT` = the moment
+   the radio accepted the message. Do not create a thread by hand and do not
+   write `MmsSms` internals: let the provider assign `THREAD_ID`.
+3. A `null` `StoredSms.rowId` is not a send failure. Keep the "Sent, but this
+   phone did not store it" notice and skip the mirror; never draw a bubble
+   for a row the provider refused.
+4. The mirror is `RelayClient.importBatch(listOf(ImportMessage(...,
+   direction = "out")))`. `receivedAt` is **epoch seconds** (`DATE` is
+   millis, so divide by 1000) and `subId` is coerced to `0..99`. The backend
+   stores it as `sms_commands` with `source='import'`, `status='sent'`.
+5. A failed mirror must stay silent for the user. Log the category only
+   (`network` / `refused`), never the number, the body or a contact name.
+6. Do **not** add a `sendingEnabled` check to this path. The switch is for
+   remote commands; a person typing on the screen is the consent. If a durable
+   outbound queue is ever added, it belongs behind the local row, not instead
+   of it.
+7. Update `README.md` (the send/mirror sequence and the known limitations) in
+   the same change.
+
+### Add a tab to the Phone home
+
+1. Add the enum case to `ui/dialer/DialerTab` with its title resource. The
+   enum is the only source of the tab strip, the adapter choice and the state
+   text; do not add a tab in XML.
+2. Add the read to `ui/dialer/DialerRepository` and return `Load<T>`:
+   `denied` for a missing permission, `failed` for a provider that broke,
+   empty items only when the phone really has no rows.
+3. Handle it in `DialerHomeActivity.loadCurrentTab()` and in the empty-state
+   and banner rendering. A new tab must not inherit the previous tab's
+   "no rows" sentence.
+4. A row must open `ACTION_DIAL` through `openDialpad(number)` or
+   `dial(number)`. Never `ACTION_CALL`, never a direct Telecom call, and
+   never a special case for a number that looks like an emergency number.
+5. Add the tab to the search filter and to `onSaveInstanceState` if it has
+   state; a restored tab and a tapped tab must take the same code path.
+6. Device-free tests do not exist for a provider read; require the
+   `android-build` workflow and record that no visual verification was done.
+
+### Add a call-log or contact column
+
+1. `ui/dialer/DialerRepository.recents()` owns the `CallLog.Calls` projection;
+   add the column there, read it by `getColumnIndex`, and carry it in
+   `RecentCall`. Never query the provider from an adapter.
+2. `contacts()`/`favorites()` read `ContactsContract`: keep the size caps
+   (`MAX_CONTACTS`, `MAX_FAVORITES`) and return `Load` with the permission
+   outcome. The repository stays read only: never write a star or a name back.
+3. Render the new value through `DialerFormat.meta(...)`, which drops empty
+   parts instead of leaving a stray separator, or extend `DialerFormat` for a
+   new shape (duration, time). Do not format in the adapter.
+4. A blank number is a "private number" row, not an error: keep the toast
+   path in `dial()`.
+5. Keep `CallLogReader`/`CallLogWorker` untouched: that is the upload stream
+   and it hashes its own projection. The Phone home is a read-only local view.
+6. Update `README.md` if the visible field changes what the screen means.
+
+### Add or change a call action
+
+1. Add the verb to `db.CALL_ACTIONS`. A verb that may not be repeated freely
+   gets a `db.CALL_ACTION_TTL_S` entry; everything else falls back to
+   `CALL_ACTION_DEFAULT_TTL_S = 300`.
+2. `calls.CallActionBody` validates the verb against that tuple, so a new verb
+   is accepted by the Mini App route as soon as the tuple knows it. Decide
+   whether it needs a live `call_ref` (`dial` is the only empty-ref action) and
+   whether it may carry a `payload`.
+3. The TTL is written in `db.call_action_create()` — change it there and
+   nowhere else, or the bot and the Mini App will disagree.
+4. Android: add the verb to `CallActionNames`, execute it in
+   `CallExecutor`, and make sure `CallActionGuard.claim()` runs **before** the
+   Telecom call. The idle path (`CommandWorker.runIdleDialActions`) executes
+   only `dial`; every other verb it claims is reported `rejected`
+   (`no live call`). A new verb that must also work while idle needs an
+   explicit branch there, otherwise it only ever gets rejected (trap 31).
+5. Mini App: add the button in `ui.renderLiveCall()` and send it through
+   `store.sendCallAction()` with a fresh `client_ref`.
+6. Tests: `backend/tests/test_call_actions.py` (creation, TTL, claim, result,
+   expiry, transitions) and `backend/tests/test_calls.py` (the route).
+
+### Change the ringing or missed text
+
+1. Both texts are built by `calls._call_text()` from a header, the device name
+   and the caller; the headers are `Incoming call` and `Missed call` in
+   `_notify_ringing()` and `_notify_missed()`.
+2. Do **not** add a number to the text when a contact name exists, and never
+   add the call body of anything: there is none. The caller label is
+   `calls._caller_label()` — contact name, else `display_number`, else
+   `Unknown number`.
+3. The buttons come from `calls._call_keyboard()` and the verbs
+   `answer`/`reject` (ringing) and `callback` (missed). `CALL_VERBS` in
+   `updater.py` must know a new verb, or the tap is answered as stale.
+4. Keep the send bounded: `NOTIFY_TIMEOUT_S = 2.0` and `_send_call_message()`
+   swallow every failure. A slow Telegram must never delay the phone's state
+   report.
+5. Tests: `tests/test_calls.py` (message text, buttons, no-body rule) and
+   `tests/test_updater.py` (the callback path).
+
+### Change the freshness windows
+
+1. The constants are `LIVE_RINGING_TTL_S` (120), `LIVE_ACTIVE_TTL_S`
+   (12 * 3600) and `LIVE_DISCONNECTED_GRACE_S` (60) in `calls.py`.
+2. `calls.session_is_live()` is the **only** place that applies them;
+   `live_call_shape()` (what the Mini App and `_device_summary` show) and
+   `session_actionable()` (what may still take an answer) both call it. Do not
+   duplicate a window in a route or in the UI.
+3. Widen a window only with a reason: a ringing window is a guard against a
+   phone that died mid-ring, and the disconnected grace is what lets the card
+   render "call ended". A shorter window hides a real call; a longer one offers
+   Answer on a call that is over.
+4. Tests: `tests/test_calls.py` (fresh, stale and boundary cases for each
+   state).
+
+### Add a call-via target
+
+1. Android: add an `Entry` to `CallDeepLinks.ALL` with `id`, `labelRes`,
+   `capability` (`CAPABILITY_CALL` or `CAPABILITY_CHAT`), the `scheme` the
+   package manager is asked about and a `buildUrl` that cannot throw on a
+   partial number. Set `alwaysVisible = true` only for an `https` URL — a
+   custom scheme that nothing handles is a dead button.
+2. An `https` entry is always offered. A custom scheme needs a matching
+   `<queries>`/`<intent>` entry in `AndroidManifest.xml`, otherwise package
+   visibility hides it on API 30+.
+3. Mini App: add the counterpart in `ui.callViaEntries()` and keep it out of
+   the sheet for an emergency number (`ui.isEmergencyNumber()` is checked
+   before the list is built).
+4. Never add a target that can place an emergency call: the emergency gate is
+   in `CallExecutor.EmergencyNumbers`, `calls.is_emergency_number()`,
+   `ui.isEmergencyNumber()` and the `Call back` handler, and all four must
+   agree on the digit list.
+5. Tests: a pure-JVM test for `buildUrl` and the number normalisation; there
+   is no device-free test for package visibility.
+
 ### Change an auth or security check
 
 1. Device tokens are looked up by digest (`db.device_by_token`) and must
@@ -704,9 +1153,9 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests -q
 ```
 
-The suite collects **632 tests**; **629 pass**. Four of them do not pass for
-reasons that predate the multi-device work and are still open (three failures
-and one error):
+The suite collects **738 tests**: **734 passed, 3 failed, 1 error**. The
+four non-passing tests do not pass for reasons that predate the multi-device
+work and are still open:
 
 - `tests/test_commands.py::test_search_by_name_suggests_contacts`
 - `tests/test_commands.py::test_contacts_are_uploaded_and_searchable`
@@ -734,6 +1183,7 @@ Useful focused runs:
 .venv/bin/python -m pytest tests/test_miniapp_send.py -q
 .venv/bin/python -m pytest tests/test_pairing.py tests/test_devices.py -q
 .venv/bin/python -m pytest tests/test_device_isolation.py -q
+.venv/bin/python -m pytest tests/test_calls.py tests/test_call_actions.py -q
 ```
 
 Test modules: `test_db`, `test_delivery`, `test_ingest`, `test_import`,
@@ -742,12 +1192,16 @@ Test modules: `test_db`, `test_delivery`, `test_ingest`, `test_import`,
 `test_updater`, `test_tg`, `test_security`, `test_config`, `test_phones`,
 `test_miniapp_auth`, `test_miniapp_inbox`, `test_miniapp_send`,
 `test_miniapp_shell`, `test_miniapp_frontend_static`, `test_app_assembly`,
-`test_set_menu_script`.
+`test_set_menu_script`, `test_calls`, `test_call_actions`.
 
 There are no Android instrumentation tests and no JavaScript test runner. The
 Mini App tests are Python static assertions plus API tests. If you change the
 Android app, state clearly in the log that it was not built or tested on the
-VPS.
+VPS. A change to the Messages or Phone-home screens is proven only by the
+`android-build` GitHub Actions workflow, which must publish
+`sms-relay-debug.apk` on the rolling `android-latest` release; the screen
+behaviour itself still needs a manual device matrix (dialer role, locked-screen
+calls, dual SIM, emergency, provider/vendor quirks, notifications).
 
 ## 9. Debugging and operations
 
@@ -859,12 +1313,114 @@ VPS.
     are cleared and `telegram_deleted_at` is set. A reaper bug that deletes
     chat messages must never be able to reach the history through
     `messages`.
+23. **`callback_data` is capped at 64 bytes.** A call message carries
+    `call:answer:<device>`, and a device id long enough to break the cap makes
+    `_call_keyboard()` return `None`: the message goes out with **no** buttons,
+    because Telegram rejects the whole message when a `reply_markup` is
+    invalid. Do not "fix" it by truncating the device id — the bot could not
+    answer for a device that does not exist.
+24. **A disconnected session is live for only 60 s.** `session_is_live()`
+    keeps `disconnected` for `LIVE_DISCONNECTED_GRACE_S` so the Mini App can
+    render "call ended"; after that the card and the missed badge see an idle
+    device. An action created against a ref in that window is still refused:
+    `session_actionable()` excludes `disconnected`.
+25. **`dial` has `call_ref=""`.** It is the only action without a live call;
+    its `payload` is the normalised destination. The phone must therefore never
+    apply `call_ref` logic to a `dial`, and a retry has to be recognised by
+    `client_ref` (the partial unique index) — not by the ref.
+26. **The phone must refuse a mismatched or expired ref.** The server already
+    refuses `409 stale_call`, but a report and an action can cross on the
+    network. `CallExecutor` compares the action's `call_ref` with the call it
+    owns and reports `rejected` instead of acting on the current call. Never
+    relax that check to "the call that is up".
+27. **Emergency numbers are a four-way contract.**
+    `CallExecutor.EmergencyNumbers` (Android), `calls.is_emergency_number()`
+    (backend), `ui.isEmergencyNumber()` (Mini App) and the `Call back`
+    handler in `updater.py` must agree, and the comparison is on digits with
+    leading zeros stripped so `0112` resolves to `112`. A number added to one
+    list and not the others is a remote-dial path for an emergency service.
+28. **MMS and RCS are boundaries, not bugs.** RCS runs on Google's private
+    backend and has no public API; MMS has no decoder or sender in this tree
+    (`MmsReceiver` acknowledges a WAP push and ignores it). `content://sms`
+    threads cannot represent a group MMS conversation. Do not promise either
+    in the UI, and do not try to read `content://mms` without a PDU phase.
+29. **Google's assets and identity are off limits.** The dialer/messages
+    layout may follow the flow in `UI_DESIGN.md`, but Google icons, wordmarks,
+    animations and code must not be copied. Use Material Symbols or original
+    vector paths only.
+30. **An imported or legacy call has no live session.** A `call_log` row from
+    the sync is history even when `started_at` is recent; the live card reads
+    `call_sessions` only. Do not synthesise a session from a log row: it would
+    offer Answer for a call that already ended.
+31. **A non-`dial` action claimed on the idle path is rejected, not run.**
+    `CommandWorker.runIdleDialActions()` runs only `dial`; any other action it
+    claims has no live call, so it reports `rejected` with `no live call` and
+    the row reaches a terminal state instead of being stranded. The action was
+    already consumed by the atomic claim, so it cannot be re-delivered; the
+    report is the only way out. That report is **not retried**: if it fails on
+    the network, `ok` goes false and the poll chain retries, but this row is
+    already `delivered` and never comes back, so it stays `delivered` for ever
+    and the Mini App sees no result. A verb that must work while idle still
+    needs an explicit branch here rather than a wider report.
+32. **A group has no single address.** `SmsThread.recipients` holds every
+    resolved `recipient_ids` entry; two or more means a group, and a group's
+    `address` is deliberately empty. Never take `recipients.first()` as "the
+    number" — that turns a group into a private chat with one member, and the
+    thread screen would then offer that member's call button and composer.
+    Resolve every id in `canonical-addresses`, and label via `ThreadLabels`
+    only.
+33. **An MMS-only thread looks like an empty thread.** `content://sms` has no
+    rows for it, so the screen infers MMS from "empty page **and** a non-blank
+    provider snippet" (`ThreadActivity.isMmsOnly()`), and only after the first
+    page has loaded. A blank `address` with rows is a different case: an
+    unresolved canonical address, which gets its own sentence. Do not merge
+    the two, and do not show a composer for either.
+34. **`content://sms` is not the relay's Room queue.** The Messages screens
+    read the phone's store; `MessageRecord`/`MessageDao` are the upload queue
+    and must never be rendered as a conversation (and the provider rows must
+    never be uploaded as live SMS — the mirror goes through `POST /import`).
+    Confusing the two produces either a duplicate upload or a thread that
+    disagrees with the phone's own messaging app.
+35. **`sendingEnabled` is a remote-command switch.** It gates
+    `CommandWorker` and `FallbackPolicy`, not the local composer. Adding it to
+    `ThreadActivity` would block the owner from texting on their own phone;
+    removing it from the command path would let Telegram send without consent.
+    Keep it where it is.
+36. **The relay mirror is best effort, by design.** The local provider row is
+    written first and the `POST /import` comes after it, on a background
+    thread, with its result ignored except for a category log line. Do not
+    make the screen wait for it, do not retry it from the send path, and do not
+    turn a mirror failure into a send failure. A durable outbound queue is a
+    separate feature that does not exist yet.
+37. **The provider can refuse, and a refusal is not a crash.**
+    `content://sms`, `content://mms-sms/*`, `CallLog.Calls` and
+    `ContactsContract` all answer `SecurityException` or a null cursor when a
+    role or permission is missing. `SmsRepository` and `DialerRepository`
+    return an empty result plus `failed`/`denied`; the screens draw a note.
+    Every new read must do the same, and must never log a number, a name or a
+    body.
+38. **A Phone-home row never places a call.** `DialerHomeActivity` opens
+    `ACTION_DIAL` with `tel:<number>`; `ACTION_CALL` would skip the dialpad
+    and the platform's emergency handling and could dial an emergency number
+    from one touch on a log row. The dialpad (`DialerActivity`) is the only
+    place that routes an emergency call, and it needs no network.
+39. **No Google assets.** The Messages screens and the Phone home follow the
+    layout and flow in `UI_DESIGN.md`, not Google's assets: no Google icons,
+    wordmarks, animations or code, and no `ACTION_CALL` shortcut that pretends
+    to be Google Dialer. Use Material Symbols or original vector paths and the
+    stock Material 3 theme (`Theme.SmsRelay.Messages`).
 
 ## 11. Definition of done
 - [ ] The requested behavior is implemented or the investigation is complete.
 - [ ] Relevant tests pass, or the inability to run them is recorded.
+- [ ] A local send appears in the thread it was sent from, and — when the phone
+      is paired — the outbound bubble also appears in the Mini App. A local
+      send never depends on the relay: an unpaired phone still texts, and a
+      failed mirror leaves the local message and its bubble intact.
 - [ ] Per-device isolation is verified: no query, route or UI path reads or
-      writes conversation, contact or read data of another device.
+      writes conversation, contact, call or read data of another device.
+- [ ] The dialer works offline, and an emergency call never depends on the
+      backend: no pairing, no network, no remote action.
 - [ ] README/guide updated if behavior, contracts, commands, env vars, or
       limitations changed.
 - [ ] `docs/AGENT_LOG.md` has a new appended entry with date, agent, task,

@@ -5,4 +5,4 @@
 // The version query is a cache-buster, not a build id: an installed
 // Telegram WebView keeps the first copy of a module it fetched, so a
 // changed scanner wrapper only reaches the client under a new URL.
-import "./js/app.js?v=20261116-pair";
+import "./js/app.js?v=20261117-calls";

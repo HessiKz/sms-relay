@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A rounded white shape. The colour always comes from the view that
+     uses it (`android:backgroundTint`), so the same drawable is the
+     unread dot and the unread counter and follows light and dark mode. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="12dp" />
+    <solid android:color="@android:color/white" />
+</shape>

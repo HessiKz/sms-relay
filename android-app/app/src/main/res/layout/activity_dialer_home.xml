@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Phone home: the dialer hub of the app.
+
+     One vertical column - toolbar, tab strip, the optional permission
+     notes and one list - plus the dialpad FAB over it. A single list is
+     reused for every tab; only its adapter changes, so the scroll
+     position, the ripples and the insets are set up exactly once.
+
+     The FAB floats over the list, whose bottom padding reserves its
+     height, so the last row can always be scrolled clear of it. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootDialerHome"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/colorSurface">
+
+    <LinearLayout
+        android:id="@+id/layoutDialerContent"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <!-- The same menu file as the Messages home: search, "Dialer" for
+             the full dialpad and "Setup". Their handlers differ, the
+             labels do not. -->
+        <com.google.android.material.appbar.MaterialToolbar
+            android:id="@+id/toolbarDialer"
+            android:layout_width="match_parent"
+            android:layout_height="?attr/actionBarSize"
+            android:background="?attr/colorSurface"
+            app:menu="@menu/menu_shell"
+            app:title="@string/dialer_title"
+            app:titleTextColor="?attr/colorOnSurface" />
+
+        <!-- Favorites / Recents / Contacts / Voicemail. Fixed and filled:
+             four short labels fit any phone width, and the strip must not
+             scroll away from the thumb. -->
+        <com.google.android.material.tabs.TabLayout
+            android:id="@+id/tabDialer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?attr/colorSurface"
+            app:tabGravity="fill"
+            app:tabMode="fixed"
+            app:tabTextAppearance="?attr/textAppearanceTitleSmall" />
+
+        <!-- The permission notes, added in code only when needed. -->
+        <LinearLayout
+            android:id="@+id/layoutDialerBanners"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="16dp"
+            android:paddingTop="4dp"
+            android:paddingEnd="16dp" />
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1">
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/listDialer"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:clipToPadding="false"
+                android:paddingBottom="@dimen/messages_list_bottom_padding"
+                android:scrollbars="vertical" />
+
+            <!-- The empty, denied, error and voicemail states. It is one
+                 column with an optional button, because "nothing here" and
+                 "visual voicemail is your carrier's" both need a sentence
+                 and, sometimes, one tap out. -->
+            <LinearLayout
+                android:id="@+id/layoutDialerState"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:gravity="center"
+                android:orientation="vertical"
+                android:paddingStart="32dp"
+                android:paddingTop="24dp"
+                android:paddingEnd="32dp"
+                android:paddingBottom="24dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/textDialerState"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center"
+                    android:textAppearance="?attr/textAppearanceBodyLarge"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/buttonDialerState"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:minHeight="48dp"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <ProgressBar
+                android:id="@+id/progressDialer"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:indeterminate="true"
+                android:visibility="gone" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <!-- The dialpad. Circular on purpose: it is the one action of the
+         screen that is always one tap away, and a round button does not
+         cover a second row of text the way an extended one would. -->
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/fabDialpad"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="16dp"
+        android:layout_marginBottom="16dp"
+        android:contentDescription="@string/dialer_open_dialpad"
+        app:backgroundTint="?attr/colorPrimaryContainer"
+        app:srcCompat="@drawable/ic_dialpad_fab"
+        app:tint="?attr/colorOnPrimaryContainer" />
+</FrameLayout>

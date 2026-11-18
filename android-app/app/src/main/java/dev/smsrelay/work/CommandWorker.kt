@@ -1,11 +1,16 @@
 package dev.smsrelay.work
 
 import android.content.Context
+import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import dev.smsrelay.BuildConfig
 import dev.smsrelay.SettingsStore
 import dev.smsrelay.contacts.ContactResolver
+import dev.smsrelay.calls.CallActionGuard
+import dev.smsrelay.calls.CallActionNames
+import dev.smsrelay.calls.CallExecutor
+import dev.smsrelay.calls.LiveCallRegistry
 import dev.smsrelay.data.CommandDatabase
 import dev.smsrelay.data.HandledCommandEntity
 import dev.smsrelay.net.RelayClient
@@ -215,11 +220,100 @@ class CommandWorker(
         // Old rows are dropped: the backend forgets them as well.
         dao.prune(System.currentTimeMillis() - RETENTION_MS)
 
+        // 4) Call actions while no call is up.
+        //
+        // The live poll belongs to CallService: it long-polls every call
+        // and runs every action. Here only a `dial` is meaningful, and
+        // only while no call is up - running a second poller next to the
+        // service would be two consumers of one queue. The server marks a
+        // handed-out row `delivered` atomically, so even a race here can
+        // never run one action twice.
+        if (!runIdleDialActions(client)) retryNeeded = true
+
         // The next poll of the chain: WorkManager does not allow a periodic
         // work below 15 minutes, so the short cadence is a chain.
         Schedule.enqueueNextCommandPoll(applicationContext)
 
         if (retryNeeded) Result.retry() else Result.success()
+    }
+
+    /**
+     * Runs the `dial` actions that arrived while the phone is idle.
+     *
+     * Only `dial` is executed here: every other action names a live call
+     * and belongs to the running [dev.smsrelay.calls.CallService], whose
+     * own long-poll is the only place they are safe to run.
+     *
+     * But the server claims a batch of up to ten rows and marks them all
+     * `delivered` whatever their kind. So a non-`dial` row can land here -
+     * a race with a starting call, a row stranded when the service died,
+     * a manually created one - and if this worker dropped it silently the
+     * admin would wait for a result that never comes. It is therefore
+     * reported `rejected` with "no live call": a terminal answer that the
+     * server and the Mini App can show, without touching any call.
+     *
+     * Returns false when a report did not arrive and the run should
+     * retry.
+     */
+    private fun runIdleDialActions(client: RelayClient): Boolean {
+        // A live call owns the queue: CallService polls it.
+        if (LiveCallRegistry.isBusy) return true
+        val actions = client.pollCallActions(0)
+        if (actions.isEmpty()) return true
+        val guard = CallActionGuard(applicationContext)
+        var ok = true
+        for (action in actions) {
+            if (action.action != CallActionNames.DIAL) {
+                // Nothing here can run it: there is no live call. The
+                // row is already `delivered`, so saying so is the only
+                // way it can ever reach a terminal state.
+                Log.i(TAG_CALLS, "idle poll rejects action kind: " + action.action)
+                if (!client.reportCallAction(
+                        action.id,
+                        RESULT_REJECTED,
+                        DETAIL_NO_LIVE_CALL
+                    )
+                ) {
+                    // The report did not land. Nothing is re-executed and
+                    // no report is queued: the retry re-polls, and this
+                    // row is already `delivered`, so it will not come
+                    // back. The flag is still set, because a failed
+                    // report is a failed run and the admin should see it
+                    // rather than a silent success.
+                    ok = false
+                }
+                continue
+            }
+            // The guard is written before the radio is touched, so a
+            // repeated poll or a restart cannot dial twice.
+            val claim = guard.claim(action.id)
+            if (claim != CallActionGuard.Claim.GRANTED) {
+                if (claim == CallActionGuard.Claim.DUPLICATE) {
+                    Log.i(TAG_CALLS, "idle dial already executed")
+                    client.reportCallAction(action.id, RESULT_DONE, null)
+                } else {
+                    // No durable id, no call: the guard is the promise.
+                    Log.w(TAG_CALLS, "idle dial guard unavailable")
+                    if (!client.reportCallAction(
+                            action.id,
+                            "failed",
+                            CallExecutor.DETAIL_REFUSED
+                        )
+                    ) {
+                        ok = false
+                    }
+                }
+                continue
+            }
+            val result = CallExecutor.placeDial(applicationContext, action.payload)
+            Log.i(TAG_CALLS, "idle dial -> " + result.status)
+            if (!client.reportCallAction(action.id, result.status, result.detail)) {
+                // The dial itself happened: a lost report must never
+                // become a second call, so it is not retried here.
+                ok = false
+            }
+        }
+        return ok
     }
 
     /**
@@ -264,5 +358,22 @@ class CommandWorker(
 
         /** The target was neither a number nor a contact of the phone. */
         const val DETAIL_UNKNOWN_CONTACT = "unknown contact"
+
+        /** A `dial` action that was already executed by an earlier run. */
+        private const val RESULT_DONE = "done"
+
+        /** The terminal statuses of `POST /calls/actions/{id}/result`. */
+        private const val RESULT_REJECTED = "rejected"
+
+        /**
+         * Why a non-`dial` action cannot run in the idle worker.
+         *
+         * Short and inside the server's 200-character limit, and it says
+         * nothing about the phone beyond the fact that no call is up.
+         */
+        private const val DETAIL_NO_LIVE_CALL = "no live call"
+
+        /** Log tag of the call-action lines of this worker. */
+        private const val TAG_CALLS = "CommandWorker.calls"
     }
 }

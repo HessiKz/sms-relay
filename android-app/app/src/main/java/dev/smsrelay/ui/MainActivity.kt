@@ -25,6 +25,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.constraintlayout.widget.ConstraintSet
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.work.WorkInfo
@@ -33,6 +35,9 @@ import dev.smsrelay.R
 import dev.smsrelay.SettingsStore
 import dev.smsrelay.contacts.ContactsSync
 import dev.smsrelay.contacts.ContactResolver
+import dev.smsrelay.calls.CallLogDatabase
+import dev.smsrelay.calls.CallLogWorker
+import dev.smsrelay.calls.DialerActivity
 import dev.smsrelay.data.AppDatabase
 import dev.smsrelay.data.MessageRecord
 import dev.smsrelay.net.RelayClient
@@ -91,6 +96,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var textComposeStatus: TextView
     private lateinit var textCommandStatus: TextView
 
+    // The call log card.
+    private lateinit var textCallPermissions: TextView
+    private lateinit var buttonCallPermissions: Button
+    private lateinit var buttonSyncCalls: Button
+    private lateinit var buttonOpenDialer: Button
+    private lateinit var textCallSyncState: TextView
+
+    /**
+     * The dialer role controls of the Calls card.
+     *
+     * They are added in code instead of the layout file: the calls card
+     * already exists and the role is a second question on the same card.
+     * [installDialerRoleControls] inserts them under the "Open dialpad"
+     * button and moves the sync line down, so nothing overlaps.
+     */
+    private var buttonDialerRole: Button? = null
+    private var textDialerRoleState: TextView? = null
+
+    /** Set when the role was asked for before the permissions were given. */
+    private var pendingDialerRole = false
+
     // The pairing of this phone with the server.
     private lateinit var buttonPair: Button
     private lateinit var buttonNewCode: Button
@@ -114,6 +140,19 @@ class MainActivity : AppCompatActivity() {
     )
 
     /**
+     * The permissions of the call card. They are asked for separately:
+     * the SMS group is hard restricted until the app is the default SMS
+     * app, while the call log has a group of its own and can be granted
+     * without any role.
+     */
+    private val callPermissions = arrayOf(
+        Manifest.permission.READ_CALL_LOG,
+        Manifest.permission.WRITE_CALL_LOG,
+        Manifest.permission.CALL_PHONE,
+        Manifest.permission.ANSWER_PHONE_CALLS
+    )
+
+    /**
      * The system dialog that asks for the default SMS app.
      *
      * The answer of the user decides what happens next: only a granted
@@ -133,6 +172,65 @@ class MainActivity : AppCompatActivity() {
      * back and the app is the default SMS app by then.
      */
     private var waitingForDefaultSmsChoice = false
+
+    /**
+     * The runtime dialog for the call permissions.
+     *
+     * A denial is a normal answer, not an error: the card is re-read and
+     * says what is still missing. The app never crashes and never nags.
+     */
+    private val callPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        updateCallCard()
+        // Only the call permissions count here: the notification
+        // permission is not a reason to sync, and a dialog that granted
+        // nothing but notifications must not look like a success.
+        val grantedCall = grants.count { (permission, granted) ->
+            granted && permission in callPermissions
+        }
+        if (grantedCall > 0) {
+            // Something was allowed: a sync may be able to run now.
+            if (hasCallLogPermission()) startCallSync()
+        } else if (!hasAllCallPermissions()) {
+            // Nothing was allowed and the card is still incomplete: say
+            // so. A dialog that only granted notifications is not an
+            // error and must not be reported as one.
+            Toast.makeText(
+                this,
+                R.string.status_calls_no_permission,
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        // The role was asked for before the permissions: Android never
+        // grants it to an app that cannot place or answer a call, so the
+        // request is repeated now that something was allowed.
+        if (pendingDialerRole && hasAllCallPermissions()) {
+            pendingDialerRole = false
+            requestDialerRole()
+        }
+    }
+
+    /**
+     * The system dialog that asks for the dialer role.
+     *
+     * The result code is ignored on purpose: a vendor build can answer
+     * RESULT_OK and change nothing, or answer RESULT_CANCELED after the
+     * user actually agreed. Only [RoleState.isDialerRoleHeld] decides,
+     * and it is read in [onResume] as well.
+     */
+    private val dialerRoleLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (RoleState.isDialerRoleHeld(this)) {
+            Toast.makeText(this, R.string.action_dialer_role_granted, Toast.LENGTH_SHORT).show()
+        } else if (result.resultCode == Activity.RESULT_OK) {
+            Toast.makeText(this, R.string.action_dialer_role_not_applied, Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(this, R.string.action_dialer_role_refused, Toast.LENGTH_LONG).show()
+        }
+        updateCallCard()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -169,6 +267,11 @@ class MainActivity : AppCompatActivity() {
         buttonSendSms = findViewById(R.id.buttonSendSms)
         textComposeStatus = findViewById(R.id.textComposeStatus)
         textCommandStatus = findViewById(R.id.textCommandStatus)
+        textCallPermissions = findViewById(R.id.textCallPermissions)
+        buttonCallPermissions = findViewById(R.id.buttonCallPermissions)
+        buttonSyncCalls = findViewById(R.id.buttonSyncCalls)
+        buttonOpenDialer = findViewById(R.id.buttonOpenDialer)
+        textCallSyncState = findViewById(R.id.textCallSyncState)
         buttonPair = findViewById(R.id.buttonPair)
         buttonNewCode = findViewById(R.id.buttonNewCode)
         textPairState = findViewById(R.id.textPairState)
@@ -228,9 +331,17 @@ class MainActivity : AppCompatActivity() {
         buttonSendSms.setOnClickListener { sendComposedSms() }
         buttonSyncContacts.setOnClickListener { syncContactsNow() }
         buttonImportSms.setOnClickListener { confirmImport() }
+        buttonCallPermissions.setOnClickListener { requestCallPermissions() }
+        buttonSyncCalls.setOnClickListener { startCallSync() }
+        buttonOpenDialer.setOnClickListener {
+            startActivity(Intent(this, DialerActivity::class.java))
+        }
         buttonPair.setOnClickListener { startPairing() }
         buttonNewCode.setOnClickListener { confirmNewPairingCode() }
+        installDialerRoleControls()
         observeImport()
+        observeCallSync()
+        updateCallCard()
         refreshPairingUi()
     }
 
@@ -241,6 +352,7 @@ class MainActivity : AppCompatActivity() {
         setupSimSelector()
         refreshStatus()
         refreshPairingUi()
+        updateCallCard()
         // A pairing that was running when the app was closed goes on.
         pairing.resume()
         if (waitingForDefaultSmsChoice) {
@@ -994,6 +1106,424 @@ class MainActivity : AppCompatActivity() {
             ImportWorker.ERROR_SERVER -> R.string.import_error_server
             ImportWorker.ERROR_READ -> R.string.import_error_read
             else -> R.string.import_error_unknown
+        }
+    )
+
+    // ------------------------------------------------------------------
+    // Calls
+    // ------------------------------------------------------------------
+
+    /** True while the call-sync job owns the status line. */
+    private var callSyncRunning = false
+
+    /**
+     * Adds the dialer-role button and its state line to the Calls card.
+     *
+     * The card is a `ConstraintLayout`; the two views are inserted under
+     * the "Open dialpad" button and the sync line is pushed below them,
+     * so the card grows without overlapping anything. The ids are
+     * generated, which is why the fields above hold the references.
+     */
+    private fun installDialerRoleControls() {
+        val parent = buttonOpenDialer.parent as? ConstraintLayout ?: return
+        if (buttonDialerRole != null) return
+
+        val button = Button(this).apply {
+            id = View.generateViewId()
+            text = getString(R.string.action_request_dialer_role)
+            isAllCaps = false
+            setOnClickListener { requestDialerRole() }
+        }
+        val state = TextView(this).apply {
+            id = View.generateViewId()
+            setText(R.string.calls_role_explanation)
+        }
+
+        parent.addView(button, ConstraintLayout.LayoutParams(
+            ConstraintLayout.LayoutParams.WRAP_CONTENT,
+            ConstraintLayout.LayoutParams.WRAP_CONTENT
+        ))
+        parent.addView(state, ConstraintLayout.LayoutParams(
+            ConstraintLayout.LayoutParams.MATCH_CONSTRAINT,
+            ConstraintLayout.LayoutParams.WRAP_CONTENT
+        ))
+
+        val set = ConstraintSet()
+        set.clone(parent)
+        set.connect(
+            button.id, ConstraintSet.TOP,
+            buttonOpenDialer.id, ConstraintSet.BOTTOM, 0
+        )
+        set.connect(button.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START, 0)
+        set.connect(
+            state.id, ConstraintSet.TOP,
+            button.id, ConstraintSet.BOTTOM, 0
+        )
+        set.connect(state.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START, 0)
+        set.connect(state.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END, 0)
+        // The sync line used to sit under the dialpad button; it moves
+        // under the role state so both lines stay readable.
+        set.connect(
+            textCallSyncState.id, ConstraintSet.TOP,
+            state.id, ConstraintSet.BOTTOM, 0
+        )
+        set.applyTo(parent)
+
+        buttonDialerRole = button
+        textDialerRoleState = state
+    }
+
+    /**
+     * The dialer-role question of the Calls card.
+     *
+     * Three answers are possible, and each one says what to do:
+     *  - the app holds the role: nothing to ask, and the card says so;
+     *  - the phone offers the role: a button asks for it;
+     *  - the phone does not offer it (no telephony, a vendor build that
+     *    removed it): the button opens the default-apps settings and the
+     *    line explains that the phone has no role.
+     */
+    private fun updateDialerRoleCard() {
+        val button = buttonDialerRole ?: return
+        val state = textDialerRoleState ?: return
+        val held = RoleState.isDialerRoleHeld(this)
+        val available = held || RoleState.isDialerRoleAvailable(this)
+        button.isEnabled = !held
+        button.text = getString(
+            if (held) R.string.calls_role_held else R.string.action_request_dialer_role
+        )
+        state.text = getString(
+            when {
+                held -> R.string.calls_role_held_hint
+                available -> R.string.calls_role_explanation
+                else -> R.string.calls_role_unavailable
+            }
+        )
+    }
+
+    /**
+     * Asks for the dialer role.
+     *
+     * The call permissions come first: Android does not grant the role
+     * to an app that cannot place or answer a call, and the system
+     * dialog would simply refuse without saying why. When a permission
+     * is still missing the request is remembered and repeated as soon as
+     * something is granted.
+     */
+    private fun requestDialerRole() {
+        if (RoleState.isDialerRoleHeld(this)) {
+            Toast.makeText(this, R.string.calls_role_held, Toast.LENGTH_SHORT).show()
+            updateCallCard()
+            return
+        }
+        if (!hasAllCallPermissions()) {
+            pendingDialerRole = true
+            Toast.makeText(this, R.string.call_perm_needed_for_role, Toast.LENGTH_LONG).show()
+            requestCallPermissions()
+            return
+        }
+        val intent = RoleState.dialerRoleIntent(this)
+        if (intent == null) {
+            // No role on this phone: the default-apps settings are the
+            // only place the choice can be made.
+            if (!openDefaultAppsSettings()) {
+                Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        val launched = runCatching { dialerRoleLauncher.launch(intent) }.isSuccess
+        if (!launched && !openDefaultAppsSettings()) {
+            Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * The default-apps screen, where the dialer can be chosen by hand.
+     *
+     * The first screen the phone can open wins; the app details page is
+     * always there as the last resort.
+     */
+    private fun openDefaultAppsSettings(): Boolean {
+        if (tryStart(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))) {
+            Toast.makeText(this, R.string.action_dialer_role_settings, Toast.LENGTH_LONG).show()
+            return true
+        }
+        if (tryStart(Diagnostics.appDetailsIntent(this))) {
+            Toast.makeText(this, R.string.calls_role_unavailable, Toast.LENGTH_LONG).show()
+            return true
+        }
+        return false
+    }
+
+    /**
+     * The call card: what is allowed, how the queue looks and whether the
+     * dialpad is reachable.
+     *
+     * Only cheap reads happen here; the row counts come from Room, which
+     * refuses a query on the main thread, so [refreshCallCount] does them
+     * on a short-lived thread - the same pattern [refreshStatus] uses for
+     * the SMS queue.
+     */
+    private fun updateCallCard() {
+        textCallPermissions.text = callPermissionText()
+        // The notification permission is asked for by the same button, so
+        // a phone whose call permissions are complete can still have a
+        // reason to tap it.
+        buttonCallPermissions.isEnabled =
+            !hasAllCallPermissions() || notificationPermissionMissing()
+        // Wave 2: the app can hold the role, so the card offers it and
+        // reports it in plain words instead of a content description.
+        buttonOpenDialer.contentDescription = getString(
+            if (RoleState.isDialerRoleHeld(this)) {
+                R.string.calls_role_held
+            } else {
+                R.string.calls_role_not_yet
+            }
+        )
+        updateDialerRoleCard()
+        if (!hasCallLogPermission()) {
+            textCallSyncState.text = getString(R.string.status_calls_no_permission)
+        } else if (!callSyncRunning) {
+            refreshCallCount()
+        }
+    }
+
+    /** Reads the queue counts and writes the idle state line. */
+    private fun refreshCallCount() {
+        val lastSync = settings.lastCallSyncAt
+        Thread {
+            val dao = runCatching {
+                CallLogDatabase.get(this).callLogDao()
+            }.getOrNull()
+            val stored = runCatching { dao?.countStored() ?: 0 }.getOrDefault(0)
+            val queued = runCatching { dao?.countQueued() ?: 0 }.getOrDefault(0)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                // A running job owns the line until it reports back.
+                if (callSyncRunning) return@runOnUiThread
+                textCallSyncState.text = idleCallSyncText(stored, queued, lastSync)
+            }
+        }.start()
+    }
+
+    /** What the card says while no job is running. */
+    private fun idleCallSyncText(stored: Int, queued: Int, lastSync: Long): String =
+        buildString {
+            if (stored <= 0 && lastSync <= 0L) {
+                append(getString(R.string.status_calls_none))
+            } else {
+                val whenText = if (lastSync > 0L) {
+                    RelativeTime.describe(this@MainActivity, lastSync)
+                } else {
+                    getString(R.string.status_never)
+                }
+                append(getString(R.string.status_calls_synced, stored, whenText))
+            }
+            if (queued > 0) {
+                append('\n')
+                append(getString(R.string.status_calls_queued, queued))
+            }
+        }
+
+    /** Each permission of the call group in one line, in plain words. */
+    private fun callPermissionText(): String {
+        val granted = { permission: String ->
+            ContextCompat.checkSelfPermission(this, permission) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+        val lines = listOf(
+            if (granted(Manifest.permission.READ_CALL_LOG)) {
+                R.string.call_perm_read_yes
+            } else {
+                R.string.call_perm_read_no
+            },
+            if (granted(Manifest.permission.WRITE_CALL_LOG)) {
+                R.string.call_perm_write_yes
+            } else {
+                R.string.call_perm_write_no
+            },
+            if (granted(Manifest.permission.CALL_PHONE)) {
+                R.string.call_perm_call_yes
+            } else {
+                R.string.call_perm_call_no
+            },
+            if (granted(Manifest.permission.ANSWER_PHONE_CALLS)) {
+                R.string.call_perm_answer_yes
+            } else {
+                R.string.call_perm_answer_no
+            }
+        )
+        return buildString {
+            for (line in lines) {
+                if (isNotEmpty()) append('\n')
+                append(getString(line))
+            }
+            if (notificationPermissionMissing()) {
+                append('\n')
+                append(getString(R.string.call_perm_notify_no))
+            }
+            if (!hasAllCallPermissions()) {
+                append('\n')
+                append(getString(R.string.call_perm_hint))
+            }
+        }
+    }
+
+    private fun hasCallLogPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun hasAllCallPermissions(): Boolean = callPermissions.all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Asks for the missing permissions of the call group.
+     *
+     * A denied permission is remembered by Android: asking again would
+     * show nothing. In that case the app details screen is the only way
+     * left, and the user is sent there instead of to a silent dialog.
+     */
+    private fun requestCallPermissions() {
+        val missing = callPermissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        // Android 13+ asks for the in-call notification separately, so it
+        // is requested here but deliberately kept out of
+        // [hasAllCallPermissions]: a "no" to notifications must never
+        // stand between the user and the dialer role.
+        val wanted = if (notificationPermissionMissing()) {
+            missing + Manifest.permission.POST_NOTIFICATIONS
+        } else {
+            missing
+        }
+        if (wanted.isEmpty()) {
+            Toast.makeText(
+                this,
+                R.string.action_call_permissions_granted,
+                Toast.LENGTH_SHORT
+            ).show()
+            updateCallCard()
+            return
+        }
+        val permanentlyDenied = missing.any {
+            !ActivityCompat.shouldShowRequestPermissionRationale(this, it)
+        }
+        // Only READ_CALL_LOG is needed to sync; the others are optional
+        // and are asked for anyway, because a call the user answers from
+        // the relay needs them.
+        if (missing.isNotEmpty() && permanentlyDenied && missing.size == callPermissions.size) {
+            Toast.makeText(this, R.string.call_perm_hint, Toast.LENGTH_LONG).show()
+            start(Diagnostics.appDetailsIntent(this))
+            return
+        }
+        callPermissionLauncher.launch(wanted.toTypedArray())
+    }
+
+    /**
+     * True when the in-call notification would be dropped silently.
+     *
+     * Android 13 introduced the runtime permission; before it, posting a
+     * notification needs no grant at all.
+     */
+    private fun notificationPermissionMissing(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+
+    /** Runs the call sync now; the worker itself is resumable. */
+    private fun startCallSync() {
+        if (!hasCallLogPermission()) {
+            Toast.makeText(
+                this,
+                R.string.status_calls_no_permission,
+                Toast.LENGTH_LONG
+            ).show()
+            requestCallPermissions()
+            return
+        }
+        if (!settings.hasToken()) {
+            Toast.makeText(
+                this,
+                R.string.import_error_not_paired,
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        Schedule.enqueueCallLog(this)
+    }
+
+    /** Progress of the one call-sync job, straight from WorkManager. */
+    private fun observeCallSync() {
+        WorkManager.getInstance(this)
+            .getWorkInfosForUniqueWorkLiveData(Schedule.UNIQUE_CALL_LOG)
+            .observe(this) { infos -> renderCallSyncState(infos.firstOrNull()) }
+    }
+
+    private fun renderCallSyncState(info: WorkInfo?) {
+        if (info == null) {
+            callSyncRunning = false
+            buttonSyncCalls.isEnabled = true
+            updateCallCard()
+            return
+        }
+        when (info.state) {
+            WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED -> {
+                callSyncRunning = true
+                buttonSyncCalls.isEnabled = false
+                textCallSyncState.text = getString(R.string.status_calls_waiting)
+            }
+
+            WorkInfo.State.RUNNING -> {
+                callSyncRunning = true
+                buttonSyncCalls.isEnabled = false
+                val progress = info.progress
+                textCallSyncState.text = getString(
+                    R.string.status_calls_running,
+                    progress.getInt(CallLogWorker.KEY_PROCESSED, 0)
+                )
+            }
+
+            WorkInfo.State.SUCCEEDED -> {
+                callSyncRunning = false
+                buttonSyncCalls.isEnabled = true
+                val result = info.outputData
+                textCallSyncState.text = getString(
+                    R.string.status_calls_done,
+                    result.getInt(CallLogWorker.KEY_INSERTED, 0),
+                    result.getInt(CallLogWorker.KEY_UPDATED, 0),
+                    result.getInt(CallLogWorker.KEY_UNCHANGED, 0),
+                    result.getInt(CallLogWorker.KEY_FAILED, 0)
+                )
+            }
+
+            WorkInfo.State.FAILED -> {
+                callSyncRunning = false
+                buttonSyncCalls.isEnabled = true
+                val reason = info.outputData.getString(CallLogWorker.KEY_ERROR).orEmpty()
+                textCallSyncState.text = getString(
+                    R.string.status_calls_failed,
+                    callSyncError(reason)
+                )
+            }
+
+            else -> {
+                callSyncRunning = false
+                buttonSyncCalls.isEnabled = true
+                updateCallCard()
+            }
+        }
+    }
+
+    private fun callSyncError(reason: String): String = getString(
+        when (reason) {
+            CallLogWorker.ERROR_NO_PERMISSION -> R.string.calls_error_no_permission
+            CallLogWorker.ERROR_NOT_PAIRED -> R.string.calls_error_not_paired
+            CallLogWorker.ERROR_SERVER -> R.string.calls_error_server
+            CallLogWorker.ERROR_READ -> R.string.calls_error_read
+            else -> R.string.calls_error_unknown
         }
     )
 

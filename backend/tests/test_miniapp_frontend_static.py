@@ -52,9 +52,9 @@ def test_shell_keeps_base_and_telegram_sdk():
     # The entry and the modulepreload of the entry carry the cache-buster,
     # so an already installed WebView fetches the updated bundle.
     assert re.search(
-        r'<script[^>]+type="module"[^>]+src="assets/app\.js\?v=20261116-pair"',
+        r'<script[^>]+type="module"[^>]+src="assets/app\.js\?v=20261117-calls"',
         html)
-    assert 'rel="modulepreload" href="assets/js/app.js?v=20261116-pair"' \
+    assert 'rel="modulepreload" href="assets/js/app.js?v=20261117-calls"' \
         in html
 
 
@@ -96,15 +96,25 @@ def test_no_third_party_urls_outside_telegram():
     combined = _html() + "\n" + _all_js()
     urls = re.findall(r"https?://[^\s\"'<>)]+", combined)
     assert urls
+    # The call-via sheet needs the public https links of the apps it
+    # offers; nothing else may point off-origin.
+    allowed = (
+        "https://telegram.org/",
+        "https://wa.me/",
+        "https://t.me/",
+        "https://signal.me/",
+        "https://ble.ir/",
+        "https://rubika.ir/",
+    )
     for url in urls:
-        assert url.startswith("https://telegram.org/"), url
+        assert url.startswith(allowed), url
 
 
 def test_entry_module_loads_the_real_app():
     entry = (STATIC_ROOT / "assets" / "app.js").read_text(encoding="utf-8")
-    assert './js/app.js?v=20261116-pair' in entry
+    assert './js/app.js?v=20261117-calls' in entry
     # The entry is reached through the cache-busted URL of index.html.
-    assert 'src="assets/app.js?v=20261116-pair"' in _html()
+    assert 'src="assets/app.js?v=20261117-calls"' in _html()
 
 
 def test_nested_modules_are_served(client):
@@ -226,19 +236,25 @@ def test_the_scanned_code_closes_the_native_scanner():
     assert "try {" in close_source and "catch (err)" in close_source
 
 
-def test_only_the_telegram_module_is_cache_busted():
+def test_the_bundle_uses_one_cache_buster():
     app_js = _js("app.js")
     api_js = _js("api.js")
-    # One version for the wrapper, or the bundle ends up with two copies
-    # of the module and its state is computed twice.
-    assert '"./telegram.js?v=20261116-pair"' in app_js
-    assert "./telegram.js?v=20261116-pair" in api_js
-    assert '"./telegram.js"' not in app_js
+    store_js = _js("store.js")
+    version = "v=20261117-calls"
+    # One version for the whole graph, or the bundle ends up with two
+    # copies of a module and its state is computed twice.
+    for name in ("telegram.js", "store.js", "ui.js", "api.js"):
+        assert '"./' + name + "?" + version + '"' in app_js, name
+    assert "./telegram.js?" + version in api_js
+    assert "./api.js?" + version in store_js
+    assert "./ui.js?" + version in store_js
+    # No plain specifier is left behind: a bare import would be served
+    # from the cached copy and split the module identity.
+    for name in ("telegram.js", "store.js", "ui.js", "api.js"):
+        assert '"./' + name + '"' not in app_js, name
     assert '"./telegram.js"' not in api_js
-    # The rest of the graph keeps its plain, stable specifiers.
-    assert '"./store.js"' in app_js and '"./ui.js"' in app_js
-    assert '"./api.js"' in app_js
-    assert '"./api.js"' in _js("store.js")
+    assert '"./api.js"' not in store_js
+    assert '"./ui.js"' not in store_js
 
 
 def test_the_pairing_payload_forms_are_accepted():
@@ -411,3 +427,242 @@ def test_older_history_and_more_conversations_are_reachable():
     assert "load-more-chats" in app_js
     assert "loadMoreChats" in app_js
     assert "hasMore: state.chatsHasMore" in store_js
+
+
+# --- the calls surface ---------------------------------------------------
+
+
+def test_the_calls_api_client_uses_the_device_routes():
+    api_js = _js("api.js")
+    for name in ("getCalls", "getLiveCall", "sendCallAction",
+                 "markCallsRead"):
+        assert "export function " + name + "(" in api_js, name
+    # Every path hangs off the device of the bearer token route.
+    assert '"/calls"' in api_js
+    assert '"/calls/live"' in api_js
+    assert '"/calls/actions"' in api_js
+    assert '"/calls/read"' in api_js
+    # The cursor has two halves and the search one query parameter.
+    assert "params.before_ts = opts.beforeTs" in api_js
+    assert "params.before_id = opts.beforeKey" in api_js
+    assert "params.q = opts.q" in api_js
+    # The action body is idempotent through the client_ref.
+    assert "client_ref: String(opts.clientRef" in api_js
+    assert "call_ref: String(opts.callRef" in api_js
+    assert "until_ts: Math.floor(" in api_js
+    # No initData outside the header helper: no call function reads it.
+    assert "headers[AUTH_HEADER] = initData" in api_js
+    assert "initData" in api_js.split("export function")[0]
+    for name in ("getCalls", "getLiveCall", "sendCallAction",
+                 "markCallsRead"):
+        assert "initData" not in _function_source(api_js, name), name
+
+
+def test_the_store_holds_the_call_state_and_resets_it_per_device():
+    store_js = _js("store.js")
+    for field in ("calls:", "callsHasMore:", "callsCursor:", "callsQuery:",
+                  "liveCall:", "callActionPending:"):
+        assert field in store_js, field
+    # The cursor is the pair of the server, never a single number.
+    assert "params.beforeTs = state.callsCursor.ts" in store_js
+    assert "params.beforeKey = state.callsCursor.id" in store_js
+    # A device switch forgets the calls of the old device.
+    select_source = _function_source(store_js, "selectDevice")
+    assert "state.calls = []" in select_source
+    assert "state.callsCursor = null" in select_source
+    assert "state.liveCall = null" in select_source
+    # Loading is per device and paged.
+    for name in ("loadCalls", "loadMoreCalls", "loadLiveCall",
+                 "sendCallAction", "markCallsRead"):
+        assert "export async function " + name + "(" in store_js, name
+
+
+def test_a_missing_calls_endpoint_degrades_to_the_empty_state():
+    store_js = _js("store.js")
+    load_source = _function_source(store_js, "loadCalls")
+    live_source = _function_source(store_js, "loadLiveCall")
+    # A 404 is the "not available yet" state, not an exception.
+    assert "err.status === 404" in load_source
+    assert "state.callsAvailable = false" in load_source
+    assert "err.status === 404" in live_source
+    ui_js = _js("ui.js")
+    assert "No calls yet" in ui_js
+    assert "Calls are not available on this device yet" in ui_js
+
+
+def test_a_call_action_is_idempotent_and_refreshes_a_stale_call():
+    store_js = _js("store.js")
+    source = _function_source(store_js, "sendCallAction")
+    # The retry of the same action reuses the client_ref, so the unique
+    # index of the backend turns a lost answer into a duplicate.
+    assert "lastCallAttempt.clientRef" in source
+    assert "sameCallAttempt(" in source
+    assert "crypto.randomUUID()" in store_js
+    # A stale or expired call is surfaced and the live call is reloaded.
+    assert "err.status === 409" in source
+    assert "err.status === 410" in source
+    assert "await loadLiveCall(target)" in source
+    # Emergency numbers are refused with their own message.
+    assert "emergency_number" in source
+    # The busy guard is published before the request and always cleared,
+    # or one failed action would block every later one.
+    assert "ui.setCallActionsBusy(true)" in source
+    assert "state.callActionPending = null;" in source
+    assert "finally {" in source
+
+
+def test_the_revision_refresh_includes_the_live_call_for_the_open_device():
+    store_js = _js("store.js")
+    source = _function_source(store_js, "refreshFromChange")
+    # A device-wide change (thread_key === null) refreshes the live call
+    # and the call list of the open device only.
+    assert "callsDirty" in source
+    assert "changedThread === null" in source
+    assert "await loadLiveCall(deviceId)" in source
+    assert "await loadCalls(deviceId" in source
+    # Another device never reloads the calls of this one.
+    assert "changedDevice !== deviceId" in source
+
+
+def test_the_calls_route_is_in_the_hash_and_round_trips():
+    app_js = _js("app.js")
+    assert 'parts[2] === "calls"' in app_js
+    assert "function callsHash(" in app_js
+    assert '"/calls"' in app_js
+    assert 'target.name === "calls"' in app_js
+    assert "export" not in app_js or "callsHash" in app_js
+    # The existing routes keep working.
+    assert 'parts[2] === "t"' in app_js
+    assert "deviceHash" in app_js
+    assert "threadHash" in app_js
+    assert "ui.setRoute(\"calls\")" in app_js
+    # The calls screen loads the live call and marks the log as read.
+    calls_source = _function_source(app_js, "openCalls")
+    assert "loadCallsScreen(" in calls_source
+    assert "loadLiveCallQuietly" in calls_source
+    # Opening the tab marks the log as read, and the store skips the
+    # write when the same marker is already known.
+    assert "store.markCallsRead(" in calls_source
+    assert "until <= state.callsReadMarkedTs" in _js("store.js")
+    screen_source = _function_source(app_js, "loadCallsScreen")
+    assert "store.loadCalls(" in screen_source
+
+
+def test_the_search_scope_follows_the_open_tab():
+    app_js = _js("app.js")
+    source = _function_source(app_js, "runSearch")
+    assert 'ui.deviceTab() === "calls"' in source
+    assert "store.loadCalls(deviceId" in source
+    assert "store.loadChats(deviceId" in source
+    # A call-only search never touches the conversation list.
+    assert source.index("store.loadCalls(deviceId") < source.index(
+        "store.loadChats(deviceId")
+
+
+def test_the_tab_header_is_accessible_and_rendered():
+    html = _html()
+    ui_js = _js("ui.js")
+    # The shell carries only the cache-buster; the calls surface is built
+    # by ui.js with the same create() helper as every other row.
+    assert '<base href="/relay/app/">' in html
+    for marker in ('tabBarEl.setAttribute("role", "tablist")',
+                   'tabBarEl.id = "tab-bar"',
+                   'tabChatsEl.id = "tab-chats"',
+                   'tabCallsEl.id = "tab-calls"',
+                   'aria-controls", "chat-list"',
+                   'aria-controls", "call-list"',
+                   'callsSectionEl.id = "calls-section"',
+                   'callListEl.id = "call-list"',
+                   'callsStatusEl.id = "calls-status"',
+                   'card.id = "live-call-card"'):
+        assert marker in ui_js, marker
+    assert ui_js.count('setAttribute("role", "tab")') == 2
+    # The tab is toggled through aria-selected, not only through a class.
+    tab_source = _function_source(ui_js, "setDeviceTab")
+    assert 'setAttribute("aria-selected"' in tab_source
+    assert "export function deviceTab" in ui_js
+
+
+def test_the_call_sheets_and_the_live_card_exist():
+    ui_js = _js("ui.js")
+    sheets_source = _function_source(ui_js, "ensureSheets")
+    for element_id in ("call-sheet", "call-sheet-callback", "call-sheet-via",
+                       "call-sheet-cancel", "call-via-sheet",
+                       "call-via-cancel", "keypad-sheet", "keypad-close"):
+        assert '"' + element_id + '"' in sheets_source, element_id
+    # The live card is built from data and has every control of the
+    # contract.
+    assert 'card.id = "live-call-card"' in ui_js
+    for action in ("answer", "reject", "hangup", "mute", "speaker_on",
+                   "dtmf", "hold"):
+        assert '"' + action + '"' in ui_js, action
+    assert "button.dataset.callAction" in ui_js
+    # The delegated listener of app.js matches the attribute it emits.
+    assert "data-call-action" in _js("app.js")
+    assert "Unmute" in ui_js and "Speaker off" in ui_js and "Unhold" in ui_js
+
+
+def test_call_rendering_uses_text_content_only():
+    ui_js = _js("ui.js")
+    combined = _all_js()
+    # The global guard already forbids the helpers; the call rows, the
+    # live card and the thread bubble must use the create() helper.
+    for helper in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+        assert helper not in combined
+    for name in ("buildCallRow", "updateCallRow", "buildLiveCard",
+                 "buildCallBubble", "updateCallBubble", "openCallViaSheet"):
+        source = _function_source(ui_js, name)
+        assert "create(" in source or "textContent" in source, name
+        for helper in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            assert helper not in source, name
+    # Every server string goes through textContent.
+    assert "parts.title.textContent = title" in ui_js
+    assert "parts.meta.textContent = meta" in ui_js
+    assert "liveNodes.title.textContent = title" in ui_js
+
+
+def test_the_call_via_sheet_uses_https_and_hides_emergency_numbers():
+    ui_js = _js("ui.js")
+    assert "https://wa.me/" in ui_js
+    assert "https://t.me/+" in ui_js
+    assert "https://signal.me/#p/+" in ui_js
+    assert "https://ble.ir/" in ui_js
+    assert "https://rubika.ir/" in ui_js
+    assert "facetime://" in ui_js
+    assert "iOS only" in ui_js
+    assert "viber://chat" in ui_js
+    assert "skype:" in ui_js
+    # The emergency list matches the backend.
+    assert '["110", "112", "115", "125", "911", "999", "000"]' in ui_js
+    assert "export function isEmergencyNumber" in ui_js
+    # Emergency numbers are hidden from the sheet and from call back.
+    sheet_source = _function_source(ui_js, "openCallSheet")
+    assert "isEmergencyNumber(number)" in sheet_source
+    assert "Emergency numbers can only be dialled" in sheet_source
+    bubble_source = _function_source(ui_js, "updateCallBubble")
+    assert "isEmergencyNumber(number)" in bubble_source
+
+
+def test_the_thread_renders_a_call_bubble():
+    ui_js = _js("ui.js")
+    store_js = _js("store.js")
+    assert 'event.kind === "call"' in ui_js
+    assert "bubble-call" in ui_js
+    assert "data-call-back" in ui_js
+    assert '"Call back"' in ui_js
+    # The server names the key `event_id` for a call and `id` elsewhere;
+    # the store normalizes both into one shape.
+    assert "function normalizeEvent(" in store_js
+    assert "event.event_id" in store_js
+    assert "data.events.map(normalizeEvent)" in store_js
+
+
+def test_the_live_timer_stops_when_the_screen_is_left():
+    ui_js = _js("ui.js")
+    assert "export function stopLiveTimer" in ui_js
+    assert "setInterval(updateLiveElapsed, 1000)" in ui_js
+    assert "clearInterval(liveTimer)" in ui_js
+    route_source = _function_source(ui_js, "setRoute")
+    assert "syncLiveTimer()" in route_source
+    reset_source = _function_source(ui_js, "resetScope")
+    assert "stopLiveTimer()" in reset_source
