@@ -889,7 +889,8 @@ class DialerHomeActivity : AppCompatActivity() {
      * up by the navigation inset.
      */
     private fun applyInsets() {
-        val fabParams = fab.layoutParams as ViewGroup.MarginLayoutParams
+        val fabParams: ViewGroup.MarginLayoutParams =
+            fab.layoutParams as ViewGroup.MarginLayoutParams
         val fabMarginEnd = fabParams.marginEnd
         val fabMarginBottom = fabParams.bottomMargin
         val content = findViewById<View>(R.id.layoutDialerContent)
@@ -901,7 +902,7 @@ class DialerHomeActivity : AppCompatActivity() {
             content.updatePadding(top = bars.top, left = bars.left, right = bars.right)
             list.updatePadding(bottom = listBottom + bars.bottom)
             fabParams.marginEnd = fabMarginEnd + bars.right
-            fabParams.marginBottom = fabMarginBottom + bars.bottom
+            fabParams.bottomMargin = fabMarginBottom + bars.bottom
             fab.layoutParams = fabParams
             insets
         }

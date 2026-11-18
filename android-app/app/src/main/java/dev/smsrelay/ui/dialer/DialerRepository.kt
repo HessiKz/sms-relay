@@ -126,7 +126,7 @@ object DialerRepository {
             CallLog.Calls.DATE,
             CallLog.Calls.DURATION,
             CallLog.Calls.TYPE,
-            CallLog.Calls.SUBSCRIPTION_ID,
+            "subscription_id",
             CallLog.Calls.PHONE_ACCOUNT_ID,
             CallLog.Calls.IS_READ
         )
@@ -165,7 +165,7 @@ object DialerRepository {
             val dateIndex = query.getColumnIndex(CallLog.Calls.DATE)
             val durationIndex = query.getColumnIndex(CallLog.Calls.DURATION)
             val typeIndex = query.getColumnIndex(CallLog.Calls.TYPE)
-            val subIndex = query.getColumnIndex(CallLog.Calls.SUBSCRIPTION_ID)
+            val subIndex = query.getColumnIndex("subscription_id")
             val readIndex = query.getColumnIndex(CallLog.Calls.IS_READ)
             while (query.moveToNext() && rows.size < size) {
                 val id = query.getLong(idIndex)
