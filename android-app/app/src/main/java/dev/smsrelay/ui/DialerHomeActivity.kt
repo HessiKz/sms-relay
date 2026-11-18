@@ -969,8 +969,14 @@ class DialerHomeActivity : AppCompatActivity() {
      * The setup screen was the only place the role could be asked for,
      * and a phone whose call permissions were refused could never get
      * there. The role is offered here, on the screen the user actually
-     * uses, in three states: held, available, and not offered by this
-     * phone (then the settings screen is the only answer).
+     * uses, in two states: held (no card at all) and not held.
+     *
+     * Availability only picks the sentence, never whether there is
+     * something to tap. Gating the action on it hid the whole request on
+     * Android 8 and 9, where the role exists but the role manager does
+     * not: [requestDialerRole] opens the system dialog when the phone
+     * offers one and the default-apps settings when it does not, so the
+     * tap always leads somewhere.
      */
     private fun renderRoleCard() {
         if (RoleState.isDialerRoleHeld(this)) return
@@ -981,9 +987,7 @@ class DialerHomeActivity : AppCompatActivity() {
             text = getString(
                 if (available) R.string.dialer_role_card else R.string.dialer_role_unavailable_card
             )
-        ) {
-            if (available) requestDialerRole() else openDialerSettings()
-        }
+        ) { requestDialerRole() }
     }
 
     /**

@@ -10,6 +10,7 @@ import android.provider.Telephony
 import android.telecom.TelecomManager
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import dev.smsrelay.BuildConfig
 import dev.smsrelay.R
 
 /**
@@ -34,11 +35,37 @@ object RoleState {
     }
 
     /**
+     * True when this phone can be asked to make this app the default SMS
+     * app, in either era - the same distinction as
+     * [isDialerRoleAvailable], and for the same reason.
+     *
+     * Use this for reporting and for deciding whether a request is worth
+     * starting. [isRoleAvailable] stays a strict role-manager primitive:
+     * it answers false on Android 8 and 9 by design, and a caller that
+     * reads it as "this phone cannot be the default SMS app" is wrong
+     * there. The screens already branch on the SDK and never consult it
+     * below Android 10.
+     */
+    fun isSmsRoleAvailable(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return isRoleAvailable(context)
+        // Android 8 and 9: no role manager, but `ACTION_CHANGE_DEFAULT` is
+        // how the platform has always asked, and it is what the request
+        // path uses.
+        val intent = Intent(Telephony.Sms.Intents.ACTION_CHANGE_DEFAULT)
+        return runCatching { intent.resolveActivity(context.packageManager) != null }
+            .getOrDefault(false)
+    }
+
+    /**
      * True when the phone knows the default-SMS-app role at all.
      *
      * A phone without telephony, or a vendor build that took the role
      * away, has no role to ask for: the default apps settings are the
      * only way left.
+     *
+     * This is the role-manager answer only: it is false on Android 8 and
+     * 9, where the platform has no roles. Ask [isSmsRoleAvailable] when
+     * the question is "can this app be the default SMS app at all".
      */
     fun isRoleAvailable(context: Context): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
@@ -58,18 +85,39 @@ object RoleState {
     }
 
     /**
-     * True when the phone knows the default-dialer role at all.
+     * True when this phone can be asked to make this app the dialer.
      *
-     * A phone without telephony, or a vendor build that took the role
-     * away, has no role to ask for: the default apps settings are then
-     * the only way left.
+     * There are two eras here, and conflating them hid the dialer action
+     * on Android 8 and 9:
+     *
+     *  - Android 10 and newer: the role manager owns the choice, so the
+     *    answer is `isRoleAvailable(ROLE_DIALER)`. A phone whose vendor
+     *    removed the role has no dialog to show, and the default apps
+     *    settings are then the only way left.
+     *  - Android 8 and 9: there is no role manager at all, but the role
+     *    still exists - the telecom service tracks the default dialer
+     *    package and accepts `ACTION_CHANGE_DEFAULT_DIALER`. Reporting
+     *    "unavailable" there was simply wrong, and it is what made the
+     *    card hide its action on those releases.
+     *
+     * A `true` answer never traps the user: [dialerRoleIntent] returns
+     * null when neither path can be resolved, and every caller falls back
+     * to the default apps settings in that case.
      */
     fun isDialerRoleAvailable(context: Context): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
-        val roleManager = context.getSystemService(RoleManager::class.java) ?: return false
-        return runCatching {
-            roleManager.isRoleAvailable(RoleManager.ROLE_DIALER)
-        }.getOrDefault(false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = context.getSystemService(RoleManager::class.java) ?: return false
+            return runCatching {
+                roleManager.isRoleAvailable(RoleManager.ROLE_DIALER)
+            }.getOrDefault(false)
+        }
+        // Android 8 and 9: the role exists, it is just not modelled by the
+        // role manager. The telecom service is what owns the default
+        // dialer, and its presence is the honest availability answer.
+        if (context.getSystemService(TelecomManager::class.java) != null) return true
+        // No telecom service (a build without telephony): the intent is
+        // the last thing worth checking before the settings fallback.
+        return dialerRoleIntent(context) != null
     }
 
     /**
@@ -179,18 +227,33 @@ object RoleState {
         val dialerPackage = runCatching {
             context.getSystemService(TelecomManager::class.java)?.defaultDialerPackage
         }.getOrNull()
-        val lines = ArrayList<String>(12)
+        val lines = ArrayList<String>(14)
+        // The version first: it is the one line that says which build
+        // produced the rest of the report, and an operator comparing two
+        // APKs needs it before any role state.
+        lines.add(
+            context.getString(
+                R.string.diagnostics_version,
+                BuildConfig.VERSION_NAME,
+                BuildConfig.VERSION_CODE
+            )
+        )
         lines.add(context.getString(R.string.diagnostics_android, Build.VERSION.SDK_INT))
+        // Both SMS lines go through the era-aware helpers. Reporting
+        // `isRoleAvailable`/`isRoleHeld` directly said "no" to both on
+        // Android 8 and 9 even with this app already the default SMS app,
+        // which is the fastest way to send the next investigation after a
+        // fault that does not exist.
         lines.add(
             context.getString(
                 R.string.diagnostics_role_sms_available,
-                yesNo(context, isRoleAvailable(context))
+                yesNo(context, isSmsRoleAvailable(context))
             )
         )
         lines.add(
             context.getString(
                 R.string.diagnostics_role_sms_held,
-                yesNo(context, isRoleHeld(context))
+                yesNo(context, isDefaultSmsApp(context))
             )
         )
         lines.add(

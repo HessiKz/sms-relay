@@ -1322,12 +1322,17 @@ class MainActivity : AppCompatActivity() {
     /**
      * The dialer-role question of the Calls card.
      *
-     * Three answers are possible, and each one says what to do:
+     * Two answers are possible, and each one says what to do:
      *  - the app holds the role: nothing to ask, and the card says so;
-     *  - the phone offers the role: a button asks for it;
-     *  - the phone does not offer it (no telephony, a vendor build that
-     *    removed it): the button opens the default-apps settings and the
-     *    line explains that the phone has no role.
+     *  - it does not: the button is offered, always.
+     *
+     * The button is never hidden or disabled because *availability* is
+     * reported false. That check used to gate the action, and on Android
+     * 8 and 9 - where the role exists but the role manager does not - it
+     * reported false and left the user with no way to ask. Availability
+     * only chooses the wording and the destination:
+     * [requestDialerRole] shows the role dialog when the phone offers one
+     * and opens the default-apps settings when it does not.
      */
     private fun updateDialerRoleCard() {
         val button = buttonDialerRole ?: return
@@ -1342,6 +1347,9 @@ class MainActivity : AppCompatActivity() {
             when {
                 held -> R.string.calls_role_held_hint
                 available -> R.string.calls_role_explanation
+                // Neither a role dialog nor a resolvable change intent:
+                // the settings screen is the last resort, and the button
+                // still leads there.
                 else -> R.string.calls_role_unavailable
             }
         )

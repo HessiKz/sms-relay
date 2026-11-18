@@ -1824,6 +1824,41 @@ to Telegram. They are logged under separate headings below.
   If a role is still refused, collect the "Role & SMS diagnostics" lines.
   No secrets, numbers, names or message bodies were added to this entry.
 
+## 2026-11-18 — APK 1.4.0: Android 8/9 dialer role fix
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode), lead/worker delegation.
+- **Task:** The operator still could not set the default dialer and saw an
+  empty Messages list after installing the new APK.
+- **Files:** `android-app/app/src/main/java/dev/smsrelay/util/RoleState.kt`,
+  `.../ui/MainActivity.kt`, `.../ui/DialerHomeActivity.kt`,
+  `res/values/strings.xml`, `app/build.gradle.kts`; this entry.
+- **Changed:** `RoleState.isDialerRoleAvailable()` returned false on
+  Android 8/9 even though `dialerRoleIntent()` supports those versions
+  through `TelecomManager.ACTION_CHANGE_DEFAULT_DIALER`; both role cards
+  gated the action on that boolean, so the request was unreachable. The
+  availability now treats a present `TelecomManager` as available on
+  API 26–28, and both cards always offer the action, falling back to the
+  default-apps settings when the intent is null. The diagnostics now
+  report the app version (`BuildConfig.VERSION_NAME/CODE`) and use
+  `isSmsRoleAvailable`/`isDefaultSmsApp` for the SMS lines, so API 26–28
+  no longer reports a false "no role". Version bumped to
+  **1.4.0 (versionCode 9)** so the install can be identified.
+- **Verification:** static only — XML parse, resource cross-check, brace
+  balance, `git diff --check`; the published APK manifest had already
+  been parsed and contains the `InCallService`, `ACTION_DIAL` activity,
+  `SMS_DELIVER` receiver and `RESPOND_VIA_MESSAGE` service, all exported.
+  The APK is not built here; CI must compile and publish it.
+- **Decisions / risks:** the previous APK was still 1.3.3 (versionCode 8),
+  so the operator could not tell whether the fixed build had installed.
+  1.4.0 makes that visible in the diagnostics and in the backend device
+  heartbeat. The root cause is believed to be the Android 8/9 gate; if the
+  operator is on Android 10+, the same cards now always expose the action
+  and the diagnostics identify the exact state.
+- **Follow-ups:** build 1.4.0, install it, check the diagnostics version
+  line, grant the roles, then verify Messages and the Phone home. If the
+  list is still empty, send the diagnostics lines; the SMS runtime
+  permission state is part of the report.
+
 ## 2026-11-18 — Fix the two device blockers: empty Messages list and the dialer role
 
 - **Agent:** DeepSeek V4.1 Flash (OpenCode). No subagent tool was exposed in
