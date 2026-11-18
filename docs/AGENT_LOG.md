@@ -1698,3 +1698,45 @@ to Telegram. They are logged under separate headings below.
   build: durable outbound mirror queue, group send, MMS, visual parity pass,
   and the final APK release. No secrets, numbers, names or message bodies were
   added to this log.
+
+## 2026-11-18 — Android build green: calls, dialer and local Messages
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode), lead/worker delegation.
+- **Task:** compile the calls/dialer/Messages work on GitHub and publish the
+  rolling debug APK, as the repository rule requires.
+- **Files:** compile-only fixes in
+  `android-app/.../calls/CallLogReader.kt`,
+  `.../messages/SmsObserver.kt`,
+  `.../ui/ShellActivity.kt`,
+  `.../ui/DialerHomeActivity.kt`,
+  `.../ui/dialer/DialerRepository.kt`; this entry.
+- **Changed:** no behaviour. `CallLog.Calls.SUBSCRIPTION_ID` is not a public
+  SDK constant, so the projection and column lookups use the literal
+  `"subscription_id"`; `ContentObserver` is imported from
+  `android.database`; the FAB inset code uses the real
+  `ViewGroup.MarginLayoutParams.bottomMargin` field; the voicemail lookup
+  passes the first call-capable `PhoneAccountHandle` to
+  `TelecomManager.getVoiceMailNumber`, because the no-arg overload is hidden.
+- **Verification:** GitHub Actions run `44248359040` on commit `a83f972`
+  completed **success**; `Assemble debug APK`, `Upload APK` and
+  `Publish rolling APK release` all ran. The published asset is
+  `sms-relay-debug.apk` (7,638,352 bytes, sha256
+  `d91a044b39ff8569007152a9a086b6678be4021cf30431fb51470ab7176d54ef`),
+  updated 2026-11-18T06:03:29Z:
+  <https://github.com/HessiKz/sms-relay/releases/download/android-latest/sms-relay-debug.apk>
+  Backend suite remains 738 collected — 734 passed, 3 failed, 1 error
+  (the four known pre-existing failures).
+- **Decisions / risks:** the APK is compiled and published, but it has not
+  been run on a phone. The build is a debug build signed with the stable
+  CI debug key, so it updates the previous install. The new UI and dialer
+  need the default-SMS/default-dialer roles and the call/notification
+  permissions granted on the device. MMS, group send, RCS and the durable
+  outbound mirror remain out of scope; the relay mirror of a locally sent
+  SMS is best effort.
+- **Follow-ups:** install the APK and run the device matrix: first launch
+  and role prompts, conversation list, send and Mini App mirror, incoming
+  call while locked with and without the full-screen grant, answer/reject
+  from screen and notification, mute/speaker/hold/DTMF, dual-SIM, emergency
+  number with the relay offline, service rebind, and the vendor call-log /
+  contact quirks. Then a screenshot pass for visual parity, and the MMS /
+  group-send / durable-mirror phases.
