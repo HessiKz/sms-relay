@@ -1787,6 +1787,43 @@ to Telegram. They are logged under separate headings below.
   OTP notifications, note expiry after an hour, the bottom bar/gesture
   area, and the dialer role/call flows.
 
+## 2026-11-18 — Backend deployed to production
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode), lead; operator approved the
+  production restart.
+- **Task:** Deploy the calls/pairing/notification backend to the live
+  service and restart `sms-relay-api`.
+- **Files:** live copy of `backend/app` (including `calls.py` and the new
+  Mini App static files) synced to `/opt/sms-relay/app/app` with rsync;
+  no live env file, Caddyfile or database edit. The database migration ran
+  on startup and is additive.
+- **Backups:** `/opt/sms-relay/app.pre-20261118-203310.tgz` (the previous
+  app tree) and
+  `/var/lib/backups/sms-relay/sms-relay-20261118-203310.db` (online SQLite
+  backup, 25 MB, `PRAGMA integrity_check` = ok). Neither was deleted.
+- **Verification:** `systemctl restart` completed, the unit is `active`
+  (`running`), `GET /health` is `{"ok":true}` on loopback and through
+  `https://ai-barrow.ir/relay/health`; `/calls/actions` without a token is
+  `401` (the route exists); OpenAPI lists `/calls/sync`,
+  `/calls/events`, `/calls/actions`, the call-result route and the four
+  Mini App call routes; `PairClaimBody` has `confirmed`; the database has
+  `call_log`, `call_sessions`, `call_actions`, `tg_messages` and the
+  `pairings.approved_by_name/username` columns; the public Mini App serves
+  `v=20261117-calls`; the phone's next `GET /calls/actions?wait=0` changed
+  from `404` to `200`; no error/traceback lines since the restart.
+- **Decisions / risks:** the restart is a brief outage of the bot/worker;
+  queued jobs and the SQLite queue survive. The live backend is now the
+  new code, but the APK with the phone-side pairing dialog and the
+  role/message fixes must still be installed on the phone. The old APK
+  keeps sending no `confirmed` field and gets the legacy token path, so
+  the dialog only appears after the new APK is installed. The backup
+  tarball and database are the rollback path.
+- **Follow-ups:** install the `d02de4d` APK, grant the SMS and dialer
+  roles, run the pairing flow through the new phone dialog, and verify an
+  OTP/code notification and the one-hour deletion of the "SMS sent" note.
+  If a role is still refused, collect the "Role & SMS diagnostics" lines.
+  No secrets, numbers, names or message bodies were added to this entry.
+
 ## 2026-11-18 — Fix the two device blockers: empty Messages list and the dialer role
 
 - **Agent:** DeepSeek V4.1 Flash (OpenCode). No subagent tool was exposed in
