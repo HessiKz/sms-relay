@@ -1741,6 +1741,52 @@ to Telegram. They are logged under separate headings below.
   contact quirks. Then a screenshot pass for visual parity, and the MMS /
   group-send / durable-mirror phases.
 
+## 2026-11-18 — Role/message fixes, pairing confirmation, notif snippets and nav
+
+- **Agent:** DeepSeek V4.1 Flash (OpenCode), lead/worker delegation.
+- **Task:** Fix the operator-reported blockers (empty Messages list, dialer
+  role not settable), add a phone-side pairing confirmation, put OTP/code
+  snippets in Telegram notifications without a date, expire the "SMS sent"
+  notes, and add a bottom navigation bar.
+- **Files:** Android `messages/SmsRepository.kt`, `ui/ShellActivity.kt`,
+  `ui/DialerHomeActivity.kt`, `ui/MainActivity.kt`,
+  `util/RoleState.kt`, `pairing/PairingController.kt`,
+  `net/PairingClient.kt`, layouts/menu/drawables/strings; backend
+  `delivery.py`, `db.py`, `api.py`, `updater.py`, `pairing.py`, tests;
+  `README.md`, `docs/AGENT_GUIDE.md`.
+- **Changed:** the Messages list no longer drops a thread when
+  `canonical-addresses` cannot resolve it: it falls back to the first SMS
+  row's `ADDRESS`, and keeps an "Unknown sender" thread with its real
+  `thread_id` if even that fails. The SMS and dialer roles are requested
+  without a permission gate and have prominent cards plus a
+  `RoleState.diagnosticsReport()` dialog. `POST /pair/claim` now supports
+  `confirmed` (`null` -> `202 awaiting_phone_confirmation` with the
+  approver, `true` -> token once, `false` -> cancelled; absent -> old
+  behaviour), and the phone shows a non-cancelable confirmation before the
+  token is stored. Telegram notifications now carry a 160-character body
+  snippet and an extracted `Code:` line, no date; masked/labelled
+  identifiers are not codes. The `tg_messages` table and the reaper delete
+  "SMS sent" notes after one hour. A Material 3 bottom bar switches
+  Messages / Phone / Contacts / Settings.
+- **Verification:** backend suite **785 collected — 781 passed, 3 failed,
+  1 error** (the four known pre-existing failures). GitHub Actions run
+  `44365278140` on `d02de4d` completed **success**; the rolling asset
+  `sms-relay-debug.apk` is 7,670,521 bytes, sha256
+  `79f377384dc40deb7482b1073bdb2e3349bec6193a36dbc4cec366f68f3b70a9`,
+  updated 2026-11-18T18:04:02Z.
+- **Decisions / risks:** the APK is compiled and published, but the
+  backend changes are **not deployed**; the pairing dialog and the new
+  notification format need a service restart to take effect. The APK was
+  not device-tested. OEM role suppression is still possible; the
+  diagnostics dialog is the first check. OTP extraction is heuristic; the
+  snippet still shows unusual formats, and a code-shaped card/order number
+  must not be labelled a code.
+- **Follow-ups:** deploy the backend with operator approval, install the
+  new APK, and run the device matrix: role cards and diagnostics, Messages
+  list and "Unknown sender" threads, send/mirror, pairing confirmation,
+  OTP notifications, note expiry after an hour, the bottom bar/gesture
+  area, and the dialer role/call flows.
+
 ## 2026-11-18 — Fix the two device blockers: empty Messages list and the dialer role
 
 - **Agent:** DeepSeek V4.1 Flash (OpenCode). No subagent tool was exposed in
